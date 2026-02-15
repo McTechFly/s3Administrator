@@ -1,0 +1,319 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String    @unique
+  emailVerified DateTime?
+  image         String?
+
+  role             String  @default("user")
+  stripeCustomerId String? @unique
+
+  accounts      Account[]
+  sessions      Session[]
+  s3Credentials S3Credential[]
+  fileMetadata  FileMetadata[]
+  fileExtensionStats UserFileExtensionStat[]
+  mediaThumbnails MediaThumbnail[]
+  backgroundTasks BackgroundTask[]
+  backgroundTaskRuns BackgroundTaskRun[]
+  backgroundTaskEvents BackgroundTaskEvent[]
+  subscriptions  Subscription[]
+  actionEvents   UserActionEvent[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model UserActionEvent {
+  id        String   @id @default(cuid())
+  userId    String?
+  eventType String
+  eventName String
+  path      String
+  method    String?
+  target    String?
+  metadata  Json?
+  ipAddress String?
+  userAgent String?
+  createdAt DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt])
+  @@index([userId, createdAt])
+  @@index([eventType, createdAt])
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+model S3Credential {
+  id           String  @id @default(cuid())
+  userId       String
+  label        String
+  provider     String  @default("HETZNER")
+  endpoint     String
+  region       String
+  accessKeyEnc String  @db.Text
+  secretKeyEnc String  @db.Text
+  ivAccessKey  String
+  ivSecretKey  String
+  isDefault    Boolean @default(false)
+
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  fileMetadata FileMetadata[]
+  mediaThumbnails MediaThumbnail[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+}
+
+model FileMetadata {
+  id           String   @id @default(cuid())
+  userId       String
+  credentialId String
+  bucket       String
+  key          String
+  extension    String   @default("")
+  size         BigInt
+  lastModified DateTime
+  isFolder     Boolean  @default(false)
+
+  user       User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  credential S3Credential @relation(fields: [credentialId], references: [id], onDelete: Cascade)
+
+  @@unique([credentialId, bucket, key])
+  @@index([userId])
+  @@index([credentialId, bucket])
+  @@index([userId, extension])
+}
+
+model MediaThumbnail {
+  id                String   @id @default(cuid())
+  userId            String
+  credentialId      String
+  bucket            String
+  key               String
+  status            String   @default("pending")
+  thumbnailBucket   String?
+  thumbnailKey      String?
+  mimeType          String?
+  width             Int?
+  height            Int?
+  sourceLastModified DateTime?
+  sourceSize        BigInt?
+  lastError         String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  user       User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  credential S3Credential @relation(fields: [credentialId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, credentialId, bucket, key])
+  @@index([userId, status, updatedAt])
+  @@index([credentialId, bucket, key])
+}
+
+model UserFileExtensionStat {
+  id        String   @id @default(cuid())
+  userId    String
+  extension String
+  fileCount Int      @default(0)
+  totalSize BigInt   @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, extension])
+  @@index([userId])
+}
+
+model ServerMetricSample {
+  id                  String   @id @default(cuid())
+  recordedAt          DateTime @unique
+  hostCpuPercent      Float?
+  hostMemoryUsedBytes BigInt?
+  hostMemoryTotalBytes BigInt?
+  hostDiskUsedBytes   BigInt?
+  hostDiskTotalBytes  BigInt?
+  appCpuPercent       Float?
+  appMemoryUsedBytes  BigInt?
+  appMemoryLimitBytes BigInt?
+  createdAt           DateTime @default(now())
+
+  @@index([recordedAt])
+}
+
+model BackgroundTask {
+  id                    String   @id @default(cuid())
+  userId                String
+  type                  String
+  title                 String
+  status                String   @default("pending")
+  lifecycleState        String   @default("active")
+  payload               Json
+  executionPlan         Json?
+  executionHistory      Json?
+  progress              Json?
+  attempts              Int      @default(0)
+  maxAttempts           Int      @default(5)
+  runCount              Int      @default(0)
+  lastError             String?
+  dedupeKey             String?
+  isRecurring           Boolean  @default(false)
+  scheduleIntervalSeconds Int?
+  nextRunAt             DateTime @default(now())
+  startedAt             DateTime?
+  lastRunAt             DateTime?
+  pausedAt              DateTime?
+  completedAt           DateTime?
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  runs BackgroundTaskRun[]
+  events BackgroundTaskEvent[]
+
+  @@index([userId, lifecycleState, status, nextRunAt])
+  @@index([userId, dedupeKey, lifecycleState, status])
+  @@index([createdAt])
+}
+
+model BackgroundTaskRun {
+  id         String   @id @default(cuid())
+  taskId     String
+  userId     String
+  runNumber  Int
+  attempt    Int      @default(1)
+  status     String
+  startedAt  DateTime
+  finishedAt DateTime?
+  error      String?
+  metrics    Json?
+  workerId   String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  task   BackgroundTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  user   User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  events BackgroundTaskEvent[]
+
+  @@unique([taskId, runNumber])
+  @@index([taskId, runNumber(sort: Desc)])
+  @@index([userId, startedAt(sort: Desc)])
+  @@index([startedAt])
+}
+
+model BackgroundTaskEvent {
+  id        String   @id @default(cuid())
+  taskId    String
+  runId     String?
+  userId    String
+  at        DateTime @default(now())
+  eventType String
+  message   String
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  task BackgroundTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  run  BackgroundTaskRun? @relation(fields: [runId], references: [id], onDelete: SetNull)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([runId, at(sort: Desc)])
+  @@index([taskId, at(sort: Desc)])
+  @@index([userId, at(sort: Desc)])
+}
+
+model Plan {
+  id                 String   @id @default(cuid())
+  slug               String   @unique
+  name               String
+  priceMonthly       Int      @default(0)
+  stripePriceId      String?  @unique
+  bucketLimit        Int      @default(1)
+  fileLimit          Int      @default(1000)
+  features           String[] @default([])
+  thumbnailCache     Boolean  @default(false)
+  transferTasks      Boolean  @default(false)
+  recursiveDelete    Boolean  @default(false)
+  multipleUpload     Boolean  @default(false)
+  copyFolderToFolder Boolean  @default(false)
+  copyBucketToBucket Boolean  @default(false)
+  auditLogs          Boolean  @default(false)
+  searchAllFiles     Boolean  @default(false)
+  syncTasks          Boolean  @default(false)
+  isActive           Boolean  @default(true)
+  sortOrder          Int      @default(0)
+
+  subscriptions Subscription[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Subscription {
+  id                   String    @id @default(cuid())
+  userId               String
+  planId               String
+  stripeSubscriptionId String    @unique
+  stripeCustomerId     String
+  status               String    @default("active")
+  currentPeriodStart   DateTime
+  currentPeriodEnd     DateTime
+  cancelAtPeriodEnd    Boolean   @default(false)
+  canceledAt           DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  plan Plan @relation(fields: [planId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([stripeSubscriptionId])
+}

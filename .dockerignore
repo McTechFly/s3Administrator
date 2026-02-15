@@ -1,0 +1,17 @@
+node_modules
+.next
+.git
+*.md
+.env
+.env.local
+docker
+logs
+coverage
+dist
+out
+.cache
+.turbo
+tmp
+*.log
+*.tsbuildinfo
+.DS_Store

@@ -1,0 +1,117 @@
+import { hostname } from "node:os"
+import { prisma } from "@/lib/db"
+import {
+  getTaskEngineInternalToken,
+  getTaskWorkerAppUrl,
+  isTaskEngineV2Enabled,
+} from "@/lib/task-engine-config"
+import { recordTaskRunFromSnapshot } from "@/lib/task-run-history"
+import { startTaskQueueWorker } from "@/lib/task-queue"
+
+interface ProcessRouteResponse {
+  processed?: boolean
+  taskId?: string
+  done?: boolean
+}
+
+function buildWorkerId(): string {
+  const host = hostname()
+  return `${host}:${process.pid}`
+}
+
+async function processUserOnce(userId: string, workerId: string) {
+  const token = getTaskEngineInternalToken()
+  if (!token) {
+    throw new Error("TASK_ENGINE_INTERNAL_TOKEN must be configured for worker processing")
+  }
+
+  const baseUrl = getTaskWorkerAppUrl().replace(/\/+$/, "")
+  const url = `${baseUrl}/api/tasks/process?userId=${encodeURIComponent(userId)}`
+
+  const startedAt = new Date()
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "x-task-engine-token": token,
+    },
+  })
+  const finishedAt = new Date()
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => "")
+    throw new Error(
+      `Task process request failed for user ${userId} (${response.status}): ${body || response.statusText}`
+    )
+  }
+
+  const payload = (await response.json()) as ProcessRouteResponse
+  if (!payload.processed || !payload.taskId) {
+    return { processed: false }
+  }
+
+  const snapshot = await prisma.backgroundTask.findUnique({
+    where: { id: payload.taskId },
+    select: {
+      id: true,
+      userId: true,
+      type: true,
+      runCount: true,
+      attempts: true,
+      status: true,
+      lastError: true,
+    },
+  })
+
+  if (snapshot) {
+    await recordTaskRunFromSnapshot({
+      snapshot,
+      startedAt,
+      finishedAt,
+      workerId,
+      metrics: {
+        done: Boolean(payload.done),
+      },
+    })
+  }
+
+  return {
+    processed: true,
+    taskId: payload.taskId,
+  }
+}
+
+async function main() {
+  if (!isTaskEngineV2Enabled()) {
+    console.info("[task-worker] TASK_ENGINE_V2 is disabled. Worker idle.")
+    return
+  }
+
+  const workerId = buildWorkerId()
+  const stop = await startTaskQueueWorker({
+    workerId,
+    enabled: true,
+    processUserOnce: (userId) => processUserOnce(userId, workerId),
+  })
+
+  console.info(`[task-worker] started (${workerId})`)
+
+  const shutdown = async (signal: string) => {
+    console.info(`[task-worker] shutting down on ${signal}`)
+    await stop()
+    await prisma.$disconnect().catch(() => {})
+    process.exit(0)
+  }
+
+  process.on("SIGINT", () => {
+    void shutdown("SIGINT")
+  })
+  process.on("SIGTERM", () => {
+    void shutdown("SIGTERM")
+  })
+}
+
+void main().catch(async (error) => {
+  console.error("[task-worker] fatal error", error)
+  await prisma.$disconnect().catch(() => {})
+  process.exit(1)
+})

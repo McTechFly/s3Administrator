@@ -1,0 +1,17 @@
+{$CADDY_SITE_ADDRESSES::80} {
+  encode zstd gzip
+
+  @apex expression {host} == "{$ROOT_DOMAIN}" && "{$ROOT_DOMAIN}" != "" && "{$ROOT_DOMAIN}" != "{$DOMAIN}"
+  redir @apex https://{$DOMAIN}{uri} permanent
+
+  header {
+    Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+    X-Frame-Options "DENY"
+    X-Content-Type-Options "nosniff"
+    Referrer-Policy "strict-origin-when-cross-origin"
+    Permissions-Policy "camera=(), microphone=(), geolocation=()"
+    -Server
+  }
+
+  reverse_proxy app:3000
+}
