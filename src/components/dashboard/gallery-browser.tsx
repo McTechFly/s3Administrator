@@ -14,7 +14,7 @@ interface GalleryBrowserProps {
   isFetchingNextPage: boolean
   hasNextPage: boolean
   selectedKeys: Set<string>
-  onSelect: (item: GalleryItem) => void
+  onSelect: (item: GalleryItem, options?: { shiftKey?: boolean }) => void
   onSelectAllVisible: () => void
   onNavigate: (item: GalleryItem) => void
   onOpenPreview: (item: GalleryItem) => void
@@ -45,6 +45,7 @@ export function GalleryBrowser({
   onLoadMore,
 }: GalleryBrowserProps) {
   const sentinelRef = useRef<HTMLDivElement | null>(null)
+  const shiftPressedRef = useRef(false)
 
   useEffect(() => {
     if (!hasNextPage) return
@@ -151,7 +152,19 @@ export function GalleryBrowser({
                   )}
                 </button>
                 <div className="absolute left-2 top-2">
-                  <Checkbox checked={selected} onCheckedChange={() => onSelect(item)} />
+                  <Checkbox
+                    checked={selected}
+                    onPointerDown={(event) => {
+                      shiftPressedRef.current = event.shiftKey
+                    }}
+                    onKeyDown={(event) => {
+                      shiftPressedRef.current = event.shiftKey
+                    }}
+                    onCheckedChange={() => {
+                      onSelect(item, { shiftKey: shiftPressedRef.current })
+                      shiftPressedRef.current = false
+                    }}
+                  />
                 </div>
               </div>
 

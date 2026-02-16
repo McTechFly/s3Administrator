@@ -1,5 +1,6 @@
 "use client"
 
+import { useRef } from "react"
 import {
   Table,
   TableBody,
@@ -31,7 +32,7 @@ interface FileBrowserProps {
   files: S3Object[]
   isLoading: boolean
   selectedKeys: Set<string>
-  onSelect: (file: S3Object) => void
+  onSelect: (file: S3Object, options?: { shiftKey?: boolean }) => void
   onSelectAll: () => void
   onNavigate: (file: S3Object) => void
   onRename: (file: S3Object) => void
@@ -78,6 +79,7 @@ export function FileBrowser({
   onSort,
 }: FileBrowserProps) {
   const resolveRowId = (file: S3Object) => getRowId?.(file) ?? file.key
+  const shiftPressedRef = useRef(false)
 
   const renderSortableHeader = (label: string, column: SortColumn) => {
     const isActive = sortBy === column
@@ -173,7 +175,16 @@ export function FileBrowser({
                 <TableCell>
                   <Checkbox
                     checked={isSelected}
-                    onCheckedChange={() => onSelect(file)}
+                    onPointerDown={(event) => {
+                      shiftPressedRef.current = event.shiftKey
+                    }}
+                    onKeyDown={(event) => {
+                      shiftPressedRef.current = event.shiftKey
+                    }}
+                    onCheckedChange={() => {
+                      onSelect(file, { shiftKey: shiftPressedRef.current })
+                      shiftPressedRef.current = false
+                    }}
                   />
                 </TableCell>
                 <TableCell className={compact ? "py-1.5" : undefined}>

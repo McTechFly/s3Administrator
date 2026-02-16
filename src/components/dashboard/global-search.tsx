@@ -1,6 +1,6 @@
 "use client"
 
-import { useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import { useRouter } from "next/navigation"
 import { useQuery, useQueryClient } from "@tanstack/react-query"
 import { Loader2 } from "lucide-react"
@@ -10,15 +10,6 @@ import { MultiSelectToolbar } from "@/components/dashboard/multi-select-toolbar"
 import { DeleteConfirmDialog } from "@/components/dashboard/delete-confirm-dialog"
 import { RenameDialog } from "@/components/dashboard/rename-dialog"
 import { SearchFilters } from "@/components/dashboard/search-filters"
-import {
-  BulkDeletePreviewDialog,
-  type BulkDeleteTaskPreview,
-} from "@/components/dashboard/bulk-delete-preview-dialog"
-import { DestructiveConfirmDialog } from "@/components/shared/destructive-confirm-dialog"
-import {
-  DESTRUCTIVE_CONFIRM_SCOPE,
-  hasDestructiveConfirmBypass,
-} from "@/lib/destructive-confirmation"
 import type { S3Object } from "@/types"
 
 interface SearchResult {
@@ -49,17 +40,6 @@ interface Bucket {
 interface Credential {
   id: string
   label: string
-}
-
-interface BulkDeleteTaskBody {
-  query: string
-  selectedType: string
-  selectedCredentialIds: string[]
-  selectedBucketScopes: string[]
-  schedule?: {
-    cron: string
-  } | null
-  confirmDestructiveSchedule?: boolean
 }
 
 const PAGE_SIZE = 100
@@ -93,6 +73,12 @@ function getPathOnly(key: string): string {
   return `${normalized.slice(0, separatorIndex + 1)}`
 }
 
+function isEditableTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false
+  if (target.isContentEditable) return true
+  return Boolean(target.closest("input, textarea, [contenteditable='true']"))
+}
+
 export function GlobalSearch() {
   const router = useRouter()
   const queryClient = useQueryClient()
@@ -101,18 +87,11 @@ export function GlobalSearch() {
   const [selectedBucketScopes, setSelectedBucketScopes] = useState<string[]>([])
   const [selectedCredentialIds, setSelectedCredentialIds] = useState<string[]>([])
   const [selectedType, setSelectedType] = useState<string>("all")
-  const [bulkDeleteScheduleMode, setBulkDeleteScheduleMode] = useState<"once" | "cron">("once")
-  const [bulkDeleteScheduleCron, setBulkDeleteScheduleCron] = useState("0 * * * *")
   const [sortBy, setSortBy] = useState<"name" | "size" | "lastModified">("name")
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc")
 
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set())
-  const [allMatchingSelected, setAllMatchingSelected] = useState(false)
   const [isBulkRunning, setIsBulkRunning] = useState(false)
-  const [bulkDeleteConfirmOpen, setBulkDeleteConfirmOpen] = useState(false)
-  const [bulkDeletePreviewOpen, setBulkDeletePreviewOpen] = useState(false)
-  const [bulkDeletePreview, setBulkDeletePreview] = useState<BulkDeleteTaskPreview | null>(null)
-  const [pendingBulkDeleteBody, setPendingBulkDeleteBody] = useState<BulkDeleteTaskBody | null>(null)
 
   const [deleteOpen, setDeleteOpen] = useState(false)
   const [deleteItems, setDeleteItems] = useState<SearchItem[]>([])
@@ -123,6 +102,8 @@ export function GlobalSearch() {
 
   const [renameOpen, setRenameOpen] = useState(false)
   const [renameTarget, setRenameTarget] = useState<SearchItem | null>(null)
+
+  const selectionAnchorRef = useRef<string | null>(null)
 
   const { data: credentials = [] } = useQuery<Credential[]>({
     queryKey: ["credentials"],
@@ -173,7 +154,7 @@ export function GlobalSearch() {
 
   const resetSelection = () => {
     setSelectedKeys(new Set())
-    setAllMatchingSelected(false)
+    selectionAnchorRef.current = null
   }
 
   const buildSearchParams = (skip = 0, take = PAGE_SIZE) => {
@@ -229,36 +210,44 @@ export function GlobalSearch() {
     enabled: queryValue.length >= MIN_QUERY_LENGTH,
   })
 
-  const totalResults = searchData?.total ?? 0
-
   const items = useMemo<SearchItem[]>(
     () => (searchData?.results ?? []).map((result) => toSearchItem(result)),
     [searchData]
   )
 
+  const visibleRowIds = useMemo(() => items.map((item) => rowId(item)), [items])
+
   const selectedItems = items.filter((item) => selectedKeys.has(rowId(item)))
-  const selectedCount = allMatchingSelected ? totalResults : selectedKeys.size
+  const selectedCount = selectedKeys.size
 
-  const fetchAllMatchingItems = async () => {
-    const allItems: SearchItem[] = []
-    let currentSkip = 0
-    let total = 0
+  useEffect(() => {
+    if (!selectionAnchorRef.current) return
+    if (!visibleRowIds.includes(selectionAnchorRef.current)) {
+      selectionAnchorRef.current = null
+    }
+  }, [visibleRowIds])
 
-    do {
-      const page = await fetchSearchPage(currentSkip, PAGE_SIZE)
-      if (currentSkip === 0) {
-        total = page.total
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!(event.metaKey || event.ctrlKey)) return
+      if (event.key.toLowerCase() !== "a") return
+      if (isEditableTarget(event.target)) return
+
+      event.preventDefault()
+
+      if (visibleRowIds.length === 0) {
+        setSelectedKeys(new Set())
+        selectionAnchorRef.current = null
+        return
       }
-      if (page.results.length === 0) {
-        break
-      }
 
-      allItems.push(...page.results.map((item) => toSearchItem(item)))
-      currentSkip += page.results.length
-    } while (currentSkip < total)
+      setSelectedKeys(new Set(visibleRowIds))
+      selectionAnchorRef.current = visibleRowIds[visibleRowIds.length - 1] ?? null
+    }
 
-    return allItems
-  }
+    window.addEventListener("keydown", onKeyDown)
+    return () => window.removeEventListener("keydown", onKeyDown)
+  }, [visibleRowIds])
 
   const toggleBucketScope = (scope: string) => {
     setSelectedBucketScopes((prev) =>
@@ -332,17 +321,16 @@ export function GlobalSearch() {
   }
 
   const handleBulkDownload = async () => {
+    if (selectedItems.length === 0) return
+
     try {
       setIsBulkRunning(true)
-      const targets = allMatchingSelected
-        ? await fetchAllMatchingItems()
-        : selectedItems
 
-      if (targets.length > 50) {
-        toast.info(`Starting ${targets.length} downloads`)
+      if (selectedItems.length > 50) {
+        toast.info(`Starting ${selectedItems.length} downloads`)
       }
 
-      for (const item of targets) {
+      for (const item of selectedItems) {
         await handleDownload(item)
       }
     } catch {
@@ -361,7 +349,7 @@ export function GlobalSearch() {
     )
 
     if (!singleContext) {
-      toast.error("Bulk delete across accounts requires 'Select all matching files' mode")
+      toast.error("Select files from a single bucket/account to delete together")
       return
     }
 
@@ -370,108 +358,8 @@ export function GlobalSearch() {
     setDeleteOpen(true)
   }
 
-  const buildBulkDeleteBody = (): BulkDeleteTaskBody => ({
-    query: queryValue,
-    selectedType,
-    selectedCredentialIds,
-    selectedBucketScopes,
-    schedule:
-      bulkDeleteScheduleMode === "cron"
-        ? { cron: bulkDeleteScheduleCron.trim() }
-        : null,
-  })
-
-  const fetchBulkDeletePreview = async (body: BulkDeleteTaskBody): Promise<BulkDeleteTaskPreview> => {
-    const res = await fetch("/api/tasks/bulk-delete", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        ...body,
-        previewOnly: true,
-      }),
-    })
-
-    const data = await res.json()
-    if (!res.ok) {
-      throw new Error(data?.error ?? "Failed to build bulk delete plan")
-    }
-
-    const preview = data?.preview as BulkDeleteTaskPreview | undefined
-    if (!preview || !Array.isArray(preview.summary) || !Array.isArray(preview.commands)) {
-      throw new Error("Invalid bulk delete preview response")
-    }
-    return preview
-  }
-
-  const submitBulkDeleteTask = async (body: BulkDeleteTaskBody) => {
-    const requestBody: BulkDeleteTaskBody = {
-      ...body,
-      ...(body.schedule ? { confirmDestructiveSchedule: true } : {}),
-    }
-    const res = await fetch("/api/tasks/bulk-delete", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(requestBody),
-    })
-
-    const data = await res.json()
-    if (!res.ok) {
-      throw new Error(data?.error ?? "Failed to create bulk delete task")
-    }
-
-    queryClient.invalidateQueries({ queryKey: ["background-tasks"] })
-    toast.success(data?.duplicate ? "Equivalent bulk delete task already queued" : "Bulk delete task started")
-    resetSelection()
-  }
-
-  const handleBulkDelete = async () => {
-    if (bulkDeleteScheduleMode === "cron" && !bulkDeleteScheduleCron.trim()) {
-      toast.error("Cron schedule is required")
-      return
-    }
-
-    if (allMatchingSelected) {
-      try {
-        setIsBulkRunning(true)
-        const body = buildBulkDeleteBody()
-        const preview = await fetchBulkDeletePreview(body)
-        setPendingBulkDeleteBody(body)
-        setBulkDeletePreview(preview)
-        setBulkDeletePreviewOpen(true)
-      } catch (error) {
-        toast.error(error instanceof Error ? error.message : "Failed to build bulk delete plan")
-      } finally {
-        setIsBulkRunning(false)
-      }
-      return
-    }
-
+  const handleBulkDelete = () => {
     openDeleteDialog(selectedItems)
-  }
-
-  const handleConfirmBulkDeleteFromPreview = async () => {
-    if (!pendingBulkDeleteBody) {
-      toast.error("Missing bulk delete payload")
-      return
-    }
-
-    if (!hasDestructiveConfirmBypass(DESTRUCTIVE_CONFIRM_SCOPE)) {
-      setBulkDeletePreviewOpen(false)
-      setBulkDeleteConfirmOpen(true)
-      return
-    }
-
-    try {
-      setIsBulkRunning(true)
-      await submitBulkDeleteTask(pendingBulkDeleteBody)
-      setBulkDeletePreviewOpen(false)
-      setBulkDeletePreview(null)
-      setPendingBulkDeleteBody(null)
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Failed to create bulk delete task")
-    } finally {
-      setIsBulkRunning(false)
-    }
   }
 
   const handleOpenInBucket = (item: SearchItem) => {
@@ -490,11 +378,65 @@ export function GlobalSearch() {
     router.push(`/dashboard?${params}`)
   }
 
-  const canSelectAllMatching =
-    !allMatchingSelected &&
-    items.length > 0 &&
-    selectedKeys.size === items.length &&
-    totalResults > items.length
+  const handleSelect = (item: SearchItem, options?: { shiftKey?: boolean }) => {
+    const id = rowId(item)
+
+    setSelectedKeys((prev) => {
+      const next = new Set(prev)
+      const shouldSelect = !prev.has(id)
+      const anchorId = selectionAnchorRef.current
+
+      if (options?.shiftKey && anchorId) {
+        const anchorIndex = visibleRowIds.indexOf(anchorId)
+        const currentIndex = visibleRowIds.indexOf(id)
+
+        if (anchorIndex !== -1 && currentIndex !== -1) {
+          const [start, end] =
+            anchorIndex <= currentIndex
+              ? [anchorIndex, currentIndex]
+              : [currentIndex, anchorIndex]
+
+          for (const rangeId of visibleRowIds.slice(start, end + 1)) {
+            if (shouldSelect) {
+              next.add(rangeId)
+            } else {
+              next.delete(rangeId)
+            }
+          }
+
+          selectionAnchorRef.current = id
+          return next
+        }
+      }
+
+      if (shouldSelect) {
+        next.add(id)
+      } else {
+        next.delete(id)
+      }
+
+      selectionAnchorRef.current = id
+      return next
+    })
+  }
+
+  const handleSelectAll = () => {
+    setSelectedKeys((prev) => {
+      if (visibleRowIds.length === 0) {
+        selectionAnchorRef.current = null
+        return new Set()
+      }
+
+      const allSelected = visibleRowIds.every((id) => prev.has(id))
+      if (allSelected) {
+        selectionAnchorRef.current = null
+        return new Set()
+      }
+
+      selectionAnchorRef.current = visibleRowIds[visibleRowIds.length - 1] ?? null
+      return new Set(visibleRowIds)
+    })
+  }
 
   return (
     <div className="flex h-full flex-col">
@@ -524,29 +466,11 @@ export function GlobalSearch() {
           setSelectedType(type)
           resetSelection()
         }}
-        bulkDeleteScheduleMode={bulkDeleteScheduleMode}
-        onBulkDeleteScheduleModeChange={setBulkDeleteScheduleMode}
-        bulkDeleteScheduleCron={bulkDeleteScheduleCron}
-        onBulkDeleteScheduleCronChange={setBulkDeleteScheduleCron}
       />
 
       {selectedCount > 0 && (
         <MultiSelectToolbar
           selectedCount={selectedCount}
-          selectionHint={allMatchingSelected ? "All matching files selected" : undefined}
-          selectAllLabel={
-            canSelectAllMatching
-              ? `Select all ${totalResults.toLocaleString()} matching files`
-              : undefined
-          }
-          onSelectAllAcrossResults={
-            canSelectAllMatching
-              ? () => {
-                  setSelectedKeys(new Set(items.map((item) => rowId(item))))
-                  setAllMatchingSelected(true)
-                }
-              : undefined
-          }
           onDelete={handleBulkDelete}
           onDownload={handleBulkDownload}
           onClear={resetSelection}
@@ -576,27 +500,8 @@ export function GlobalSearch() {
           files={items}
           isLoading={false}
           selectedKeys={selectedKeys}
-          onSelect={(item) => {
-            const next = new Set(selectedKeys)
-            const id = rowId(item as SearchItem)
-            if (next.has(id)) {
-              next.delete(id)
-              if (allMatchingSelected) {
-                setAllMatchingSelected(false)
-              }
-            } else {
-              next.add(id)
-            }
-            setSelectedKeys(next)
-          }}
-          onSelectAll={() => {
-            if (selectedKeys.size === items.length) {
-              resetSelection()
-            } else {
-              setSelectedKeys(new Set(items.map((item) => rowId(item))))
-              setAllMatchingSelected(false)
-            }
-          }}
+          onSelect={(item, options) => handleSelect(item as SearchItem, options)}
+          onSelectAll={handleSelectAll}
           onNavigate={(item) => handleOpenInBucket(item as SearchItem)}
           onRename={(item) => {
             setRenameTarget(item as SearchItem)
@@ -681,49 +586,9 @@ export function GlobalSearch() {
         />
       )}
 
-      <BulkDeletePreviewDialog
-        open={bulkDeletePreviewOpen}
-        onOpenChange={(open) => {
-          setBulkDeletePreviewOpen(open)
-          if (!open) {
-            setBulkDeletePreview(null)
-            if (!bulkDeleteConfirmOpen) {
-              setPendingBulkDeleteBody(null)
-            }
-          }
-        }}
-        preview={bulkDeletePreview}
-        isRunning={isBulkRunning}
-        onConfirm={() => void handleConfirmBulkDeleteFromPreview()}
-        onCancel={() => setBulkDeletePreviewOpen(false)}
-      />
-
-      <DestructiveConfirmDialog
-        open={bulkDeleteConfirmOpen}
-        onOpenChange={(open) => {
-          setBulkDeleteConfirmOpen(open)
-          if (!open) {
-            setBulkDeletePreview(null)
-            setPendingBulkDeleteBody(null)
-          }
-        }}
-        title="Confirm bulk delete task"
-        description={`This will queue deletion of all ${totalResults.toLocaleString()} matching indexed files.`}
-        actionLabel="Start Delete Task"
-        onConfirm={async () => {
-          if (!pendingBulkDeleteBody) {
-            toast.error("Missing bulk delete payload")
-            throw new Error("Missing bulk delete payload")
-          }
-          await submitBulkDeleteTask(pendingBulkDeleteBody)
-          setBulkDeletePreview(null)
-          setPendingBulkDeleteBody(null)
-        }}
-      />
-
       {isBulkRunning && (
         <div className="pointer-events-none fixed bottom-4 right-4 rounded-md border bg-background px-3 py-2 text-sm shadow">
-          Processing selection...
+          Processing downloads...
         </div>
       )}
     </div>

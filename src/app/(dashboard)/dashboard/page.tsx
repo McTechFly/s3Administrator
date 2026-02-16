@@ -52,6 +52,12 @@ function getBaseNameFromKey(key: string, isFolder: boolean): string {
   return parts[parts.length - 1] ?? normalized
 }
 
+function isEditableTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false
+  if (target.isContentEditable) return true
+  return Boolean(target.closest("input, textarea, [contenteditable='true']"))
+}
+
 function DashboardContent() {
   const searchParams = useSearchParams()
   const router = useRouter()
@@ -68,6 +74,7 @@ function DashboardContent() {
   const [viewMode, setViewMode] = useState<"list" | "gallery">("list")
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null)
   const requestedThumbnailKeysRef = useRef<Set<string>>(new Set())
+  const selectionAnchorRef = useRef<string | null>(null)
 
   const [uploadOpen, setUploadOpen] = useState(false)
   const [deleteOpen, setDeleteOpen] = useState(false)
@@ -204,6 +211,14 @@ function DashboardContent() {
     return sortDir === "asc" ? cmp : -cmp
   }), [filteredGalleryItems, sortBy, sortDir])
 
+  const visibleSelectionKeys = useMemo(
+    () =>
+      viewMode === "gallery"
+        ? sortedGalleryItems.map((item) => item.key)
+        : sortedItems.map((item) => item.key),
+    [sortedGalleryItems, sortedItems, viewMode]
+  )
+
   useEffect(() => {
     if (viewMode !== "gallery") return
     if (!bucket) return
@@ -261,6 +276,7 @@ function DashboardContent() {
     queryClient.invalidateQueries({ queryKey: ["gallery"] })
     queryClient.invalidateQueries({ queryKey: ["bucket-stats"] })
     setSelectedKeys(new Set())
+    selectionAnchorRef.current = null
   }, [queryClient])
 
   const syncCurrentBucket = useCallback(
@@ -299,11 +315,60 @@ function DashboardContent() {
   useEffect(() => {
     setSelectedKeys(new Set())
     setLightboxIndex(null)
+    selectionAnchorRef.current = null
   }, [bucket, prefix, credentialId, viewMode])
 
   useEffect(() => {
     requestedThumbnailKeysRef.current.clear()
   }, [bucket, prefix, credentialId])
+
+  useEffect(() => {
+    if (!selectionAnchorRef.current) return
+    if (!visibleSelectionKeys.includes(selectionAnchorRef.current)) {
+      selectionAnchorRef.current = null
+    }
+  }, [visibleSelectionKeys])
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!(event.metaKey || event.ctrlKey)) return
+      if (event.key.toLowerCase() !== "a") return
+      if (isEditableTarget(event.target)) return
+      if (
+        uploadOpen ||
+        deleteOpen ||
+        renameOpen ||
+        newFolderOpen ||
+        moveConfirmOpen ||
+        lightboxIndex !== null
+      ) {
+        return
+      }
+
+      event.preventDefault()
+
+      if (visibleSelectionKeys.length === 0) {
+        setSelectedKeys(new Set())
+        selectionAnchorRef.current = null
+        return
+      }
+
+      setSelectedKeys(new Set(visibleSelectionKeys))
+      selectionAnchorRef.current =
+        visibleSelectionKeys[visibleSelectionKeys.length - 1] ?? null
+    }
+
+    window.addEventListener("keydown", onKeyDown)
+    return () => window.removeEventListener("keydown", onKeyDown)
+  }, [
+    visibleSelectionKeys,
+    uploadOpen,
+    deleteOpen,
+    renameOpen,
+    newFolderOpen,
+    moveConfirmOpen,
+    lightboxIndex,
+  ])
 
   function handleNavigate(folderKey: string) {
     const params = new URLSearchParams({ bucket })
@@ -311,33 +376,66 @@ function DashboardContent() {
     if (credentialId) params.set("credentialId", credentialId)
     router.push(`/dashboard?${params}`)
     setSelectedKeys(new Set())
+    selectionAnchorRef.current = null
   }
 
-  function handleSelect(key: string) {
+  function handleSelect(key: string, options?: { shiftKey?: boolean }) {
     setSelectedKeys((prev) => {
       const next = new Set(prev)
-      if (next.has(key)) next.delete(key)
-      else next.add(key)
+      const shouldSelect = !prev.has(key)
+      const anchorKey = selectionAnchorRef.current
+
+      if (options?.shiftKey && anchorKey) {
+        const anchorIndex = visibleSelectionKeys.indexOf(anchorKey)
+        const currentIndex = visibleSelectionKeys.indexOf(key)
+
+        if (anchorIndex !== -1 && currentIndex !== -1) {
+          const [start, end] =
+            anchorIndex <= currentIndex
+              ? [anchorIndex, currentIndex]
+              : [currentIndex, anchorIndex]
+
+          for (const rangeKey of visibleSelectionKeys.slice(start, end + 1)) {
+            if (shouldSelect) {
+              next.add(rangeKey)
+            } else {
+              next.delete(rangeKey)
+            }
+          }
+
+          selectionAnchorRef.current = key
+          return next
+        }
+      }
+
+      if (shouldSelect) {
+        next.add(key)
+      } else {
+        next.delete(key)
+      }
+
+      selectionAnchorRef.current = key
       return next
     })
   }
 
   function handleSelectAll() {
-    const visibleKeys = viewMode === "gallery"
-      ? sortedGalleryItems.map((item) => item.key)
-      : sortedItems.map((item) => item.key)
+    setSelectedKeys((prev) => {
+      if (visibleSelectionKeys.length === 0) {
+        selectionAnchorRef.current = null
+        return new Set()
+      }
 
-    if (visibleKeys.length === 0) {
-      setSelectedKeys(new Set())
-      return
-    }
+      const allSelected = visibleSelectionKeys.every((key) => prev.has(key))
+      if (allSelected) {
+        selectionAnchorRef.current = null
+        return new Set()
+      }
 
-    const allSelected = visibleKeys.every((key) => selectedKeys.has(key))
-    if (allSelected) {
-      setSelectedKeys(new Set())
-    } else {
-      setSelectedKeys(new Set(visibleKeys))
-    }
+      selectionAnchorRef.current =
+        visibleSelectionKeys[visibleSelectionKeys.length - 1] ?? null
+      return new Set(visibleSelectionKeys)
+    })
   }
 
   function handleSort(column: "name" | "size" | "lastModified") {
@@ -646,7 +744,10 @@ function DashboardContent() {
               ? "Move-to-selected-folder is available in list mode."
               : undefined
           }
-          onClear={() => setSelectedKeys(new Set())}
+          onClear={() => {
+            setSelectedKeys(new Set())
+            selectionAnchorRef.current = null
+          }}
         />
       )}
 
@@ -657,7 +758,7 @@ function DashboardContent() {
           isFetchingNextPage={isFetchingNextPage}
           hasNextPage={Boolean(hasNextPage)}
           selectedKeys={selectedKeys}
-          onSelect={(item) => handleSelect(item.key)}
+          onSelect={(item, options) => handleSelect(item.key, options)}
           onSelectAllVisible={handleSelectAll}
           onNavigate={(item) => {
             if (!item.isFolder) return
@@ -691,7 +792,7 @@ function DashboardContent() {
           files={sortedItems}
           isLoading={isLoading}
           selectedKeys={selectedKeys}
-          onSelect={(file) => handleSelect(file.key)}
+          onSelect={(file, options) => handleSelect(file.key, options)}
           onSelectAll={handleSelectAll}
           onNavigate={(file) => handleNavigate(file.key)}
           onRename={(file) => handleRename(file.key, file.isFolder)}

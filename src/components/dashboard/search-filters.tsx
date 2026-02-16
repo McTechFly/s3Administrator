@@ -39,10 +39,6 @@ interface SearchFiltersProps {
   onClearBucketScopes: () => void
   selectedType: string
   onTypeChange: (type: string) => void
-  bulkDeleteScheduleMode: "once" | "cron"
-  onBulkDeleteScheduleModeChange: (mode: "once" | "cron") => void
-  bulkDeleteScheduleCron: string
-  onBulkDeleteScheduleCronChange: (value: string) => void
 }
 
 export function SearchFilters({
@@ -59,10 +55,6 @@ export function SearchFilters({
   onClearBucketScopes,
   selectedType,
   onTypeChange,
-  bulkDeleteScheduleMode,
-  onBulkDeleteScheduleModeChange,
-  bulkDeleteScheduleCron,
-  onBulkDeleteScheduleCronChange,
 }: SearchFiltersProps) {
   return (
     <div className="space-y-3 border-b px-4 py-3">
@@ -177,32 +169,6 @@ export function SearchFilters({
         </DropdownMenu>
       </div>
 
-      <div className="flex flex-wrap items-center gap-2">
-        <Button
-          type="button"
-          size="sm"
-          variant={bulkDeleteScheduleMode === "once" ? "default" : "outline"}
-          onClick={() => onBulkDeleteScheduleModeChange("once")}
-        >
-          Bulk Delete: One-time
-        </Button>
-        <Button
-          type="button"
-          size="sm"
-          variant={bulkDeleteScheduleMode === "cron" ? "default" : "outline"}
-          onClick={() => onBulkDeleteScheduleModeChange("cron")}
-        >
-          Bulk Delete: Scheduled (UTC)
-        </Button>
-        {bulkDeleteScheduleMode === "cron" ? (
-          <Input
-            className="h-9 w-full max-w-xs"
-            value={bulkDeleteScheduleCron}
-            onChange={(event) => onBulkDeleteScheduleCronChange(event.target.value)}
-            placeholder="0 * * * *"
-          />
-        ) : null}
-      </div>
     </div>
   )
 }
