@@ -11,6 +11,7 @@ const LOCAL_USER = {
 }
 
 const LOCAL_HOSTNAMES = new Set(["localhost", "127.0.0.1", "0.0.0.0", "::1"])
+const COMMUNITY_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000
 
 function normalizeUrlEnvVar(key: "AUTH_URL" | "NEXT_PUBLIC_SITE_URL") {
   const raw = process.env[key]?.trim()
@@ -59,6 +60,41 @@ async function ensureLocalUser() {
   }
 }
 
+type SessionLike = {
+  user?: {
+    id?: string
+    role?: string
+    name?: string | null
+    email?: string | null
+  }
+  expires?: string
+} | null
+
+function hasSessionUserId(session: SessionLike): boolean {
+  return typeof session?.user?.id === "string" && session.user.id.length > 0
+}
+
+function buildCommunitySession(): NonNullable<SessionLike> {
+  return {
+    user: {
+      id: LOCAL_USER.id,
+      role: LOCAL_USER.role,
+      name: LOCAL_USER.name,
+      email: LOCAL_USER.email,
+    },
+    expires: new Date(Date.now() + COMMUNITY_SESSION_TTL_MS).toISOString(),
+  }
+}
+
+async function resolveCommunitySessionFallback(
+  session: SessionLike
+): Promise<SessionLike> {
+  if (!isCommunityEdition()) return session
+  if (hasSessionUserId(session)) return session
+  await ensureLocalUser()
+  return buildCommunitySession()
+}
+
 function buildCommunityAuth() {
   return NextAuth({
     providers: [
@@ -92,7 +128,6 @@ function buildCommunityAuth() {
 
 type AuthModule = ReturnType<typeof buildCommunityAuth>
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 let _authModule: AuthModule | null = null
 
 const _ready: Promise<AuthModule> = isCommunityEdition()
@@ -125,22 +160,35 @@ export const handlers = {
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export const auth: AuthModule["auth"] = ((...args: any[]) => {
-  // Fast path: if the module is already resolved, delegate immediately.
-  if (_authModule) {
-    return (_authModule.auth as (...a: unknown[]) => unknown)(...args)
-  }
   // auth() has two calling conventions in Auth.js v5:
   //   1. auth()              → returns Promise<Session> (server components / route handlers)
   //   2. auth(callback)      → returns middleware function (proxy.ts)
-  // For case 2 the outer call happens at import time (before _ready settles),
+  // For case 2 the outer call can happen at import time (before _ready settles),
   // so we return a wrapper that awaits _ready on each request.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return (async (req: any, ctx: any) => {
-    const m = await _ready
-    const innerAuth = m.auth as (...a: unknown[]) => unknown
-    const middleware = innerAuth(...args) as (r: unknown, c: unknown) => unknown
-    return middleware(req, ctx)
-  }) as unknown
+  if (args.length > 0 && typeof args[0] === "function") {
+    if (_authModule) {
+      return (_authModule.auth as (...a: unknown[]) => unknown)(...args)
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return (async (req: any, ctx: any) => {
+      const m = await _ready
+      const innerAuth = m.auth as (...a: unknown[]) => unknown
+      const middleware = innerAuth(...args) as (r: unknown, c: unknown) => unknown
+      return middleware(req, ctx)
+    }) as unknown
+  }
+
+  // For plain auth() calls used by API routes/server components, ensure that
+  // community mode always resolves to a local session even with no cookie.
+  return (async () => {
+    const m = _authModule ?? (await _ready)
+    const innerAuth = m.auth as (...a: unknown[]) => Promise<SessionLike>
+    const session = await innerAuth(...args)
+    if (args.length === 0) {
+      return resolveCommunitySessionFallback(session)
+    }
+    return session
+  })() as unknown
 }) as AuthModule["auth"]
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
