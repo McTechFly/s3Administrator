@@ -6,6 +6,19 @@ import { logSystemEvent } from "@/lib/system-logger"
 const LOG_API_REQUESTS =
   (process.env.SYSTEM_LOG_API_REQUESTS ?? "true").toLowerCase() !== "false"
 
+function isInternalTaskProcessRequest(pathname: string, request: { headers: Headers; nextUrl: URL }) {
+  if (pathname !== "/api/tasks/process") return false
+
+  const internalToken = (process.env.TASK_ENGINE_INTERNAL_TOKEN ?? "").trim()
+  if (!internalToken) return false
+
+  const requestToken = (request.headers.get("x-task-engine-token") ?? "").trim()
+  if (requestToken !== internalToken) return false
+
+  const requestedUserId = (request.nextUrl.searchParams.get("userId") ?? "").trim()
+  return requestedUserId.length > 0
+}
+
 function shouldLogApiRequest(pathname: string) {
   if (!LOG_API_REQUESTS) return false
   if (!pathname.startsWith("/api/")) return false
@@ -37,6 +50,10 @@ const cloudMiddleware = auth((req) => {
   // Analytics ingestion is intentionally public so unauthenticated pages
   // (like /login) can submit page/click events without auth redirects/CORS noise.
   if (isPublicAnalyticsEndpoint) {
+    return NextResponse.next()
+  }
+
+  if (isInternalTaskProcessRequest(pathname, req)) {
     return NextResponse.next()
   }
 

@@ -228,6 +228,7 @@ function DashboardContent() {
         (item) =>
           !item.isFolder &&
           item.isVideo &&
+          item.thumbnailStatus !== null &&
           item.thumbnailStatus !== "ready" &&
           !requestedThumbnailKeysRef.current.has(item.key)
       )
@@ -256,7 +257,7 @@ function DashboardContent() {
           }),
         }).catch(() => null)
 
-        if (!res) {
+        if (!res || !res.ok) {
           for (const key of keys) {
             requestedThumbnailKeysRef.current.delete(key)
           }

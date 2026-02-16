@@ -1,5 +1,5 @@
 .PHONY: help \
-cloud-setup cloud-start cloud-start-prod cloud-stop cloud-restart cloud-restart-full cloud-migrate cloud-local \
+cloud-setup cloud-start cloud-start-prod cloud-stop cloud-restart cloud-restart-full cloud-migrate cloud-local cloud-check-migrations \
 community-setup community-start community-stop community-restart community-restart-full community-migrate community-local community-reset \
 log log-worker stripe-listen
 
@@ -38,19 +38,30 @@ cloud-setup: ## Build images, start DB, run migrations & seed for cloud mode
 	$(DC_CLOUD) run --rm -T tools npx --no-install prisma db seed
 	@echo "\n✓ Cloud setup complete."
 
-cloud-start: ## Start cloud stack (app + worker + db + proxy)
+cloud-check-migrations: ## Verify cloud DB schema is up to date (fails if migrations are pending)
+	$(DC_CLOUD) up db -d
+	@echo "Waiting for PostgreSQL to be ready..."
+	@until $(DC_CLOUD) exec -T db pg_isready -U s3admin -d s3_admin -q 2>/dev/null; do sleep 1; done
+	$(DC_CLOUD) run --rm -T tools npx --no-install prisma migrate status
+	@echo "✓ Cloud migration status is healthy."
+
+cloud-start: ## Validate migrations, then start cloud stack (app + worker + db + proxy)
 	@. ./.env 2>/dev/null; \
 	if [ "$$POSTGRES_PASSWORD" = "password" ] || [ -z "$$POSTGRES_PASSWORD" ]; then \
 	echo "ERROR: Set a strong POSTGRES_PASSWORD in .env"; exit 1; \
 	fi
+	$(DC_CLOUD) build tools
+	$(MAKE) cloud-check-migrations
 	$(DC_CLOUD) up -d app worker db proxy
 	@echo "✓ Cloud stack is running."
 
-cloud-start-prod: ## Alias for cloud-start (app + worker + db + proxy)
+cloud-start-prod: ## Alias for cloud-start with migration validation
 	@. ./.env 2>/dev/null; \
 	if [ "$$POSTGRES_PASSWORD" = "password" ] || [ -z "$$POSTGRES_PASSWORD" ]; then \
 	echo "ERROR: Set a strong POSTGRES_PASSWORD in .env"; exit 1; \
 	fi
+	$(DC_CLOUD) build tools
+	$(MAKE) cloud-check-migrations
 	$(DC_CLOUD) up -d app worker db proxy
 	@echo "✓ Cloud stack is running."
 
@@ -58,13 +69,16 @@ cloud-stop: ## Stop cloud containers
 	$(DC_CLOUD) down
 	@echo "✓ Cloud stopped."
 
-cloud-restart: ## Fast restart: rebuild app image and restart app
+cloud-restart: ## Rebuild app, validate migrations, then restart app
 	$(DC_CLOUD) build app
+	$(DC_CLOUD) build tools
+	$(MAKE) cloud-check-migrations
 	$(DC_CLOUD) up -d app
 	@echo "✓ Cloud app restarted."
 
-cloud-restart-full: ## Full restart: rebuild app + tools images and restart app + worker
+cloud-restart-full: ## Rebuild app + tools, validate migrations, then restart app + worker
 	$(DC_CLOUD) build app tools
+	$(MAKE) cloud-check-migrations
 	$(DC_CLOUD) up -d app worker
 	@echo "✓ Cloud app + worker restarted."
 

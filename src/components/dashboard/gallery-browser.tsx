@@ -142,7 +142,11 @@ export function GalleryBrowser({
                         <div className="flex flex-col items-center gap-2">
                           <Video className="h-7 w-7" />
                           <span className="text-xs">
-                            {item.thumbnailStatus === "failed" ? "Thumbnail failed" : "Generating..."}
+                            {item.thumbnailStatus === null
+                              ? "Preview disabled"
+                              : item.thumbnailStatus === "failed"
+                                ? "Thumbnail failed"
+                                : "Generating..."}
                           </span>
                         </div>
                       ) : (

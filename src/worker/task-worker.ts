@@ -34,8 +34,16 @@ async function processUserOnce(userId: string, workerId: string) {
     headers: {
       "x-task-engine-token": token,
     },
+    redirect: "manual",
   })
   const finishedAt = new Date()
+
+  if (response.status >= 300 && response.status < 400) {
+    const location = response.headers.get("location")
+    throw new Error(
+      `Task process request redirected for user ${userId} (${response.status})${location ? ` -> ${location}` : ""}`
+    )
+  }
 
   if (!response.ok) {
     const body = await response.text().catch(() => "")

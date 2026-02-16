@@ -86,10 +86,11 @@ Run `make help` to see all available commands.
 | Command | Description |
 |---------|-------------|
 | `make cloud-setup` | Build images, start DB, run migrations & seed |
-| `make cloud-start` | Start the stack (app + worker + db + proxy) |
+| `make cloud-check-migrations` | Verify DB schema is up to date (fails on pending/broken migrations) |
+| `make cloud-start` | Validate migrations, then start the stack (app + worker + db + proxy) |
 | `make cloud-stop` | Stop containers |
-| `make cloud-restart` | Rebuild and restart app |
-| `make cloud-restart-full` | Rebuild and restart app + worker |
+| `make cloud-restart` | Rebuild app, validate migrations, and restart app |
+| `make cloud-restart-full` | Rebuild app + tools, validate migrations, and restart app + worker |
 | `make cloud-migrate` | Run migrations & seed |
 | `make cloud-local` | Start DB and run Next.js locally in cloud mode |
 
