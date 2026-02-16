@@ -44,6 +44,46 @@ export interface TaskQueueWorkerOptions {
   enabled: boolean
 }
 
+function extractUserIdFromJobData(data: unknown): string | null {
+  const parseStructured = (value: unknown): unknown => {
+    if (typeof value === "string") {
+      try {
+        return JSON.parse(value)
+      } catch {
+        return null
+      }
+    }
+    if (value && typeof Buffer !== "undefined" && Buffer.isBuffer(value)) {
+      try {
+        return JSON.parse(value.toString("utf8"))
+      } catch {
+        return null
+      }
+    }
+    return value
+  }
+
+  const readUserId = (value: unknown): string | null => {
+    const payload = parseStructured(value)
+    if (!payload || typeof payload !== "object") {
+      return null
+    }
+
+    const directUserId = (payload as { userId?: unknown }).userId
+    if (typeof directUserId === "string" && directUserId.trim()) {
+      return directUserId.trim()
+    }
+
+    if ("data" in payload) {
+      return readUserId((payload as { data?: unknown }).data)
+    }
+
+    return null
+  }
+
+  return readUserId(data)
+}
+
 function createCronEveryNSeconds(seconds: number): string {
   const clamped = Math.min(59, Math.max(2, Math.floor(seconds)))
   return `*/${clamped} * * * * *`
@@ -55,10 +95,10 @@ async function loadPgBossConstructor(): Promise<BossConstructor | null> {
       "specifier",
       "return import(specifier)"
     ) as (specifier: string) => Promise<unknown>
-    const module = await dynamicImport("pg-boss") as {
+    const importedModule = await dynamicImport("pg-boss") as {
       default?: BossConstructor
     }
-    return module.default ?? null
+    return importedModule.default ?? null
   } catch {
     return null
   }
@@ -262,11 +302,19 @@ async function runPgBossWorker(
       retryLimit: 0,
     },
     async (job) => {
-      const userId = job.data && typeof job.data === "object"
-        ? (job.data as { userId?: unknown }).userId
-        : undefined
-      if (typeof userId !== "string" || !userId.trim()) return
-      await processUserBurst(userId, options.processUserOnce)
+      const jobs = Array.isArray(job) ? job : [job]
+      for (const current of jobs) {
+        const rawData =
+          current && typeof current === "object" && "data" in current
+            ? (current as { data?: unknown }).data
+            : current
+        const userId = extractUserIdFromJobData(rawData)
+        if (!userId) {
+          console.warn(`[task-worker:${options.workerId}] skipped dispatch job with invalid payload`)
+          continue
+        }
+        await processUserBurst(userId, options.processUserOnce)
+      }
     }
   )
 

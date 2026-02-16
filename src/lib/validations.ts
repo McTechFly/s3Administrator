@@ -132,6 +132,10 @@ export const previewSchema = z.object({
   key: s3KeySchema,
 })
 
+export const taskScheduleSchema = z.object({
+  cron: z.string().trim().min(1).max(120),
+})
+
 export const transferTaskSchema = z.object({
   scope: z.enum(["folder", "bucket"]),
   operation: z.enum(["sync", "copy", "move", "migrate"]),
@@ -141,4 +145,6 @@ export const transferTaskSchema = z.object({
   destinationBucket: s3BucketSchema,
   destinationCredentialId: z.string().optional(),
   destinationPrefix: z.string().max(1024).optional(),
+  schedule: taskScheduleSchema.nullable().optional(),
+  confirmDestructiveSchedule: z.boolean().optional(),
 })

@@ -206,6 +206,7 @@ model BackgroundTask {
   lastError             String?
   dedupeKey             String?
   isRecurring           Boolean  @default(false)
+  scheduleCron          String?
   scheduleIntervalSeconds Int?
   nextRunAt             DateTime @default(now())
   startedAt             DateTime?

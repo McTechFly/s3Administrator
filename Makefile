@@ -1,7 +1,7 @@
 .PHONY: help \
 cloud-setup cloud-start cloud-start-prod cloud-stop cloud-restart cloud-restart-full cloud-migrate cloud-local \
 community-setup community-start community-stop community-restart community-restart-full community-migrate community-local community-reset \
-log stripe-listen
+log log-worker stripe-listen
 
 DC = docker compose --env-file .env -f docker/docker-compose.yml
 DC_COMMUNITY = COMPOSE_PROJECT_NAME=s3admin-community ENVIRONMENT=COMMUNITY NEXT_PUBLIC_EDITION=community $(DC)
@@ -20,7 +20,7 @@ help: ## Show available commands
 	@echo ""
 	@echo "  Utilities"
 	@echo "  ──────────────────────────────────────"
-	@grep -E '^(log|stripe-listen):.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^(log|log-worker|stripe-listen):.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
 	@echo ""
 
 # ─── Cloud ───────────────────────────────────────────────
@@ -139,6 +139,16 @@ log: ## Tail app service logs (set PROFILE=community|cloud, default: community)
 	$(DC_CLOUD) logs -f --tail=200 app; \
 	elif [ "$(PROFILE)" = "community" ]; then \
 	$(DC_COMMUNITY) logs -f --tail=200 app; \
+	else \
+	echo "ERROR: PROFILE must be either 'community' or 'cloud' (got: $(PROFILE))"; \
+	exit 1; \
+	fi
+
+log-worker: ## Tail worker service logs (set PROFILE=community|cloud, default: community)
+	@if [ "$(PROFILE)" = "cloud" ]; then \
+	$(DC_CLOUD) logs -f --tail=200 worker; \
+	elif [ "$(PROFILE)" = "community" ]; then \
+	$(DC_COMMUNITY) logs -f --tail=200 worker; \
 	else \
 	echo "ERROR: PROFILE must be either 'community' or 'cloud' (got: $(PROFILE))"; \
 	exit 1; \

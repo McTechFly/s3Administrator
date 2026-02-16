@@ -46,6 +46,10 @@ export function getTaskWorkerScanIntervalSeconds(): number {
   return parseIntegerEnv(process.env.TASK_WORKER_SCAN_INTERVAL_SECONDS, 10, 2, 300)
 }
 
+export function getTaskMissedScheduleGraceSeconds(): number {
+  return parseIntegerEnv(process.env.TASK_MISSED_SCHEDULE_GRACE_SECONDS, 120, 5, 86_400)
+}
+
 export function getTaskEventRetentionDays(): number {
   return parseIntegerEnv(process.env.TASK_EVENT_RETENTION_DAYS, 90, 7, 3650)
 }

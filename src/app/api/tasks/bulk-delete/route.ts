@@ -8,12 +8,20 @@ import {
 } from "@/lib/file-search"
 import { getUserPlanEntitlements } from "@/lib/plan-entitlements"
 import { buildTaskDedupeKey, createTaskExecutionPlan } from "@/lib/task-plans"
+import {
+  assertValidTaskScheduleCron,
+  TaskScheduleValidationError,
+} from "@/lib/task-schedule"
 
 interface BulkDeletePayload {
   query: string
   selectedType?: string
   selectedCredentialIds?: string[]
   selectedBucketScopes?: string[]
+  schedule?: {
+    cron?: string
+  } | null
+  confirmDestructiveSchedule?: boolean
 }
 
 interface CountRow {
@@ -37,6 +45,7 @@ function buildBulkDeletePreview(params: {
   total: number
   sampleObjects: string[]
   duplicateQueued: boolean
+  scheduleCron: string | null
 }): BulkDeleteTaskPreview {
   const summary = [
     `Search query: "${params.query}"`,
@@ -48,6 +57,9 @@ function buildBulkDeletePreview(params: {
       ? `Bucket scopes in scope: ${params.selectedBucketScopes.length}`
       : "Bucket scopes in scope: all",
     `Estimated matching indexed objects: ${params.total.toLocaleString()}`,
+    params.scheduleCron
+      ? `Schedule: CRON (${params.scheduleCron}) UTC`
+      : "Schedule: one-time run",
   ]
 
   const commands = [
@@ -62,6 +74,9 @@ function buildBulkDeletePreview(params: {
   ]
   if (params.duplicateQueued) {
     warnings.push("An equivalent bulk delete task is already queued or running.")
+  }
+  if (params.scheduleCron) {
+    warnings.push("Recurring destructive task is enabled. Each run can delete objects.")
   }
 
   return {
@@ -122,6 +137,10 @@ export async function POST(request: NextRequest) {
     const selectedBucketScopes = Array.isArray(body?.selectedBucketScopes)
       ? body.selectedBucketScopes.filter((value): value is string => typeof value === "string")
       : []
+    let scheduleCron: string | null = null
+    if (body?.schedule && typeof body.schedule === "object" && typeof body.schedule.cron === "string") {
+      scheduleCron = assertValidTaskScheduleCron(body.schedule.cron)
+    }
 
     const normalizedCredentialIds = Array.from(new Set(selectedCredentialIds)).sort()
     const normalizedBucketScopes = Array.from(new Set(selectedBucketScopes)).sort()
@@ -171,7 +190,10 @@ export async function POST(request: NextRequest) {
       selectedCredentialIds: normalizedCredentialIds,
       selectedBucketScopes: normalizedBucketScopes,
     }
-    const dedupeKey = buildTaskDedupeKey("bulk_delete", taskPayload)
+    const dedupeKey = buildTaskDedupeKey("bulk_delete", {
+      payload: taskPayload,
+      scheduleCron,
+    })
 
     const existingTask = await prisma.backgroundTask.findFirst({
       where: {
@@ -204,10 +226,21 @@ export async function POST(request: NextRequest) {
           total,
           sampleObjects,
           duplicateQueued: Boolean(existingTask),
+          scheduleCron,
         }),
         duplicate: Boolean(existingTask),
         task: existingTask ?? null,
       })
+    }
+
+    if (scheduleCron && !body.confirmDestructiveSchedule) {
+      return NextResponse.json(
+        {
+          error:
+            "Recurring bulk delete requires explicit confirmation",
+        },
+        { status: 400 }
+      )
     }
 
     if (existingTask) {
@@ -227,7 +260,8 @@ export async function POST(request: NextRequest) {
         payload: taskPayload,
         executionPlan: createTaskExecutionPlan("bulk_delete", taskPayload),
         dedupeKey,
-        isRecurring: false,
+        isRecurring: Boolean(scheduleCron),
+        scheduleCron,
         scheduleIntervalSeconds: null,
         progress: {
           total,
@@ -248,6 +282,9 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ task })
   } catch (error) {
     console.error("Failed to create bulk delete task:", error)
+    if (error instanceof TaskScheduleValidationError) {
+      return NextResponse.json({ error: error.message }, { status: 400 })
+    }
     if (isBackgroundTaskSchemaOutdated(error)) {
       return NextResponse.json(
         {

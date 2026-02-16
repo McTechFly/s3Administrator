@@ -30,12 +30,21 @@ import {
   getObjectTransferDisabledMessage,
 } from "@/lib/transfer-task-policy"
 import { logUserAuditAction } from "@/lib/audit-logger"
-import { getTaskEngineInternalToken, getTaskMaxActivePerUser } from "@/lib/task-engine-config"
+import {
+  getTaskEngineInternalToken,
+  getTaskMaxActivePerUser,
+  getTaskMissedScheduleGraceSeconds,
+} from "@/lib/task-engine-config"
 import {
   appendExecutionHistory,
   normalizeExecutionHistory,
   type TaskExecutionHistoryEntry,
 } from "@/lib/task-plans"
+import {
+  nextRunAtForTaskSchedule,
+  resolveTaskSchedule,
+  type ResolvedTaskSchedule,
+} from "@/lib/task-schedule"
 
 export const runtime = "nodejs"
 export const maxDuration = 60
@@ -46,6 +55,7 @@ const LOCK_SECONDS = 45
 const THUMBNAIL_TIMEOUT_MS = 5_000
 const SYNC_POLL_INTERVAL_SECONDS = 60
 const TRANSFER_BATCH_TIME_BUDGET_MS = 8_000
+const MAX_STALE_SCHEDULE_SKIPS_PER_CALL = 32
 
 interface BulkDeleteTaskPayload {
   query: string
@@ -287,14 +297,6 @@ function parseObjectTransferPayload(raw: unknown): ObjectTransferTaskPayload | n
   }
 }
 
-function getSyncPollIntervalMs(payload: ObjectTransferTaskPayload): number {
-  const seconds =
-    payload.pollIntervalSeconds && payload.pollIntervalSeconds >= SYNC_POLL_INTERVAL_SECONDS
-      ? payload.pollIntervalSeconds
-      : SYNC_POLL_INTERVAL_SECONDS
-  return seconds * 1000
-}
-
 function parseObjectTransferProgress(
   raw: unknown,
   totalFallback = 0
@@ -483,6 +485,82 @@ function addTaskHistoryEntry(
     at: new Date().toISOString(),
     ...entry,
   }) as unknown as Prisma.InputJsonValue
+}
+
+async function realignFutureRecurringRun(params: {
+  userId: string
+  now: Date
+  graceMs: number
+}): Promise<boolean> {
+  const { userId, now, graceMs } = params
+  const candidate = await prisma.backgroundTask.findFirst({
+    where: {
+      userId,
+      lifecycleState: "active",
+      status: "pending",
+      isRecurring: true,
+      type: {
+        in: ["bulk_delete", "thumbnail_generate", "object_transfer"],
+      },
+      nextRunAt: {
+        gt: now,
+      },
+    },
+    orderBy: {
+      createdAt: "asc",
+    },
+    select: {
+      id: true,
+      nextRunAt: true,
+      scheduleCron: true,
+      scheduleIntervalSeconds: true,
+      executionHistory: true,
+    },
+  })
+
+  if (!candidate) return false
+
+  const schedule = resolveTaskSchedule({
+    isRecurring: true,
+    scheduleCron: candidate.scheduleCron,
+    scheduleIntervalSeconds: candidate.scheduleIntervalSeconds,
+  })
+  if (!schedule.enabled) return false
+
+  const expectedNextRunAt = nextRunAtForTaskSchedule(schedule, now)
+  if (!expectedNextRunAt) return false
+
+  if (candidate.nextRunAt.getTime() - expectedNextRunAt.getTime() <= graceMs) {
+    return false
+  }
+
+  const updated = await prisma.backgroundTask.updateMany({
+    where: {
+      id: candidate.id,
+      userId,
+      lifecycleState: "active",
+      status: "pending",
+      nextRunAt: candidate.nextRunAt,
+    },
+    data: {
+      nextRunAt: expectedNextRunAt,
+      lastError: null,
+      executionHistory: addTaskHistoryEntry(
+        normalizeExecutionHistory(candidate.executionHistory),
+        {
+          status: "skipped",
+          message: "Realigned scheduled run to server time",
+          metadata: {
+            previousNextRunAt: candidate.nextRunAt.toISOString(),
+            nextRunAt: expectedNextRunAt.toISOString(),
+            realignedAt: now.toISOString(),
+          },
+        }
+      ),
+    },
+  })
+
+  return updated.count > 0
 }
 
 function resolveTaskPlanPayload(executionPlan: unknown, fallbackPayload: unknown): unknown {
@@ -731,6 +809,7 @@ export async function POST(request: Request) {
   let thumbnailPayload: ThumbnailTaskPayload | null = null
   let transferPayload: ObjectTransferTaskPayload | null = null
   let taskExecutionHistory: TaskExecutionHistoryEntry[] = []
+  let claimedTaskSchedule: ResolvedTaskSchedule | null = null
 
   try {
     const internalToken = getTaskEngineInternalToken()
@@ -771,26 +850,99 @@ export async function POST(request: Request) {
       })
     }
 
-    const candidate = await prisma.backgroundTask.findFirst({
-      where: {
-        userId: actorUserId,
-        lifecycleState: "active",
-        type: {
-          in: ["bulk_delete", "thumbnail_generate", "object_transfer"],
-        },
-        status: {
-          in: ["pending", "in_progress"],
-        },
-        nextRunAt: {
-          lte: now,
-        },
-      },
-      orderBy: {
-        createdAt: "asc",
-      },
+    const staleScheduleGraceMs = getTaskMissedScheduleGraceSeconds() * 1000
+    const realignedFutureSchedule = await realignFutureRecurringRun({
+      userId: actorUserId,
+      now,
+      graceMs: staleScheduleGraceMs,
     })
+    let skippedStaleSchedules = 0
+    let candidate: Awaited<ReturnType<typeof prisma.backgroundTask.findFirst>> = null
+
+    for (let index = 0; index < MAX_STALE_SCHEDULE_SKIPS_PER_CALL; index++) {
+      const nextCandidate = await prisma.backgroundTask.findFirst({
+        where: {
+          userId: actorUserId,
+          lifecycleState: "active",
+          type: {
+            in: ["bulk_delete", "thumbnail_generate", "object_transfer"],
+          },
+          status: {
+            in: ["pending", "in_progress"],
+          },
+          nextRunAt: {
+            lte: now,
+          },
+        },
+        orderBy: {
+          createdAt: "asc",
+        },
+      })
+
+      if (!nextCandidate) {
+        break
+      }
+
+      const scheduled = resolveTaskSchedule(nextCandidate)
+      const shouldSkipStaleRun =
+        nextCandidate.status === "pending" &&
+        scheduled.enabled &&
+        now.getTime() - nextCandidate.nextRunAt.getTime() > staleScheduleGraceMs
+
+      if (!shouldSkipStaleRun) {
+        candidate = nextCandidate
+        break
+      }
+
+      const nextRunAt =
+        nextRunAtForTaskSchedule(scheduled, now) ??
+        new Date(now.getTime() + SYNC_POLL_INTERVAL_SECONDS * 1000)
+      const moved = await prisma.backgroundTask.updateMany({
+        where: {
+          id: nextCandidate.id,
+          userId: actorUserId,
+          lifecycleState: "active",
+          status: "pending",
+          nextRunAt: {
+            lte: now,
+          },
+        },
+        data: {
+          nextRunAt,
+          lastError: null,
+          executionHistory: addTaskHistoryEntry(
+            normalizeExecutionHistory(nextCandidate.executionHistory),
+            {
+              status: "skipped",
+              message: "Skipped stale scheduled run after downtime",
+              metadata: {
+                previousNextRunAt: nextCandidate.nextRunAt.toISOString(),
+                nextRunAt: nextRunAt.toISOString(),
+                skippedAt: now.toISOString(),
+              },
+            }
+          ),
+        },
+      })
+      if (moved.count > 0) {
+        skippedStaleSchedules += 1
+      }
+    }
 
     if (!candidate) {
+      if (skippedStaleSchedules > 0) {
+        return NextResponse.json({
+          processed: false,
+          message: "Skipped stale scheduled runs",
+          skippedStaleSchedules,
+        })
+      }
+      if (realignedFutureSchedule) {
+        return NextResponse.json({
+          processed: false,
+          message: "Realigned future scheduled run to server time",
+        })
+      }
       return NextResponse.json({ processed: false, message: "No pending tasks" })
     }
 
@@ -827,6 +979,7 @@ export async function POST(request: Request) {
       attempts: candidate.attempts,
       maxAttempts: candidate.maxAttempts,
     }
+    claimedTaskSchedule = resolveTaskSchedule(candidate)
     taskExecutionHistory = normalizeExecutionHistory(candidate.executionHistory)
 
     if (candidate.type === "thumbnail_generate") {
@@ -1304,17 +1457,20 @@ export async function POST(request: Request) {
 
         await rebuildUserExtensionStats(actorUserId)
 
-        if (transferPayload.operation === "sync") {
-          const cycleProgress = {
-            total,
-            processed: progress.processed,
-            copied: progress.copied,
-            moved: progress.moved,
-            deleted: progress.deleted + syncCleanupDeleted,
-            skipped: progress.skipped,
-            failed: progress.failed + syncCleanupFailed,
-          }
-          const nextRunAt = new Date(Date.now() + getSyncPollIntervalMs(transferPayload))
+        const cycleProgress = {
+          total,
+          processed: progress.processed,
+          copied: progress.copied,
+          moved: progress.moved,
+          deleted: progress.deleted + syncCleanupDeleted,
+          skipped: progress.skipped,
+          failed: progress.failed + syncCleanupFailed,
+        }
+
+        if (claimedTaskSchedule?.enabled) {
+          const nextRunAt =
+            nextRunAtForTaskSchedule(claimedTaskSchedule, new Date()) ??
+            new Date(Date.now() + SYNC_POLL_INTERVAL_SECONDS * 1000)
           await prisma.backgroundTask.update({
             where: { id: candidate.id },
             data: {
@@ -1340,11 +1496,11 @@ export async function POST(request: Request) {
                 status: cycleProgress.failed > 0 ? "failed" : "succeeded",
                 message:
                   cycleProgress.failed > 0
-                    ? "Sync cycle completed with failures"
-                    : "Sync cycle completed",
+                    ? "Scheduled cycle completed with failures"
+                    : "Scheduled cycle completed",
                 metadata: {
                   nextRunAt: nextRunAt.toISOString(),
-                  intervalSeconds: getSyncPollIntervalMs(transferPayload) / 1000,
+                  schedule: claimedTaskSchedule.cron ?? claimedTaskSchedule.legacyIntervalSeconds,
                   progress: cycleProgress,
                 },
               }),
@@ -1354,7 +1510,7 @@ export async function POST(request: Request) {
           await logUserAuditAction({
             userId: actorUserId,
             eventType: "s3_action",
-            eventName: "object_transfer_sync_cycle_completed",
+            eventName: "object_transfer_scheduled_cycle_completed",
             path: "/api/tasks/process",
             method: "POST",
             target: `${transferPayload.sourceBucket} -> ${transferPayload.destinationBucket}`,
@@ -1368,7 +1524,7 @@ export async function POST(request: Request) {
               destinationBucket: transferPayload.destinationBucket,
               destinationPrefix: transferPayload.destinationPrefix,
               nextRunAt: nextRunAt.toISOString(),
-              intervalSeconds: getSyncPollIntervalMs(transferPayload) / 1000,
+              schedule: claimedTaskSchedule.cron ?? claimedTaskSchedule.legacyIntervalSeconds,
               progress: cycleProgress,
               cleanupDeleted: syncCleanupDeleted,
               cleanupFailed: syncCleanupFailed,
@@ -1387,7 +1543,7 @@ export async function POST(request: Request) {
           })
         }
 
-        const hasTransferFailures = progress.failed > 0
+        const hasTransferFailures = cycleProgress.failed > 0
 
         await prisma.backgroundTask.update({
           where: { id: candidate.id },
@@ -1397,7 +1553,7 @@ export async function POST(request: Request) {
             completedAt: new Date(),
             nextRunAt: new Date(),
             progress: {
-              ...progress,
+              ...cycleProgress,
               total,
               remaining: 0,
             } as Prisma.InputJsonObject,
@@ -1411,12 +1567,12 @@ export async function POST(request: Request) {
                 : "Transfer completed",
               metadata: {
                 total,
-                processed: progress.processed,
-                copied: progress.copied,
-                moved: progress.moved,
-                deleted: progress.deleted,
-                skipped: progress.skipped,
-                failed: progress.failed,
+                processed: cycleProgress.processed,
+                copied: cycleProgress.copied,
+                moved: cycleProgress.moved,
+                deleted: cycleProgress.deleted,
+                skipped: cycleProgress.skipped,
+                failed: cycleProgress.failed,
               },
             }),
           },
@@ -1803,6 +1959,45 @@ export async function POST(request: Request) {
     if (batch.length === 0) {
       await rebuildUserExtensionStats(actorUserId)
 
+      if (claimedTaskSchedule?.enabled) {
+        const nextRunAt =
+          nextRunAtForTaskSchedule(claimedTaskSchedule, new Date()) ??
+          new Date(Date.now() + SYNC_POLL_INTERVAL_SECONDS * 1000)
+        await prisma.backgroundTask.update({
+          where: { id: candidate.id },
+          data: {
+            status: "pending",
+            attempts: 0,
+            completedAt: null,
+            nextRunAt,
+            progress: {
+              total: 0,
+              deleted: 0,
+              remaining: 0,
+              cursorId: null,
+            },
+            lastError: null,
+            executionHistory: addTaskHistoryEntry(taskExecutionHistory, {
+              status: "succeeded",
+              message: "Scheduled bulk delete cycle completed",
+              metadata: {
+                deleted: progress.total,
+                nextRunAt: nextRunAt.toISOString(),
+                schedule: claimedTaskSchedule.cron ?? claimedTaskSchedule.legacyIntervalSeconds,
+              },
+            }),
+          },
+        })
+
+        return NextResponse.json({
+          processed: true,
+          taskId: candidate.id,
+          done: false,
+          recurring: true,
+          nextRunAt: nextRunAt.toISOString(),
+        })
+      }
+
       await prisma.backgroundTask.update({
         where: { id: candidate.id },
         data: {
@@ -1907,6 +2102,47 @@ export async function POST(request: Request) {
       }
     }
 
+    if (remaining === 0 && claimedTaskSchedule?.enabled) {
+      const nextRunAt =
+        nextRunAtForTaskSchedule(claimedTaskSchedule, new Date()) ??
+        new Date(Date.now() + SYNC_POLL_INTERVAL_SECONDS * 1000)
+      await prisma.backgroundTask.update({
+        where: { id: candidate.id },
+        data: {
+          status: "pending",
+          attempts: 0,
+          completedAt: null,
+          nextRunAt,
+          progress: {
+            total: 0,
+            deleted: 0,
+            remaining: 0,
+            cursorId: null,
+          },
+          lastError: null,
+          executionHistory: addTaskHistoryEntry(taskExecutionHistory, {
+            status: "succeeded",
+            message: "Scheduled bulk delete cycle completed",
+            metadata: {
+              total,
+              deleted,
+              nextRunAt: nextRunAt.toISOString(),
+              schedule: claimedTaskSchedule.cron ?? claimedTaskSchedule.legacyIntervalSeconds,
+            },
+          }),
+        },
+      })
+
+      return NextResponse.json({
+        processed: true,
+        taskId: candidate.id,
+        deletedInBatch: deletedIds.size,
+        done: false,
+        recurring: true,
+        nextRunAt: nextRunAt.toISOString(),
+      })
+    }
+
     await prisma.backgroundTask.update({
       where: { id: candidate.id },
       data: {
@@ -1923,15 +2159,15 @@ export async function POST(request: Request) {
         lastError: null,
         ...(remaining === 0
           ? {
-            executionHistory: addTaskHistoryEntry(taskExecutionHistory, {
-              status: "succeeded",
-              message: "Bulk delete completed",
-              metadata: {
-                total,
-                deleted,
-              },
-            }),
-          }
+              executionHistory: addTaskHistoryEntry(taskExecutionHistory, {
+                status: "succeeded",
+                message: "Bulk delete completed",
+                metadata: {
+                  total,
+                  deleted,
+                },
+              }),
+            }
           : {}),
       },
     })
@@ -1954,6 +2190,11 @@ export async function POST(request: Request) {
         const nextAttempts = claimedTask.attempts + 1
         const retryable = nextAttempts < claimedTask.maxAttempts
         const backoffSeconds = Math.min(300, Math.pow(2, nextAttempts))
+        const nextScheduledRunAt =
+          claimedTaskSchedule?.enabled
+            ? nextRunAtForTaskSchedule(claimedTaskSchedule, now) ??
+              new Date(now.getTime() + SYNC_POLL_INTERVAL_SECONDS * 1000)
+            : null
 
         if (claimedTask.type === "thumbnail_generate" && thumbnailPayload) {
           await prisma.mediaThumbnail.updateMany({
@@ -2006,21 +2247,42 @@ export async function POST(request: Request) {
           })
         }
 
-        const failureUpdate: Prisma.BackgroundTaskUpdateManyMutationInput = {
-          attempts: nextAttempts,
-          status: retryable ? "pending" : "failed",
-          nextRunAt: retryable
-            ? new Date(now.getTime() + backoffSeconds * 1000)
-            : new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000),
-          lastError: message,
-          completedAt: retryable ? null : now,
-        }
-        if (!retryable) {
-          failureUpdate.executionHistory = addTaskHistoryEntry(taskExecutionHistory, {
-            status: "failed",
-            message,
-          })
-        }
+        const failureUpdate: Prisma.BackgroundTaskUpdateManyMutationInput = (() => {
+          if (claimedTaskSchedule?.enabled && !retryable) {
+            return {
+              attempts: 0,
+              status: "pending",
+              nextRunAt: nextScheduledRunAt ?? new Date(now.getTime() + backoffSeconds * 1000),
+              lastError: message,
+              completedAt: null,
+              executionHistory: addTaskHistoryEntry(taskExecutionHistory, {
+                status: "failed",
+                message: "Scheduled run failed",
+                metadata: {
+                  error: message,
+                  nextRunAt: nextScheduledRunAt?.toISOString() ?? null,
+                },
+              }),
+            }
+          }
+
+          const base: Prisma.BackgroundTaskUpdateManyMutationInput = {
+            attempts: nextAttempts,
+            status: retryable ? "pending" : "failed",
+            nextRunAt: retryable
+              ? new Date(now.getTime() + backoffSeconds * 1000)
+              : new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000),
+            lastError: message,
+            completedAt: retryable ? null : now,
+          }
+          if (!retryable) {
+            base.executionHistory = addTaskHistoryEntry(taskExecutionHistory, {
+              status: "failed",
+              message,
+            })
+          }
+          return base
+        })()
 
         await prisma.backgroundTask.updateMany({
           where: {

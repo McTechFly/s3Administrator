@@ -69,6 +69,10 @@ interface BulkDeleteTaskBody {
   selectedType: string
   selectedCredentialIds: string[]
   selectedBucketScopes: string[]
+  schedule?: {
+    cron: string
+  } | null
+  confirmDestructiveSchedule?: boolean
 }
 
 interface BulkDeleteTaskPreview {
@@ -120,6 +124,8 @@ export function GlobalSearch() {
   const [selectedBucketScopes, setSelectedBucketScopes] = useState<string[]>([])
   const [selectedCredentialIds, setSelectedCredentialIds] = useState<string[]>([])
   const [selectedType, setSelectedType] = useState<string>("all")
+  const [bulkDeleteScheduleMode, setBulkDeleteScheduleMode] = useState<"once" | "cron">("once")
+  const [bulkDeleteScheduleCron, setBulkDeleteScheduleCron] = useState("* * * * *")
   const [sortBy, setSortBy] = useState<"name" | "size" | "lastModified">("name")
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc")
 
@@ -392,6 +398,10 @@ export function GlobalSearch() {
     selectedType,
     selectedCredentialIds,
     selectedBucketScopes,
+    schedule:
+      bulkDeleteScheduleMode === "cron"
+        ? { cron: bulkDeleteScheduleCron.trim() }
+        : null,
   })
 
   const fetchBulkDeletePreview = async (body: BulkDeleteTaskBody): Promise<BulkDeleteTaskPreview> => {
@@ -417,10 +427,14 @@ export function GlobalSearch() {
   }
 
   const submitBulkDeleteTask = async (body: BulkDeleteTaskBody) => {
+    const requestBody: BulkDeleteTaskBody = {
+      ...body,
+      ...(body.schedule ? { confirmDestructiveSchedule: true } : {}),
+    }
     const res = await fetch("/api/tasks/bulk-delete", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      body: JSON.stringify(requestBody),
     })
 
     const data = await res.json()
@@ -434,6 +448,11 @@ export function GlobalSearch() {
   }
 
   const handleBulkDelete = async () => {
+    if (bulkDeleteScheduleMode === "cron" && !bulkDeleteScheduleCron.trim()) {
+      toast.error("Cron schedule is required")
+      return
+    }
+
     if (allMatchingSelected) {
       try {
         setIsBulkRunning(true)
@@ -624,6 +643,33 @@ export function GlobalSearch() {
               ))}
             </DropdownMenuContent>
           </DropdownMenu>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            type="button"
+            size="sm"
+            variant={bulkDeleteScheduleMode === "once" ? "default" : "outline"}
+            onClick={() => setBulkDeleteScheduleMode("once")}
+          >
+            Bulk Delete: One-time
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant={bulkDeleteScheduleMode === "cron" ? "default" : "outline"}
+            onClick={() => setBulkDeleteScheduleMode("cron")}
+          >
+            Bulk Delete: Scheduled (UTC)
+          </Button>
+          {bulkDeleteScheduleMode === "cron" ? (
+            <Input
+              className="h-9 w-full max-w-xs"
+              value={bulkDeleteScheduleCron}
+              onChange={(event) => setBulkDeleteScheduleCron(event.target.value)}
+              placeholder="* * * * *"
+            />
+          ) : null}
         </div>
       </div>
 

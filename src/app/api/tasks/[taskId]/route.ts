@@ -5,9 +5,20 @@ import { auth } from "@/lib/auth"
 import { prisma } from "@/lib/db"
 import { buildFileSearchSqlWhereClause, parseScopes } from "@/lib/file-search"
 import { appendExecutionHistory } from "@/lib/task-plans"
+import {
+  assertValidTaskScheduleCron,
+  TaskScheduleValidationError,
+} from "@/lib/task-schedule"
 
 const controlSchema = z.object({
-  action: z.enum(["pause", "resume", "restart", "retry_failed"]),
+  action: z.enum(["pause", "resume", "restart", "retry_failed", "update_schedule", "cancel"]),
+  schedule: z
+    .object({
+      cron: z.string().trim().min(1).max(120),
+    })
+    .nullable()
+    .optional(),
+  confirmDestructiveSchedule: z.boolean().optional(),
 })
 
 const SYNC_POLL_INTERVAL_SECONDS = 60
@@ -155,6 +166,10 @@ function getObjectTransferFailedCount(progress: unknown): number {
   return Math.max(0, Math.floor(value))
 }
 
+function isDestructiveTransferOperation(operation: ObjectTransferTaskPayload["operation"]): boolean {
+  return operation === "sync" || operation === "move" || operation === "migrate"
+}
+
 export async function PATCH(
   request: NextRequest,
   context: { params: Promise<{ taskId: string }> }
@@ -191,6 +206,7 @@ export async function PATCH(
         executionHistory: true,
         progress: true,
         isRecurring: true,
+        scheduleCron: true,
         scheduleIntervalSeconds: true,
         runCount: true,
         nextRunAt: true,
@@ -242,10 +258,7 @@ export async function PATCH(
           pausedAt: null,
           status: shouldRequeueRecurring ? "pending" : task.status,
           completedAt: shouldRequeueRecurring ? null : undefined,
-          nextRunAt:
-            task.nextRunAt.getTime() > now.getTime() && !shouldRequeueRecurring
-              ? task.nextRunAt
-              : now,
+          nextRunAt: now,
           executionHistory: pushHistory(task.executionHistory, "resumed", "Task resumed by user"),
         },
         select: {
@@ -275,6 +288,112 @@ export async function PATCH(
 
     const planPayload = resolveTaskPlanPayload(task.executionPlan, task.payload)
     const now = new Date()
+
+    if (parsed.data.action === "cancel") {
+      if (task.status === "in_progress") {
+        return NextResponse.json(
+          { error: "Cannot cancel a running task. Please wait for the current run to finish." },
+          { status: 400 }
+        )
+      }
+
+      const updated = await prisma.backgroundTask.update({
+        where: { id: task.id },
+        data: {
+          lifecycleState: "active",
+          pausedAt: null,
+          status: "completed",
+          attempts: 0,
+          lastError: null,
+          isRecurring: false,
+          scheduleCron: null,
+          scheduleIntervalSeconds: null,
+          completedAt: now,
+          nextRunAt: now,
+          executionHistory: pushHistory(task.executionHistory, "skipped", "Task canceled by user"),
+        },
+        select: {
+          id: true,
+          status: true,
+          lifecycleState: true,
+          nextRunAt: true,
+          isRecurring: true,
+          scheduleCron: true,
+        },
+      })
+
+      return NextResponse.json({ task: updated })
+    }
+
+    if (parsed.data.action === "update_schedule") {
+      if (task.type === "thumbnail_generate") {
+        return NextResponse.json(
+          { error: "Scheduling is not supported for thumbnail tasks" },
+          { status: 400 }
+        )
+      }
+
+      let scheduleCron: string | null = null
+      if (parsed.data.schedule?.cron) {
+        scheduleCron = assertValidTaskScheduleCron(parsed.data.schedule.cron)
+      }
+
+      if (scheduleCron) {
+        let destructive = false
+        if (task.type === "bulk_delete") {
+          destructive = true
+        } else if (task.type === "object_transfer") {
+          const transferPayload = parseObjectTransferPayload(planPayload)
+          if (!transferPayload) {
+            return NextResponse.json({ error: "Invalid transfer execution plan" }, { status: 400 })
+          }
+          destructive = isDestructiveTransferOperation(transferPayload.operation)
+        }
+
+        if (destructive && !parsed.data.confirmDestructiveSchedule) {
+          return NextResponse.json(
+            { error: "Recurring destructive task requires explicit confirmation" },
+            { status: 400 }
+          )
+        }
+      }
+
+      const updated = await prisma.backgroundTask.update({
+        where: { id: task.id },
+        data: {
+          lifecycleState: "active",
+          pausedAt: null,
+          isRecurring: Boolean(scheduleCron),
+          scheduleCron,
+          scheduleIntervalSeconds: null,
+          ...(task.status !== "in_progress"
+            ? {
+                status: "pending",
+                attempts: 0,
+                startedAt: null,
+                completedAt: null,
+                nextRunAt: now,
+                lastError: null,
+              }
+            : {}),
+          executionHistory: pushHistory(
+            task.executionHistory,
+            "resumed",
+            scheduleCron ? "Task schedule updated" : "Task schedule disabled"
+          ),
+        },
+        select: {
+          id: true,
+          status: true,
+          lifecycleState: true,
+          nextRunAt: true,
+          isRecurring: true,
+          scheduleCron: true,
+        },
+      })
+
+      return NextResponse.json({ task: updated })
+    }
 
     if (task.type === "object_transfer") {
       const transferPayload = parseObjectTransferPayload(planPayload)
@@ -328,11 +447,9 @@ export async function PATCH(
           startedAt: null,
           completedAt: null,
           nextRunAt: now,
-          isRecurring: transferPayload.operation === "sync",
-          scheduleIntervalSeconds:
-            transferPayload.operation === "sync"
-              ? transferPayload.pollIntervalSeconds ?? SYNC_POLL_INTERVAL_SECONDS
-              : null,
+          isRecurring: task.isRecurring,
+          scheduleCron: task.scheduleCron,
+          scheduleIntervalSeconds: task.scheduleIntervalSeconds,
           runCount: retryFailedOnly ? 0 : undefined,
           progress: {
             phase: "transfer",
@@ -394,8 +511,9 @@ export async function PATCH(
           startedAt: null,
           completedAt: null,
           nextRunAt: now,
-          isRecurring: false,
-          scheduleIntervalSeconds: null,
+          isRecurring: task.isRecurring,
+          scheduleCron: task.scheduleCron,
+          scheduleIntervalSeconds: task.scheduleIntervalSeconds,
           progress: {
             total,
             deleted: 0,
@@ -433,6 +551,7 @@ export async function PATCH(
           completedAt: null,
           nextRunAt: now,
           isRecurring: false,
+          scheduleCron: null,
           scheduleIntervalSeconds: null,
           executionHistory: pushHistory(task.executionHistory, "restarted", "Task restarted by user"),
         },
@@ -450,7 +569,55 @@ export async function PATCH(
     return NextResponse.json({ error: "Unsupported task type" }, { status: 400 })
   } catch (error) {
     console.error("Failed to control task:", error)
+    if (error instanceof TaskScheduleValidationError) {
+      return NextResponse.json({ error: error.message }, { status: 400 })
+    }
     const message = error instanceof Error ? error.message : "Failed to control task"
+    return NextResponse.json({ error: message }, { status: 500 })
+  }
+}
+
+export async function DELETE(
+  _request: NextRequest,
+  context: { params: Promise<{ taskId: string }> }
+) {
+  try {
+    const session = await auth()
+    if (!session?.user?.id) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
+    }
+
+    const { taskId } = await context.params
+    const task = await prisma.backgroundTask.findFirst({
+      where: {
+        id: taskId,
+        userId: session.user.id,
+      },
+      select: {
+        id: true,
+        status: true,
+      },
+    })
+
+    if (!task) {
+      return NextResponse.json({ error: "Task not found" }, { status: 404 })
+    }
+
+    if (task.status === "in_progress") {
+      return NextResponse.json(
+        { error: "Cannot delete a running task" },
+        { status: 400 }
+      )
+    }
+
+    await prisma.backgroundTask.delete({
+      where: { id: task.id },
+    })
+
+    return NextResponse.json({ deleted: true })
+  } catch (error) {
+    console.error("Failed to delete task:", error)
+    const message = error instanceof Error ? error.message : "Failed to delete task"
     return NextResponse.json({ error: message }, { status: 500 })
   }
 }

@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from "react"
 import { useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
-import { ListTodo, Pause, Play, RotateCcw } from "lucide-react"
+import { ListTodo, Pause, Play, RotateCcw, Trash2 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
@@ -22,6 +22,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+import { Input } from "@/components/ui/input"
 import { FolderPickerDialog } from "@/components/dashboard/folder-picker-dialog"
 import { DestructiveConfirmDialog } from "@/components/shared/destructive-confirm-dialog"
 import {
@@ -52,6 +53,7 @@ interface TaskRow {
   lastError: string | null
   runCount: number
   isRecurring: boolean
+  scheduleCron?: string | null
   scheduleIntervalSeconds: number | null
   nextRunAt: string
   lastRunAt: string | null
@@ -79,6 +81,10 @@ interface TransferTaskCreateBody {
   destinationBucket: string
   destinationCredentialId: string
   destinationPrefix?: string
+  schedule?: {
+    cron: string
+  } | null
+  confirmDestructiveSchedule?: boolean
 }
 
 interface TransferTaskPreview {
@@ -88,6 +94,30 @@ interface TransferTaskPreview {
   estimatedObjects: number
   sampleObjects: string[]
   warnings: string[]
+  detailedPlan: TransferTaskDetailedPreviewPlan
+}
+
+interface TransferTaskDetailedPreviewAction {
+  phase: "transfer" | "sync_cleanup"
+  operation: "copy" | "delete_source" | "delete_destination"
+  command: string
+  sourceKey: string | null
+  destinationKey: string | null
+}
+
+interface TransferTaskDetailedPreviewCursor {
+  phase: "source" | "cleanup"
+  sourceKey: string | null
+  cleanupKey: string | null
+}
+
+interface TransferTaskDetailedPreviewPlan {
+  actions: TransferTaskDetailedPreviewAction[]
+  hasMore: boolean
+  nextCursor: TransferTaskDetailedPreviewCursor | null
+  pageSize: number
+  scannedSourceObjects: number
+  scanLimitReached: boolean
 }
 
 function toSafeInt(value: unknown): number {
@@ -100,22 +130,34 @@ function getTransferResultSummary(progress: unknown): string | null {
   const candidate = progress as {
     total?: unknown
     processed?: unknown
+    copied?: unknown
+    moved?: unknown
     failed?: unknown
     skipped?: unknown
   }
-  const total = toSafeInt(candidate.total)
   const processed = toSafeInt(candidate.processed)
+  const copied = toSafeInt(candidate.copied)
+  const moved = toSafeInt(candidate.moved)
   const failed = toSafeInt(candidate.failed)
   const skipped = toSafeInt(candidate.skipped)
+  const total = toSafeInt(candidate.total)
 
-  if (total > 0) {
-    const succeeded = Math.max(0, total - failed)
-    return `${succeeded.toLocaleString()} succeeded • ${failed.toLocaleString()} failed`
+  if (processed <= 0 && failed <= 0 && copied <= 0 && moved <= 0) return null
+
+  const effectiveCopied = copied > 0 || moved > 0 ? copied + moved : Math.max(0, processed - failed - skipped)
+  const parts = [
+    `${effectiveCopied.toLocaleString()} copied`,
+  ]
+  if (skipped > 0) {
+    parts.push(`${skipped.toLocaleString()} skipped`)
   }
-
-  if (processed <= 0 && failed <= 0) return null
-  const succeeded = Math.max(0, processed - failed - skipped)
-  return `${succeeded.toLocaleString()} succeeded • ${failed.toLocaleString()} failed`
+  if (failed > 0) {
+    parts.push(`${failed.toLocaleString()} failed`)
+  }
+  if (total > 0) {
+    parts.push(`${total.toLocaleString()} total`)
+  }
+  return parts.join(" • ")
 }
 
 function getBulkDeleteResultSummary(progress: unknown): string | null {
@@ -165,6 +207,17 @@ function getDisplayState(task: TaskRow): string {
   return task.status.replace("_", " ")
 }
 
+function getTaskScheduleLabel(task: TaskRow): string {
+  if (!task.isRecurring) return "One-time"
+  if (task.scheduleCron && task.scheduleCron.trim()) {
+    return `CRON (${task.scheduleCron}) UTC`
+  }
+  if (task.scheduleIntervalSeconds && task.scheduleIntervalSeconds > 0) {
+    return `Every ${task.scheduleIntervalSeconds}s`
+  }
+  return "Scheduled"
+}
+
 const FOLDER_OPERATIONS: Array<{ value: TaskOperation; label: string }> = [
   { value: "sync", label: "Sync" },
   { value: "copy", label: "One-time copy" },
@@ -187,12 +240,15 @@ export default function TasksPage() {
   const [destinationBucket, setDestinationBucket] = useState("")
   const [sourcePrefix, setSourcePrefix] = useState("")
   const [destinationPrefix, setDestinationPrefix] = useState("")
+  const [scheduleMode, setScheduleMode] = useState<"once" | "cron">("once")
+  const [scheduleCron, setScheduleCron] = useState("* * * * *")
   const [submitting, setSubmitting] = useState(false)
   const [controllingTaskId, setControllingTaskId] = useState<string | null>(null)
   const [transferPreviewOpen, setTransferPreviewOpen] = useState(false)
   const [transferPreview, setTransferPreview] = useState<TransferTaskPreview | null>(null)
   const [transferConfirmOpen, setTransferConfirmOpen] = useState(false)
   const [pendingTransferBody, setPendingTransferBody] = useState<TransferTaskCreateBody | null>(null)
+  const [loadingMoreTransferPlan, setLoadingMoreTransferPlan] = useState(false)
 
   const { data: credentials = [] } = useQuery<Credential[]>({
     queryKey: ["credentials"],
@@ -230,6 +286,8 @@ export default function TasksPage() {
       if (!res.ok) return { tasks: [] }
       return (await res.json()) as { tasks: TaskRow[] }
     },
+    refetchInterval: 10_000,
+    refetchIntervalInBackground: true,
   })
 
   const availableOperations = scope === "folder" ? FOLDER_OPERATIONS : BUCKET_OPERATIONS
@@ -322,16 +380,34 @@ export default function TasksPage() {
       body.destinationPrefix = destinationPrefix.trim()
     }
 
+    if (scheduleMode === "cron") {
+      if (!scheduleCron.trim()) {
+        toast.error("Cron schedule is required")
+        return null
+      }
+      body.schedule = { cron: scheduleCron.trim() }
+    } else {
+      body.schedule = null
+    }
+
     return body
   }
 
-  async function fetchTransferPreview(body: TransferTaskCreateBody): Promise<TransferTaskPreview> {
+  async function fetchTransferPreview(
+    body: TransferTaskCreateBody,
+    options?: {
+      cursor?: TransferTaskDetailedPreviewCursor | null
+      limit?: number
+    }
+  ): Promise<TransferTaskPreview> {
     const res = await fetch("/api/tasks/transfer", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         ...body,
         previewOnly: true,
+        previewCursor: options?.cursor ?? undefined,
+        previewLimit: options?.limit ?? undefined,
       }),
     })
 
@@ -346,7 +422,13 @@ export default function TasksPage() {
     }
 
     const preview = data?.preview as TransferTaskPreview | undefined
-    if (!preview || !Array.isArray(preview.summary) || !Array.isArray(preview.commands)) {
+    if (
+      !preview ||
+      !Array.isArray(preview.summary) ||
+      !Array.isArray(preview.commands) ||
+      !preview.detailedPlan ||
+      !Array.isArray(preview.detailedPlan.actions)
+    ) {
       throw new Error("Invalid transfer preview response")
     }
 
@@ -356,10 +438,16 @@ export default function TasksPage() {
   async function createTransferTask(body: TransferTaskCreateBody) {
     setSubmitting(true)
     try {
+      const requestBody: TransferTaskCreateBody = {
+        ...body,
+        ...(body.schedule && destructiveTask
+          ? { confirmDestructiveSchedule: true }
+          : {}),
+      }
       const res = await fetch("/api/tasks/transfer", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+        body: JSON.stringify(requestBody),
       })
 
       const data = await res.json()
@@ -400,6 +488,47 @@ export default function TasksPage() {
     }
   }
 
+  async function handleLoadMoreTransferPlan() {
+    if (!pendingTransferBody || !transferPreview?.detailedPlan.hasMore) {
+      return
+    }
+    if (!transferPreview.detailedPlan.nextCursor) {
+      return
+    }
+
+    setLoadingMoreTransferPlan(true)
+    try {
+      const nextPreview = await fetchTransferPreview(pendingTransferBody, {
+        cursor: transferPreview.detailedPlan.nextCursor,
+        limit: transferPreview.detailedPlan.pageSize,
+      })
+
+      setTransferPreview((current) => {
+        if (!current) return nextPreview
+
+        return {
+          ...current,
+          summary: nextPreview.summary,
+          commands: nextPreview.commands,
+          estimatedObjects: nextPreview.estimatedObjects,
+          sampleObjects:
+            current.sampleObjects.length > 0
+              ? current.sampleObjects
+              : nextPreview.sampleObjects,
+          warnings: nextPreview.warnings,
+          detailedPlan: {
+            ...nextPreview.detailedPlan,
+            actions: [...current.detailedPlan.actions, ...nextPreview.detailedPlan.actions],
+          },
+        }
+      })
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Failed to load more plan actions")
+    } finally {
+      setLoadingMoreTransferPlan(false)
+    }
+  }
+
   async function handleConfirmTransferFromPreview() {
     if (!pendingTransferBody) {
       toast.error("Missing transfer payload")
@@ -424,7 +553,7 @@ export default function TasksPage() {
 
   async function handleTaskControl(
     taskId: string,
-    action: "pause" | "resume" | "restart" | "retry_failed"
+    action: "pause" | "resume" | "restart" | "retry_failed" | "cancel"
   ) {
     setControllingTaskId(taskId)
     try {
@@ -445,12 +574,39 @@ export default function TasksPage() {
           ? "Task paused"
           : action === "resume"
             ? "Task resumed"
+            : action === "cancel"
+              ? "Task schedule canceled"
             : action === "retry_failed"
               ? "Retry for failed items started"
               : "Task restarted"
       )
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Failed to control task")
+    } finally {
+      setControllingTaskId(null)
+    }
+  }
+
+  async function handleDeleteTask(taskId: string) {
+    if (!window.confirm("Remove this task from history? This cannot be undone.")) {
+      return
+    }
+
+    setControllingTaskId(taskId)
+    try {
+      const res = await fetch(`/api/tasks/${taskId}`, {
+        method: "DELETE",
+      })
+      const data = await res.json()
+      if (!res.ok) {
+        throw new Error(data?.error ?? "Failed to remove task")
+      }
+      queryClient.invalidateQueries({ queryKey: ["background-tasks"] })
+      queryClient.invalidateQueries({ queryKey: ["background-tasks", "tasks-page"] })
+      void refetchTasks()
+      toast.success("Task removed from history")
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Failed to remove task")
     } finally {
       setControllingTaskId(null)
     }
@@ -500,8 +656,8 @@ export default function TasksPage() {
           <div className="space-y-1">
             <CardTitle>Start New Task</CardTitle>
             <CardDescription>
-              Transfers run on cached files only and follow plan limits. Sync tasks run continuously every
-              minute until deleted. Sync now mirrors the destination scope and deletes destination-only files.
+              Transfers run on cached files only and follow plan limits. Scheduling is optional for every
+              transfer operation. Sync mirrors destination scope and deletes destination-only files.
             </CardDescription>
           </div>
         </CardHeader>
@@ -534,6 +690,34 @@ export default function TasksPage() {
                 </SelectContent>
               </Select>
             </div>
+          </div>
+
+          <div className="grid gap-4 md:grid-cols-2">
+            <div className="space-y-2">
+              <Label>Schedule</Label>
+              <Select value={scheduleMode} onValueChange={(value) => setScheduleMode(value as "once" | "cron")}>
+                <SelectTrigger className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="once">One-time run</SelectItem>
+                  <SelectItem value="cron">Cron schedule (UTC)</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            {scheduleMode === "cron" ? (
+              <div className="space-y-2">
+                <Label>Cron expression (UTC)</Label>
+                <Input
+                  value={scheduleCron}
+                  onChange={(event) => setScheduleCron(event.target.value)}
+                  placeholder="* * * * *"
+                />
+                <p className="text-xs text-muted-foreground">
+                  Minimum supported frequency is once per minute.
+                </p>
+              </div>
+            ) : null}
           </div>
 
           <div className="grid gap-4 md:grid-cols-2">
@@ -652,7 +836,7 @@ export default function TasksPage() {
       <Card>
         <CardHeader>
           <CardTitle>Queue</CardTitle>
-          <CardDescription>Live tasks with pause/resume/restart controls.</CardDescription>
+          <CardDescription>Live tasks with pause/resume/restart/cancel controls.</CardDescription>
         </CardHeader>
         <CardContent>
           {queueTasks.length === 0 ? (
@@ -667,6 +851,9 @@ export default function TasksPage() {
                       <p className="mt-1 text-xs text-muted-foreground">
                         Updated {new Date(task.updatedAt).toLocaleString()} • Runs {task.runCount}
                       </p>
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        Schedule: {getTaskScheduleLabel(task)}
+                      </p>
                       {(task.successRuns > 0 || task.failedRuns > 0) ? (
                         <p className="mt-1 text-xs text-muted-foreground">
                           Run summary: {task.successRuns} succeeded • {task.failedRuns} failed
@@ -679,7 +866,7 @@ export default function TasksPage() {
                       ) : null}
                       {task.isRecurring && task.upcomingRuns.length > 0 ? (
                         <p className="mt-1 text-xs text-muted-foreground">
-                          Next 3 sync runs:{" "}
+                          Next 3 scheduled runs:{" "}
                           {task.upcomingRuns
                             .map((item) => new Date(item).toLocaleString())
                             .join(" • ")}
@@ -730,6 +917,16 @@ export default function TasksPage() {
                         <RotateCcw className="mr-1 h-3.5 w-3.5" />
                         Restart
                       </Button>
+                      {task.isRecurring ? (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={controllingTaskId === task.id || task.status === "in_progress"}
+                          onClick={() => void handleTaskControl(task.id, "cancel")}
+                        >
+                          Cancel Schedule
+                        </Button>
+                      ) : null}
                     </div>
                   </div>
                 </div>
@@ -742,7 +939,9 @@ export default function TasksPage() {
       <Card>
         <CardHeader>
           <CardTitle>History</CardTitle>
-          <CardDescription>Completed/failed tasks and the latest execution note.</CardDescription>
+          <CardDescription>
+            Completed/failed tasks, latest execution note, and history cleanup controls.
+          </CardDescription>
         </CardHeader>
         <CardContent>
           {historyTasks.length === 0 ? (
@@ -759,6 +958,9 @@ export default function TasksPage() {
                         {task.completedAt
                           ? ` • Completed ${new Date(task.completedAt).toLocaleString()}`
                           : ""}
+                      </p>
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        Schedule: {getTaskScheduleLabel(task)}
                       </p>
                       {(task.successRuns > 0 || task.failedRuns > 0) ? (
                         <p className="mt-1 text-xs text-muted-foreground">
@@ -802,6 +1004,16 @@ export default function TasksPage() {
                           Retry Failed
                         </Button>
                       ) : null}
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="text-muted-foreground hover:text-destructive"
+                        disabled={controllingTaskId === task.id}
+                        onClick={() => void handleDeleteTask(task.id)}
+                      >
+                        <Trash2 className="mr-1 h-3.5 w-3.5" />
+                        Remove
+                      </Button>
                     </div>
                   </div>
                 </div>
@@ -817,6 +1029,7 @@ export default function TasksPage() {
           setTransferPreviewOpen(open)
           if (!open) {
             setTransferPreview(null)
+            setLoadingMoreTransferPlan(false)
             if (!transferConfirmOpen) {
               setPendingTransferBody(null)
             }
@@ -849,6 +1062,51 @@ export default function TasksPage() {
                     <li key={line}>{line}</li>
                   ))}
                 </ul>
+              </div>
+
+              <div className="space-y-2">
+                <p className="font-medium">
+                  Planned object actions ({transferPreview.detailedPlan.actions.length} loaded)
+                </p>
+                {transferPreview.detailedPlan.actions.length > 0 ? (
+                  <ul className="max-h-64 overflow-y-auto rounded-md border p-2 font-mono text-xs">
+                    {transferPreview.detailedPlan.actions.map((action, index) => (
+                      <li
+                        key={`${action.command}:${action.sourceKey ?? "none"}:${action.destinationKey ?? "none"}:${index}`}
+                        className="truncate py-0.5"
+                      >
+                        {action.command}
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="text-xs text-muted-foreground">
+                    No object-level actions in this page. Load more to continue scanning.
+                  </p>
+                )}
+                <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                  <span>
+                    Scanned {transferPreview.detailedPlan.scannedSourceObjects.toLocaleString()} source objects in this
+                    request.
+                  </span>
+                  {transferPreview.detailedPlan.scanLimitReached ? (
+                    <span>Scan limit reached for this page; load more to continue.</span>
+                  ) : null}
+                </div>
+                {transferPreview.detailedPlan.hasMore ? (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void handleLoadMoreTransferPlan()}
+                    disabled={loadingMoreTransferPlan || submitting}
+                  >
+                    {loadingMoreTransferPlan ? "Loading..." : "Load more actions"}
+                  </Button>
+                ) : (
+                  <p className="text-xs text-muted-foreground">
+                    Full plan loaded for the current cached metadata snapshot.
+                  </p>
+                )}
               </div>
 
               <div className="space-y-2">

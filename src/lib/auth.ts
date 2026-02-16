@@ -32,16 +32,31 @@ normalizeUrlEnvVar("AUTH_URL")
 normalizeUrlEnvVar("NEXT_PUBLIC_SITE_URL")
 
 async function ensureLocalUser() {
-  await prisma.user.upsert({
-    where: { id: LOCAL_USER.id },
-    update: {},
-    create: {
-      id: LOCAL_USER.id,
-      name: LOCAL_USER.name,
-      email: LOCAL_USER.email,
-      role: LOCAL_USER.role,
-    },
-  })
+  try {
+    await prisma.user.upsert({
+      where: { id: LOCAL_USER.id },
+      update: {},
+      create: {
+        id: LOCAL_USER.id,
+        name: LOCAL_USER.name,
+        email: LOCAL_USER.email,
+        role: LOCAL_USER.role,
+      },
+    })
+  } catch {
+    // If LOCAL_USER.email is already taken by another row, still guarantee
+    // that the canonical local id exists for all FK writes.
+    await prisma.user.upsert({
+      where: { id: LOCAL_USER.id },
+      update: {},
+      create: {
+        id: LOCAL_USER.id,
+        name: LOCAL_USER.name,
+        email: `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}@community.local`,
+        role: LOCAL_USER.role,
+      },
+    })
+  }
 }
 
 function buildCommunityAuth() {
@@ -56,12 +71,14 @@ function buildCommunityAuth() {
       }),
     ],
     callbacks: {
-      jwt({ token }) {
+      async jwt({ token }) {
+        await ensureLocalUser()
         token.id = LOCAL_USER.id
         token.role = LOCAL_USER.role
         return token
       },
-      session({ session }) {
+      async session({ session }) {
+        await ensureLocalUser()
         session.user.id = LOCAL_USER.id
         session.user.role = LOCAL_USER.role
         return session
