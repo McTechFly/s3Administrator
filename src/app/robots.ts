@@ -7,6 +7,21 @@ const PRIVATE_PATHS = [
   "/settings/",
   "/billing/",
   "/api/",
+  "/login",
+  "/register",
+]
+
+const AI_TRAINING_BOTS = [
+  "GPTBot",
+  "Google-Extended",
+  "CCBot",
+  "anthropic-ai",
+  "Claude-Web",
+  "Bytespider",
+  "Diffbot",
+  "Applebot-Extended",
+  "FacebookBot",
+  "PerplexityBot",
 ]
 
 export default function robots(): MetadataRoute.Robots {
@@ -27,10 +42,10 @@ export default function robots(): MetadataRoute.Robots {
         allow: "/",
         disallow: PRIVATE_PATHS,
       },
-      {
-        userAgent: "GPTBot",
-        disallow: "/",
-      },
+      ...AI_TRAINING_BOTS.map((bot) => ({
+        userAgent: bot,
+        disallow: ["/"],
+      })),
     ],
     sitemap: absoluteUrl("/sitemap.xml"),
     host: getSiteUrl(),

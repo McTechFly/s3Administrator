@@ -3,6 +3,8 @@ import type {
   SeoLandingCategory,
   SeoLandingPageConfig,
 } from "@/lib/seo-landing-pages"
+import { absoluteUrl } from "@/lib/site-url"
+import { serializeJsonLd } from "@/lib/json-ld"
 
 const categoryTitles: Record<SeoLandingCategory, string> = {
   features: "S3 Feature Guides",
@@ -26,8 +28,31 @@ export function SeoLandingIndex({
   category: SeoLandingCategory
   pages: SeoLandingPageConfig[]
 }) {
+  const breadcrumbJsonLd = {
+    "@context": "https://schema.org",
+    "@type": "BreadcrumbList",
+    itemListElement: [
+      {
+        "@type": "ListItem",
+        position: 1,
+        name: "Home",
+        item: absoluteUrl("/"),
+      },
+      {
+        "@type": "ListItem",
+        position: 2,
+        name: categoryTitles[category],
+        item: absoluteUrl(`/${category}`),
+      },
+    ],
+  }
+
   return (
     <section className="mx-auto max-w-5xl space-y-10 px-4 py-20">
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{ __html: serializeJsonLd(breadcrumbJsonLd) }}
+      />
       <header className="space-y-3">
         <h1 className="text-4xl font-bold tracking-tight sm:text-5xl">
           {categoryTitles[category]}

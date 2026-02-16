@@ -1,11 +1,15 @@
 import Link from "next/link"
 import { CheckCircle2 } from "lucide-react"
 import type { SeoLandingPageConfig } from "@/lib/seo-landing-pages"
+import { SITE_NAME } from "@/lib/seo"
 import { absoluteUrl } from "@/lib/site-url"
+import { serializeJsonLd } from "@/lib/json-ld"
 import { Button } from "@/components/ui/button"
 
-function serializeJsonLd(data: unknown): string {
-  return JSON.stringify(data).replace(/</g, "\\u003c")
+const categoryLabels: Record<string, string> = {
+  features: "Features",
+  providers: "Providers",
+  compare: "Comparisons",
 }
 
 export function SeoLandingPage({ page }: { page: SeoLandingPageConfig }) {
@@ -19,6 +23,15 @@ export function SeoLandingPage({ page }: { page: SeoLandingPageConfig }) {
     description: page.description,
     url: pageUrl,
     keywords: page.keywords.join(", "),
+    mainEntityOfPage: {
+      "@type": "WebPage",
+      "@id": pageUrl,
+    },
+    isPartOf: {
+      "@type": "WebSite",
+      name: SITE_NAME,
+      url: absoluteUrl("/"),
+    },
   }
 
   const faqJsonLd = {
@@ -34,6 +47,31 @@ export function SeoLandingPage({ page }: { page: SeoLandingPageConfig }) {
     })),
   }
 
+  const breadcrumbJsonLd = {
+    "@context": "https://schema.org",
+    "@type": "BreadcrumbList",
+    itemListElement: [
+      {
+        "@type": "ListItem",
+        position: 1,
+        name: "Home",
+        item: absoluteUrl("/"),
+      },
+      {
+        "@type": "ListItem",
+        position: 2,
+        name: categoryLabels[page.category] ?? page.category,
+        item: absoluteUrl(`/${page.category}`),
+      },
+      {
+        "@type": "ListItem",
+        position: 3,
+        name: page.title,
+        item: pageUrl,
+      },
+    ],
+  }
+
   return (
     <article className="mx-auto max-w-5xl space-y-16 px-4 py-20">
       <script
@@ -43,6 +81,10 @@ export function SeoLandingPage({ page }: { page: SeoLandingPageConfig }) {
       <script
         type="application/ld+json"
         dangerouslySetInnerHTML={{ __html: serializeJsonLd(faqJsonLd) }}
+      />
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{ __html: serializeJsonLd(breadcrumbJsonLd) }}
       />
 
       <header className="space-y-6">
