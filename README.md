@@ -17,26 +17,22 @@ Open-source S3 file manager for Hetzner, AWS, Cloudflare R2, and any S3-compatib
 ## Quick Start
 
 ```bash
-# Clone the repository
 git clone https://github.com/YOUR_USERNAME/s3-administrator.git
 cd s3-administrator
 
-# Choose a template and copy to runtime env
-cp .env.community .env
-# or: cp .env.cloud .env
+# Copy the example env and fill in the values
+cp .env.community.example .env
 
-# Fill in required values in .env:
-#   - DATABASE_URL
-#   - AUTH_SECRET (generate with: openssl rand -base64 32)
-#   - ENCRYPTION_MASTER_KEY (generate with: openssl rand -hex 32)
-#   - ENCRYPTION_SALT (generate with: openssl rand -hex 16)
+# Generate required secrets
+openssl rand -base64 32   # → paste into AUTH_SECRET
+openssl rand -hex 32      # → paste into ENCRYPTION_MASTER_KEY
+openssl rand -hex 16      # → paste into ENCRYPTION_SALT
 
-# Start with Docker Compose
-docker compose --env-file .env -f docker/docker-compose.yml up -d
+# Build, migrate, and seed
+make community-setup
 
-# Run database migrations and seed
-docker compose --env-file .env -f docker/docker-compose.yml exec app npx prisma migrate deploy
-docker compose --env-file .env -f docker/docker-compose.yml exec app npx prisma db seed
+# Start the stack
+make community-start
 
 # Open http://localhost:3000
 ```
@@ -63,57 +59,51 @@ The community edition is a single-user, no-auth tool designed for personal or in
 
 For multi-user support, audit logs, and managed hosting, see [s3administrator.com](https://www.s3administrator.com).
 
+## Make Commands
+
+Run `make help` to see all available commands.
+
+### Community
+
+| Command | Description |
+|---------|-------------|
+| `make community-setup` | Build images, start DB, run migrations & seed |
+| `make community-start` | Start the stack (app + worker + db + proxy) |
+| `make community-stop` | Stop containers |
+| `make community-restart` | Rebuild and restart app |
+| `make community-restart-full` | Rebuild and restart app + worker |
+| `make community-migrate` | Run migrations & seed |
+| `make community-local` | Start DB and run Next.js locally |
+| `make community-reset` | Destroy DB volume and start fresh |
+
+### Cloud
+
+| Command | Description |
+|---------|-------------|
+| `make cloud-setup` | Build images, start DB, run migrations & seed |
+| `make cloud-start` | Start the stack (app + worker + db + proxy) |
+| `make cloud-stop` | Stop containers |
+| `make cloud-restart` | Rebuild and restart app |
+| `make cloud-restart-full` | Rebuild and restart app + worker |
+| `make cloud-migrate` | Run migrations & seed |
+| `make cloud-local` | Start DB and run Next.js locally in cloud mode |
+
+### Utilities
+
+| Command | Description |
+|---------|-------------|
+| `make log PROFILE=community` | Tail app logs |
+| `make log-worker PROFILE=community` | Tail worker logs |
+| `make stripe-listen` | Forward Stripe webhooks locally |
+
 ## Development
 
 ```bash
-# Install dependencies
-npm install
+# Copy env and fill in values
+cp .env.community.example .env
 
-# Copy community template to runtime env
-cp .env.community .env
-
-# Start PostgreSQL
-docker compose --env-file .env -f docker/docker-compose.yml up db -d
-
-# Run migrations and seed
-npx prisma migrate deploy
-npx prisma db seed
-
-# Start app
-npm run dev
-```
-
-## Make Commands
-
-```bash
-# Community profile
-make community-setup
-make community-start
-
-# Cloud profile
-make cloud-setup
-make cloud-start
-make cloud-local
-make cloud-start-prod
-
-# Logs
-make log PROFILE=community
-make log PROFILE=cloud
-```
-
-`cloud-start` runs `app + db + proxy` and always starts Caddy.
-`cloud-start-prod` is a compatibility alias to `cloud-start`.
-
-Caddy now uses a single config file: `docker/Caddyfile`.
-It reads `DOMAIN`, `ROOT_DOMAIN`, and `CADDY_SITE_ADDRESSES` from `.env`.
-
-For local cloud development, keep cloud mode but point URLs to localhost in `.env`:
-
-```bash
-ENVIRONMENT="CLOUD"
-NEXT_PUBLIC_EDITION="cloud"
-AUTH_URL="http://localhost:3000"
-NEXT_PUBLIC_SITE_URL="http://localhost:3000"
+# Start DB, install deps, run locally
+make community-local
 ```
 
 ## Environment Contract
@@ -122,8 +112,8 @@ Application runtime reads only `.env`.
 
 - `ENVIRONMENT` must be `COMMUNITY` or `CLOUD`
 - `envVar("KEY")` lookup order:
-1. `KEY_COMMUNITY` or `KEY_CLOUD` (based on `ENVIRONMENT`)
-2. `KEY` (unsuffixed fallback)
+  1. `KEY_COMMUNITY` or `KEY_CLOUD` (based on `ENVIRONMENT`)
+  2. `KEY` (unsuffixed fallback)
 
 ## Gallery Mode and Video Thumbnails
 
