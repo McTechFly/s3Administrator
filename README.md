@@ -17,8 +17,8 @@ Open-source S3 file manager for Hetzner, AWS, Cloudflare R2, and any S3-compatib
 ## Quick Start
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/s3-administrator.git
-cd s3-administrator
+git clone https://github.com/s3administrator/s3Administrator.git
+cd s3Administrator
 
 # Copy the example env and fill in the values
 cp .env.community.example .env
@@ -34,7 +34,7 @@ make community-setup
 # Start the stack
 make community-start
 
-# Open http://localhost:3000
+# Open http://localhost
 ```
 
 ## Community vs Cloud
@@ -104,16 +104,6 @@ cp .env.community.example .env
 
 # Start DB, install deps, run locally
 make community-local
-```
-
-## Environment Contract
-
-Application runtime reads only `.env`.
-
-- `ENVIRONMENT` must be `COMMUNITY` or `CLOUD`
-- `envVar("KEY")` lookup order:
-  1. `KEY_COMMUNITY` or `KEY_CLOUD` (based on `ENVIRONMENT`)
-  2. `KEY` (unsuffixed fallback)
 
 ## Gallery Mode and Video Thumbnails
 
@@ -151,6 +141,10 @@ pre-commit run --all-files
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=s3administrator/s3Administrator&type=Date)](https://star-history.com/#s3administrator/s3Administrator&Date)
 
 ## License
 
