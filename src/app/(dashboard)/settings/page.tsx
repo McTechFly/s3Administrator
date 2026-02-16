@@ -142,7 +142,7 @@ export default function SettingsPage() {
     setForm((f) => ({
       ...f,
       provider,
-      region: config.defaultRegion,
+      region: provider === "MINIO" ? "" : config.defaultRegion,
       endpoint: "",
     }))
   }
@@ -268,9 +268,18 @@ export default function SettingsPage() {
                   onChange={(e) =>
                     setForm((f) => ({ ...f, region: e.target.value }))
                   }
-                  placeholder={PROVIDERS[selectedProvider].defaultRegion}
-                  required
+                  placeholder={
+                    selectedProvider === "MINIO"
+                      ? "Optional (defaults to us-east-1)"
+                      : PROVIDERS[selectedProvider].defaultRegion
+                  }
+                  required={selectedProvider !== "MINIO"}
                 />
+                {selectedProvider === "MINIO" ? (
+                  <p className="text-xs text-muted-foreground">
+                    Region is optional for MinIO. If empty, us-east-1 will be used.
+                  </p>
+                ) : null}
               </div>
               <div className="space-y-2">
                 <Label htmlFor="accessKey">Access Key</Label>

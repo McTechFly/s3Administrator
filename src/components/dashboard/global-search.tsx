@@ -125,7 +125,7 @@ export function GlobalSearch() {
   const [selectedCredentialIds, setSelectedCredentialIds] = useState<string[]>([])
   const [selectedType, setSelectedType] = useState<string>("all")
   const [bulkDeleteScheduleMode, setBulkDeleteScheduleMode] = useState<"once" | "cron">("once")
-  const [bulkDeleteScheduleCron, setBulkDeleteScheduleCron] = useState("* * * * *")
+  const [bulkDeleteScheduleCron, setBulkDeleteScheduleCron] = useState("0 * * * *")
   const [sortBy, setSortBy] = useState<"name" | "size" | "lastModified">("name")
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc")
 
@@ -667,7 +667,7 @@ export function GlobalSearch() {
               className="h-9 w-full max-w-xs"
               value={bulkDeleteScheduleCron}
               onChange={(event) => setBulkDeleteScheduleCron(event.target.value)}
-              placeholder="* * * * *"
+              placeholder="0 * * * *"
             />
           ) : null}
         </div>

@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useRef, useCallback } from "react"
+import { useState, useRef, useCallback, useEffect } from "react"
 import {
   Dialog,
   DialogContent,
@@ -8,12 +8,27 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { Button } from "@/components/ui/button"
-import { Upload, X, CheckCircle, Loader2, FolderUp } from "lucide-react"
+import {
+  Upload,
+  X,
+  CheckCircle,
+  Loader2,
+  FolderUp,
+  Pause,
+  Play,
+  RotateCcw,
+} from "lucide-react"
 import { toast } from "sonner"
-
-const LARGE_FILE_THRESHOLD = 100 * 1024 * 1024
-const MULTIPART_CHUNK_SIZE = 8 * 1024 * 1024
-const MAX_PART_RETRIES = 3
+import {
+  UploadEngine,
+  shouldUseMultipart,
+  type UploadState,
+} from "@/lib/upload-engine"
+import {
+  getPersistedUploads,
+  removeUploadState,
+  type PersistedUploadState,
+} from "@/lib/upload-persistence"
 
 interface UploadDialogProps {
   open: boolean
@@ -28,13 +43,10 @@ interface UploadFile {
   file: File
   relativePath: string
   progress: number
-  status: "pending" | "uploading" | "done" | "error"
+  speed: number
+  status: "pending" | "uploading" | "paused" | "completing" | "done" | "error"
   error?: string
-}
-
-interface MultipartPart {
-  ETag: string
-  PartNumber: number
+  engine?: UploadEngine
 }
 
 function normalizeRelativePath(file: File): string {
@@ -42,14 +54,24 @@ function normalizeRelativePath(file: File): string {
   return raw.replace(/^\/+/, "")
 }
 
-function isCorsLikeError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error)
-  const normalized = message.toLowerCase()
-  return (
-    normalized.includes("cors") ||
-    normalized.includes("preflight") ||
-    normalized.includes("access-control-allow-origin")
-  )
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return "0 B"
+  const units = ["B", "KB", "MB", "GB", "TB"]
+  const i = Math.floor(Math.log(bytes) / Math.log(1024))
+  return `${(bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0)} ${units[i]}`
+}
+
+function formatSpeed(bytesPerSec: number): string {
+  if (bytesPerSec <= 0) return ""
+  return `${formatBytes(bytesPerSec)}/s`
+}
+
+function formatEta(bytesRemaining: number, speed: number): string {
+  if (speed <= 0) return ""
+  const seconds = Math.ceil(bytesRemaining / speed)
+  if (seconds < 60) return `${seconds}s left`
+  if (seconds < 3600) return `${Math.ceil(seconds / 60)}m left`
+  return `${Math.floor(seconds / 3600)}h ${Math.ceil((seconds % 3600) / 60)}m left`
 }
 
 export function UploadDialog({
@@ -62,17 +84,53 @@ export function UploadDialog({
 }: UploadDialogProps) {
   const [files, setFiles] = useState<UploadFile[]>([])
   const [isUploading, setIsUploading] = useState(false)
+  const [persistedUploads, setPersistedUploads] = useState<PersistedUploadState[]>([])
   const fileInputRef = useRef<HTMLInputElement>(null)
   const folderInputRef = useRef<HTMLInputElement>(null)
-  const ensuredCorsBucketsRef = useRef<Set<string>>(new Set())
+  const resumeFileInputRef = useRef<HTMLInputElement>(null)
+  const resumeTargetRef = useRef<PersistedUploadState | null>(null)
+  const enginesRef = useRef<Map<number, UploadEngine>>(new Map())
+
   const uploadedCount = files.filter((item) => item.status === "done").length
   const failedCount = files.filter((item) => item.status === "error").length
+  const pausedCount = files.filter((item) => item.status === "paused").length
   const processedCount = uploadedCount + failedCount
   const allUploadsDone = files.length > 0 && uploadedCount === files.length
+  const hasActiveUploads = files.some(
+    (item) => item.status === "uploading" || item.status === "completing"
+  )
+  const hasPausedUploads = pausedCount > 0
 
-  const setFileAt = useCallback((index: number, updater: (file: UploadFile) => UploadFile) => {
-    setFiles((prev) => prev.map((item, idx) => (idx === index ? updater(item) : item)))
-  }, [])
+  // Load persisted uploads when dialog opens
+  useEffect(() => {
+    if (open) {
+      const persisted = getPersistedUploads().filter(
+        (u) => u.bucket === bucket && u.credentialId === (credentialId ?? undefined)
+      )
+      setPersistedUploads(persisted)
+    }
+  }, [open, bucket, credentialId])
+
+  // Warn before closing tab during uploads
+  useEffect(() => {
+    if (!hasActiveUploads) return
+
+    const handler = (e: BeforeUnloadEvent) => {
+      e.preventDefault()
+    }
+
+    window.addEventListener("beforeunload", handler)
+    return () => window.removeEventListener("beforeunload", handler)
+  }, [hasActiveUploads])
+
+  const setFileAt = useCallback(
+    (index: number, updater: (file: UploadFile) => UploadFile) => {
+      setFiles((prev) =>
+        prev.map((item, idx) => (idx === index ? updater(item) : item))
+      )
+    },
+    []
+  )
 
   const addFiles = useCallback((fileList: FileList | null) => {
     if (!fileList) return
@@ -81,12 +139,16 @@ export function UploadDialog({
       file,
       relativePath: normalizeRelativePath(file),
       progress: 0,
+      speed: 0,
       status: "pending" as const,
     }))
 
     setFiles((prev) => {
       const seen = new Set(
-        prev.map((item) => `${item.relativePath}:${item.file.size}:${item.file.lastModified}`)
+        prev.map(
+          (item) =>
+            `${item.relativePath}:${item.file.size}:${item.file.lastModified}`
+        )
       )
 
       const dedupedIncoming = incoming.filter((item) => {
@@ -100,325 +162,138 @@ export function UploadDialog({
     })
   }, [])
 
-  const ensureBucketCors = useCallback(async (): Promise<boolean> => {
-    const scope = `${credentialId ?? "default"}::${bucket}`
-    if (ensuredCorsBucketsRef.current.has(scope)) {
-      return true
-    }
-
-    try {
-      const res = await fetch("/api/s3/cors/ensure", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          bucket,
-          credentialId,
-          origin: window.location.origin,
-        }),
-      })
-
-      if (!res.ok) {
-        return false
-      }
-
-      ensuredCorsBucketsRef.current.add(scope)
-      return true
-    } catch {
-      return false
-    }
-  }, [bucket, credentialId])
-
   function handleDrop(e: React.DragEvent) {
     e.preventDefault()
     addFiles(e.dataTransfer.files)
   }
 
   function removeFile(index: number) {
+    const engine = enginesRef.current.get(index)
+    if (engine) {
+      engine.destroy()
+      enginesRef.current.delete(index)
+    }
     setFiles((prev) => prev.filter((_, i) => i !== index))
   }
 
-  async function uploadBlobToSignedUrl(
-    url: string,
-    blob: Blob,
-    contentType: string,
-    onProgress?: (loaded: number, total: number) => void
-  ): Promise<string | null> {
-    return new Promise<string | null>((resolve, reject) => {
-      const xhr = new XMLHttpRequest()
-      xhr.open("PUT", url)
-      xhr.setRequestHeader("Content-Type", contentType || "application/octet-stream")
-
-      xhr.upload.onprogress = (event) => {
-        if (event.lengthComputable && onProgress) {
-          onProgress(event.loaded, event.total)
-        }
-      }
-
-      xhr.onload = () => {
-        if (xhr.status >= 200 && xhr.status < 300) {
-          resolve(xhr.getResponseHeader("ETag"))
-        } else if (xhr.status === 0) {
-          reject(
-            new Error(
-              "Upload failed due to CORS/network preflight. Ensure bucket CORS allows this app origin."
-            )
-          )
-        } else {
-          reject(new Error(`Upload failed with status ${xhr.status}`))
-        }
-      }
-
-      xhr.onerror = () =>
-        reject(
-          new Error(
-            "Upload failed due to CORS/network preflight. Ensure bucket CORS allows this app origin."
-          )
-        )
-
-      xhr.send(blob)
-    })
-  }
-
-  async function uploadSinglePut(uploadFile: UploadFile, index: number, key: string) {
-    const presignRes = await fetch("/api/s3/upload", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ bucket, credentialId, key }),
-    })
-
-    if (!presignRes.ok) {
-      throw new Error("Failed to get upload URL")
-    }
-
-    const { url } = await presignRes.json()
-
-    await uploadBlobToSignedUrl(
-      url,
-      uploadFile.file,
-      uploadFile.file.type,
-      (loaded, total) => {
-        const pct = Math.round((loaded / total) * 100)
-        setFileAt(index, (item) => ({ ...item, progress: pct }))
-      }
-    )
-  }
-
-  async function requestMultipartPartUrl(
-    key: string,
-    uploadId: string,
-    partNumber: number
-  ): Promise<string> {
-    const res = await fetch("/api/s3/upload/multipart/part", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        bucket,
-        key,
-        credentialId,
-        uploadId,
-        partNumber,
-      }),
-    })
-
-    if (!res.ok) {
-      throw new Error("Failed to get multipart part URL")
-    }
-
-    const data = await res.json()
-    return data.url as string
-  }
-
-  async function uploadMultipart(uploadFile: UploadFile, index: number, key: string) {
-    const startRes = await fetch("/api/s3/upload/multipart/start", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        bucket,
-        key,
-        credentialId,
-        contentType: uploadFile.file.type,
-      }),
-    })
-
-    if (!startRes.ok) {
-      throw new Error("Failed to start multipart upload")
-    }
-
-    const { uploadId } = await startRes.json()
-    if (!uploadId) {
-      throw new Error("Missing uploadId")
-    }
-
-    const fileSize = uploadFile.file.size
-    const totalParts = Math.ceil(fileSize / MULTIPART_CHUNK_SIZE)
-    const parts: MultipartPart[] = []
-    let uploadedBytes = 0
-
-    try {
-      for (let partNumber = 1; partNumber <= totalParts; partNumber++) {
-        const start = (partNumber - 1) * MULTIPART_CHUNK_SIZE
-        const end = Math.min(fileSize, start + MULTIPART_CHUNK_SIZE)
-        const chunk = uploadFile.file.slice(start, end)
-
-        let partETag: string | null = null
-
-        for (let attempt = 1; attempt <= MAX_PART_RETRIES; attempt++) {
-          try {
-            const partUrl = await requestMultipartPartUrl(key, uploadId, partNumber)
-            partETag = await uploadBlobToSignedUrl(
-              partUrl,
-              chunk,
-              uploadFile.file.type,
-              (loaded) => {
-                const pct = Math.round(((uploadedBytes + loaded) / fileSize) * 100)
-                setFileAt(index, (item) => ({ ...item, progress: pct }))
-              }
-            )
-            break
-          } catch {
-            if (attempt === MAX_PART_RETRIES) {
-              throw new Error(`Part ${partNumber} failed after ${MAX_PART_RETRIES} retries`)
-            }
+  function createEngine(file: File, key: string, index: number): UploadEngine {
+    const engine = new UploadEngine({
+      bucket,
+      key,
+      credentialId,
+      file,
+      contentType: file.type || "application/octet-stream",
+      callbacks: {
+        onProgress: (bytesUploaded, totalBytes, speed) => {
+          const pct = Math.min(Math.round((bytesUploaded / totalBytes) * 100), 100)
+          setFileAt(index, (item) => ({
+            ...item,
+            // Never decrease progress — on pause, in-flight bytes are lost
+            // but the bar should hold at the last known position
+            progress: Math.max(item.progress, pct),
+            speed,
+          }))
+        },
+        onStateChange: (state: UploadState) => {
+          const statusMap: Record<UploadState, UploadFile["status"]> = {
+            idle: "pending",
+            uploading: "uploading",
+            paused: "paused",
+            completing: "completing",
+            done: "done",
+            error: "error",
           }
-        }
+          setFileAt(index, (item) => ({ ...item, status: statusMap[state] }))
+        },
+        onComplete: () => {
+          setFileAt(index, (item) => ({
+            ...item,
+            status: "done",
+            progress: 100,
+            speed: 0,
+          }))
+        },
+        onError: (error: Error) => {
+          setFileAt(index, (item) => ({
+            ...item,
+            status: "error",
+            error: error.message,
+            speed: 0,
+          }))
+        },
+      },
+    })
 
-        if (!partETag) {
-          throw new Error(`Missing ETag for part ${partNumber}`)
-        }
-
-        parts.push({
-          PartNumber: partNumber,
-          ETag: partETag,
-        })
-
-        uploadedBytes += chunk.size
-        const pct = Math.round((uploadedBytes / fileSize) * 100)
-        setFileAt(index, (item) => ({ ...item, progress: pct }))
-      }
-
-      const completeRes = await fetch("/api/s3/upload/multipart/complete", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          bucket,
-          key,
-          credentialId,
-          uploadId,
-          parts,
-        }),
-      })
-
-      if (!completeRes.ok) {
-        throw new Error("Failed to complete multipart upload")
-      }
-    } catch (error) {
-      await fetch("/api/s3/upload/multipart/abort", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ bucket, key, credentialId, uploadId }),
-      }).catch(() => {
-        // best-effort cleanup
-      })
-
-      throw error
-    }
-  }
-
-  async function uploadWithCorsRetry(uploadFile: UploadFile, index: number, key: string) {
-    try {
-      if (uploadFile.file.size >= LARGE_FILE_THRESHOLD) {
-        await uploadMultipart(uploadFile, index, key)
-      } else {
-        await uploadSinglePut(uploadFile, index, key)
-      }
-      return
-    } catch (error) {
-      if (!isCorsLikeError(error)) {
-        throw error
-      }
-    }
-
-    const configured = await ensureBucketCors()
-    if (!configured) {
-      throw new Error(
-        "Upload blocked by bucket CORS. Could not auto-configure CORS with current credentials."
-      )
-    }
-
-    if (uploadFile.file.size >= LARGE_FILE_THRESHOLD) {
-      await uploadMultipart(uploadFile, index, key)
-    } else {
-      await uploadSinglePut(uploadFile, index, key)
-    }
+    enginesRef.current.set(index, engine)
+    return engine
   }
 
   async function handleUpload() {
     if (files.length === 0) return
     setIsUploading(true)
-
     const uploadedItems: Array<{ key: string; size: number; lastModified: string }> = []
-
-    // Best effort: configure bucket CORS once up front.
-    await ensureBucketCors()
 
     for (let i = 0; i < files.length; i++) {
       const uploadFile = files[i]
       if (uploadFile.status === "done") continue
 
+      const key = prefix + uploadFile.relativePath
+      const engine = createEngine(uploadFile.file, key, i)
+
       setFileAt(i, (item) => ({
         ...item,
         status: "uploading",
         progress: 0,
+        speed: 0,
         error: undefined,
+        engine,
       }))
 
       try {
-        const key = prefix + uploadFile.relativePath
+        // start() stays alive through pause/resume cycles via the pause gate.
+        // It only resolves when the upload is fully done, errored, or aborted.
+        await engine.start()
 
-        await uploadWithCorsRetry(uploadFile, i, key)
-
-        setFileAt(i, (item) => ({
-          ...item,
-          status: "done",
-          progress: 100,
-          error: undefined,
-        }))
-
-        uploadedItems.push({
-          key,
-          size: uploadFile.file.size,
-          lastModified: new Date().toISOString(),
-        })
+        if (engine.getState() === "done") {
+          uploadedItems.push({
+            key,
+            size: uploadFile.file.size,
+            lastModified: new Date().toISOString(),
+          })
+        }
       } catch (error) {
         const message = error instanceof Error ? error.message : "Upload failed"
-        setFileAt(i, (item) => ({ ...item, status: "error", error: message }))
+        setFileAt(i, (item) => ({
+          ...item,
+          status: "error",
+          error: message,
+          speed: 0,
+        }))
       }
     }
 
+    // All engines have resolved — finalize
     if (uploadedItems.length > 0) {
       try {
         await fetch("/api/s3/upload/complete", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            bucket,
-            credentialId,
-            items: uploadedItems,
-          }),
+          body: JSON.stringify({ bucket, credentialId, items: uploadedItems }),
         })
       } catch {
-        // Metadata can still be refreshed via manual sync; upload itself already succeeded.
+        // Metadata can still be refreshed via manual sync
       }
     }
 
     setIsUploading(false)
 
-    if (uploadedItems.length === files.length) {
-      toast.success(`Upload complete (${uploadedItems.length}/${files.length})`)
-    } else if (uploadedItems.length === 0) {
+    const totalFiles = files.length
+    if (uploadedItems.length === totalFiles && totalFiles > 0) {
+      toast.success(`Upload complete (${uploadedItems.length}/${totalFiles})`)
+    } else if (uploadedItems.length === 0 && totalFiles > 0) {
       toast.error("Upload failed. Check bucket CORS configuration and try again.")
-    } else {
-      toast.error(`Uploaded ${uploadedItems.length}/${files.length}. Some files failed.`)
+    } else if (uploadedItems.length > 0) {
+      toast.error(`Uploaded ${uploadedItems.length}/${totalFiles}. Some files failed.`)
     }
 
     if (uploadedItems.length > 0) {
@@ -430,11 +305,146 @@ export function UploadDialog({
     }
   }
 
-  function handleClose(openState: boolean) {
-    if (!isUploading) {
-      setFiles([])
-      onOpenChange(openState)
+  function handlePauseFile(index: number) {
+    const engine = enginesRef.current.get(index)
+    if (engine) {
+      engine.pause()
     }
+  }
+
+  function handleResumeFile(index: number) {
+    const engine = enginesRef.current.get(index)
+    if (engine) {
+      engine.resume() // synchronous — opens the pause gate, workers continue
+    }
+  }
+
+  function handlePauseAll() {
+    for (const engine of enginesRef.current.values()) {
+      if (engine.getState() === "uploading") {
+        engine.pause()
+      }
+    }
+  }
+
+  function handleResumeAll() {
+    for (const engine of enginesRef.current.values()) {
+      if (engine.getState() === "paused") {
+        engine.resume()
+      }
+    }
+  }
+
+  function handleDiscardPersistedUpload(upload: PersistedUploadState) {
+    removeUploadState(upload.uploadId)
+    setPersistedUploads((prev) =>
+      prev.filter((u) => u.uploadId !== upload.uploadId)
+    )
+
+    // Best-effort abort on S3
+    fetch("/api/s3/upload/multipart/abort", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        bucket: upload.bucket,
+        key: upload.key,
+        credentialId: upload.credentialId,
+        uploadId: upload.uploadId,
+      }),
+    }).catch(() => {})
+  }
+
+  function handleResumePersistedUpload(upload: PersistedUploadState) {
+    resumeTargetRef.current = upload
+    resumeFileInputRef.current?.click()
+  }
+
+  async function handleResumeFileSelected(fileList: FileList | null) {
+    const savedUpload = resumeTargetRef.current
+    resumeTargetRef.current = null
+    if (!fileList || fileList.length === 0 || !savedUpload) return
+
+    const file = fileList[0]
+
+    // Validate file matches
+    if (
+      file.name !== savedUpload.fileName ||
+      file.size !== savedUpload.fileSize ||
+      file.lastModified !== savedUpload.fileLastModified
+    ) {
+      toast.error(
+        "Selected file does not match the original upload. Please select the same file."
+      )
+      return
+    }
+
+    setIsUploading(true)
+
+    const index = files.length
+    const newFile: UploadFile = {
+      file,
+      relativePath: savedUpload.key.replace(new RegExp(`^${prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`), ""),
+      progress: Math.round(
+        (savedUpload.completedPartNumbers.length / savedUpload.totalParts) * 100
+      ),
+      speed: 0,
+      status: "uploading",
+    }
+
+    setFiles((prev) => [...prev, newFile])
+
+    const engine = createEngine(file, savedUpload.key, index)
+
+    try {
+      // Stays alive through pause/resume cycles
+      await engine.resumeFromPersistedState(savedUpload)
+
+      if (engine.getState() === "done") {
+        // Remove from persisted list
+        setPersistedUploads((prev) =>
+          prev.filter((u) => u.uploadId !== savedUpload.uploadId)
+        )
+
+        try {
+          await fetch("/api/s3/upload/complete", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              bucket,
+              credentialId,
+              items: [{ key: savedUpload.key, size: file.size, lastModified: new Date().toISOString() }],
+            }),
+          })
+        } catch {
+          // Metadata can still be refreshed via manual sync
+        }
+
+        toast.success("Upload resumed and completed")
+
+        try {
+          await onUploadComplete()
+        } catch {
+          toast.error("Upload finished, but bucket sync failed")
+        }
+      }
+    } catch {
+      // Error handling done via engine callbacks
+    }
+
+    setIsUploading(false)
+  }
+
+  function handleClose(openState: boolean) {
+    if (hasActiveUploads || hasPausedUploads) return
+
+    // Cleanup engines
+    for (const engine of enginesRef.current.values()) {
+      engine.destroy()
+    }
+    enginesRef.current.clear()
+
+    setFiles([])
+    onOpenChange(openState)
   }
 
   async function handlePrimaryAction() {
@@ -448,7 +458,7 @@ export function UploadDialog({
 
   return (
     <Dialog open={open} onOpenChange={handleClose}>
-      <DialogContent className="max-w-lg">
+      <DialogContent className="max-w-lg overflow-hidden">
         <DialogHeader>
           <DialogTitle>Upload Files</DialogTitle>
         </DialogHeader>
@@ -510,7 +520,57 @@ export function UploadDialog({
             className="hidden"
             onChange={(event) => addFiles(event.target.files)}
           />
+          {/* Hidden input for resume file selection */}
+          <input
+            ref={resumeFileInputRef}
+            type="file"
+            className="hidden"
+            onChange={(event) => {
+              void handleResumeFileSelected(event.target.files)
+              event.target.value = ""
+            }}
+          />
         </div>
+
+        {/* Resumable uploads from previous sessions */}
+        {persistedUploads.length > 0 && (
+          <div className="space-y-2 overflow-hidden border-t pt-3">
+            <p className="text-xs font-medium text-muted-foreground">
+              Resumable uploads
+            </p>
+            {persistedUploads.map((upload) => (
+              <div
+                key={upload.uploadId}
+                className="flex items-center gap-2 overflow-hidden rounded-md border px-3 py-2"
+              >
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-sm">{upload.fileName}</p>
+                  <p className="truncate text-xs text-muted-foreground">
+                    {formatBytes(upload.fileSize)} &mdash;{" "}
+                    {upload.completedPartNumbers.length}/{upload.totalParts} parts
+                  </p>
+                </div>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="shrink-0"
+                  onClick={() => handleResumePersistedUpload(upload)}
+                  disabled={isUploading}
+                >
+                  <RotateCcw className="mr-1.5 h-3 w-3" />
+                  Resume
+                </Button>
+                <button
+                  type="button"
+                  onClick={() => handleDiscardPersistedUpload(upload)}
+                  className="shrink-0"
+                >
+                  <X className="h-4 w-4 text-muted-foreground hover:text-foreground" />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
 
         {files.length > 0 && (
           <div className="max-h-60 space-y-2 overflow-auto">
@@ -524,9 +584,23 @@ export function UploadDialog({
                   <div className="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-muted">
                     <div
                       className="h-full rounded-full bg-primary transition-all"
-                      style={{ width: `${item.progress}%` }}
+                      style={{ width: `${Math.min(item.progress, 100)}%` }}
                     />
                   </div>
+                  {(item.status === "uploading" || item.status === "completing" || item.status === "paused") ? (
+                    <p className="mt-0.5 text-xs text-muted-foreground">
+                      {item.progress}%
+                      {item.speed > 0
+                        ? ` — ${formatSpeed(item.speed)}`
+                        : ""}
+                      {item.speed > 0 && item.progress > 0 && item.progress < 100
+                        ? ` — ${formatEta(
+                            item.file.size * (1 - item.progress / 100),
+                            item.speed
+                          )}`
+                        : ""}
+                    </p>
+                  ) : null}
                   {item.error ? (
                     <p className="mt-1 text-xs text-destructive">{item.error}</p>
                   ) : null}
@@ -534,8 +608,34 @@ export function UploadDialog({
 
                 {item.status === "done" ? (
                   <CheckCircle className="h-4 w-4 shrink-0 text-green-500" />
-                ) : item.status === "uploading" ? (
-                  <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
+                ) : item.status === "uploading" || item.status === "completing" ? (
+                  shouldUseMultipart(item.file.size) ? (
+                    <button
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        handlePauseFile(index)
+                      }}
+                      className="shrink-0"
+                      title="Pause upload"
+                    >
+                      <Pause className="h-4 w-4 text-muted-foreground hover:text-foreground" />
+                    </button>
+                  ) : (
+                    <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
+                  )
+                ) : item.status === "paused" ? (
+                  <button
+                    type="button"
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      handleResumeFile(index)
+                    }}
+                    className="shrink-0"
+                    title="Resume upload"
+                  >
+                    <Play className="h-4 w-4 text-muted-foreground hover:text-foreground" />
+                  </button>
                 ) : (
                   <button
                     type="button"
@@ -554,25 +654,38 @@ export function UploadDialog({
         )}
 
         <div className="flex justify-end gap-2">
+          {hasPausedUploads && (
+            <Button variant="outline" size="sm" onClick={handleResumeAll}>
+              <Play className="mr-1.5 h-3 w-3" />
+              Resume All
+            </Button>
+          )}
+          {hasActiveUploads && (
+            <Button variant="outline" size="sm" onClick={handlePauseAll}>
+              <Pause className="mr-1.5 h-3 w-3" />
+              Pause All
+            </Button>
+          )}
+          <div className="flex-1" />
           <Button
             variant="outline"
             onClick={() => handleClose(false)}
-            disabled={isUploading}
+            disabled={hasActiveUploads || hasPausedUploads}
           >
             Cancel
           </Button>
           <Button
             onClick={() => void handlePrimaryAction()}
-            disabled={files.length === 0 || isUploading}
+            disabled={files.length === 0 || hasActiveUploads || hasPausedUploads}
           >
-            {isUploading ? (
+            {hasActiveUploads ? (
               <Loader2 className="mr-2 h-4 w-4 animate-spin" />
             ) : null}
-            {isUploading
+            {hasActiveUploads
               ? `Uploading ${processedCount}/${files.length}`
               : allUploadsDone
                 ? "Continue"
-              : `Upload${files.length > 0 ? ` (${files.length})` : ""}`}
+                : `Upload${files.length > 0 ? ` (${files.length})` : ""}`}
           </Button>
         </div>
       </DialogContent>

@@ -4,6 +4,7 @@ import {
   DeleteObjectCommand,
   DeleteObjectsCommand,
   GetObjectCommand,
+  HeadObjectCommand,
   PutObjectCommand,
   type PutObjectCommandInput,
   type S3Client,
@@ -45,6 +46,7 @@ import {
   resolveTaskSchedule,
   type ResolvedTaskSchedule,
 } from "@/lib/task-schedule"
+import { isDestinationUpToDateForSync } from "@/lib/transfer-delta"
 
 export const runtime = "nodejs"
 export const maxDuration = 60
@@ -406,6 +408,11 @@ function toValidContentLength(value: unknown): number | null {
   return null
 }
 
+interface RemoteObjectSnapshot {
+  size: bigint | null
+  lastModified: Date | null
+}
+
 function getS3ErrorCode(error: unknown): string {
   if (!error || typeof error !== "object") return ""
   const candidate = error as { Code?: unknown; code?: unknown; name?: unknown }
@@ -414,6 +421,54 @@ function getS3ErrorCode(error: unknown): string {
   if (typeof candidate.code === "string") return candidate.code
   if (typeof candidate.name === "string") return candidate.name
   return ""
+}
+
+function isS3MissingObjectError(error: unknown): boolean {
+  const code = getS3ErrorCode(error)
+  if (
+    code === "NoSuchKey" ||
+    code === "NotFound" ||
+    code === "NoSuchObject" ||
+    code === "404"
+  ) {
+    return true
+  }
+
+  if (!error || typeof error !== "object") return false
+  const candidate = error as {
+    $metadata?: {
+      httpStatusCode?: unknown
+    }
+  }
+  return candidate.$metadata?.httpStatusCode === 404
+}
+
+async function readRemoteObjectSnapshot(params: {
+  client: S3Client
+  bucket: string
+  key: string
+}): Promise<RemoteObjectSnapshot | null> {
+  try {
+    const response = await params.client.send(
+      new HeadObjectCommand({
+        Bucket: params.bucket,
+        Key: params.key,
+      })
+    )
+
+    const size = toValidContentLength(response.ContentLength)
+    const lastModified = response.LastModified instanceof Date ? response.LastModified : null
+
+    return {
+      size: size === null ? null : BigInt(size),
+      lastModified,
+    }
+  } catch (error) {
+    if (isS3MissingObjectError(error)) {
+      return null
+    }
+    throw error
+  }
 }
 
 function formatTaskProcessingError(error: unknown): string {
@@ -1624,26 +1679,43 @@ export async function POST(request: Request) {
 
       const sameCredential =
         transferPayload.sourceCredentialId === transferPayload.destinationCredentialId
-      const destinationKeys = sourceBatch.map((file) =>
-        mapTransferDestinationKey(transferPayload as ObjectTransferTaskPayload, file.key)
-      )
+      const requiresDestinationComparison =
+        transferPayload.operation === "copy" || transferPayload.operation === "sync"
+      const mappedBatch = sourceBatch.map((sourceFile) => ({
+        sourceFile,
+        destinationKey: mapTransferDestinationKey(
+          transferPayload as ObjectTransferTaskPayload,
+          sourceFile.key
+        ),
+      }))
 
-      const destinationRows = await prisma.fileMetadata.findMany({
-        where: {
-          userId: actorUserId,
-          credentialId: transferPayload.destinationCredentialId,
-          bucket: transferPayload.destinationBucket,
-          isFolder: false,
-          key: { in: destinationKeys },
-        },
-        select: {
-          key: true,
-          size: true,
-          lastModified: true,
-        },
-      })
+      let destinationByKey = new Map<string, { size: bigint; lastModified: Date }>()
+      if (requiresDestinationComparison) {
+        const destinationRows = await prisma.fileMetadata.findMany({
+          where: {
+            userId: actorUserId,
+            credentialId: transferPayload.destinationCredentialId,
+            bucket: transferPayload.destinationBucket,
+            isFolder: false,
+            key: { in: mappedBatch.map((item) => item.destinationKey) },
+          },
+          select: {
+            key: true,
+            size: true,
+            lastModified: true,
+          },
+        })
 
-      const destinationByKey = new Map(destinationRows.map((row) => [row.key, row]))
+        destinationByKey = new Map(
+          destinationRows.map((row) => [
+            row.key,
+            {
+              size: row.size,
+              lastModified: row.lastModified,
+            },
+          ])
+        )
+      }
 
       let remainingCacheSlots: number | null = null
       if (
@@ -1673,7 +1745,7 @@ export async function POST(request: Request) {
       const movedSourceKeys: string[] = []
       const batchStartedAt = Date.now()
 
-      for (const sourceFile of sourceBatch) {
+      for (const { sourceFile, destinationKey } of mappedBatch) {
         // Keep each processing run bounded so long transfers continue across calls
         // instead of hitting function/request time limits.
         if (
@@ -1683,11 +1755,6 @@ export async function POST(request: Request) {
           timeBudgetReached = true
           break
         }
-
-        const destinationKey = mapTransferDestinationKey(
-          transferPayload as ObjectTransferTaskPayload,
-          sourceFile.key
-        )
 
         if (
           sameCredential &&
@@ -1700,8 +1767,34 @@ export async function POST(request: Request) {
           continue
         }
 
-        const destinationExisting = destinationByKey.get(destinationKey)
-        const createsNewDestination = !destinationExisting
+        let destinationExisting = requiresDestinationComparison
+          ? destinationByKey.get(destinationKey)
+          : undefined
+        let destinationExistsRemotely = false
+
+        if (requiresDestinationComparison && !destinationExisting) {
+          try {
+            const remoteSnapshot = await readRemoteObjectSnapshot({
+              client: destinationClient,
+              bucket: transferPayload.destinationBucket,
+              key: destinationKey,
+            })
+            if (remoteSnapshot) {
+              destinationExistsRemotely = true
+              if (remoteSnapshot.size !== null && remoteSnapshot.lastModified) {
+                destinationExisting = {
+                  size: remoteSnapshot.size,
+                  lastModified: remoteSnapshot.lastModified,
+                }
+                destinationByKey.set(destinationKey, destinationExisting)
+              }
+            }
+          } catch {
+            // If destination verification fails, continue with normal transfer flow.
+          }
+        }
+
+        const createsNewDestination = !destinationExisting && !destinationExistsRemotely
 
         if (createsNewDestination && remainingCacheSlots !== null && remainingCacheSlots <= 0) {
           skippedInBatch++
@@ -1710,7 +1803,10 @@ export async function POST(request: Request) {
           continue
         }
 
-        if (transferPayload.operation === "copy" && destinationExisting) {
+        if (
+          transferPayload.operation === "copy" &&
+          (destinationExisting || destinationExistsRemotely)
+        ) {
           skippedInBatch++
           processedInBatch++
           lastProcessedCursorKey = sourceFile.key
@@ -1720,8 +1816,13 @@ export async function POST(request: Request) {
         if (
           transferPayload.operation === "sync" &&
           destinationExisting &&
-          destinationExisting.size.toString() === sourceFile.size.toString() &&
-          destinationExisting.lastModified.getTime() === sourceFile.lastModified.getTime()
+          isDestinationUpToDateForSync(
+            {
+              size: sourceFile.size,
+              lastModified: sourceFile.lastModified,
+            },
+            destinationExisting
+          )
         ) {
           skippedInBatch++
           processedInBatch++

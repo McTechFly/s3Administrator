@@ -15,6 +15,7 @@ import {
   assertValidTaskScheduleCron,
   TaskScheduleValidationError,
 } from "@/lib/task-schedule"
+import { isDestinationUpToDateForSync } from "@/lib/transfer-delta"
 
 type TransferScope = "folder" | "bucket"
 type TransferOperation = "sync" | "copy" | "move" | "migrate"
@@ -111,12 +112,6 @@ interface TransferTaskDetailedPreviewPlan {
   pageSize: number
   scannedSourceObjects: number
   scanLimitReached: boolean
-}
-
-interface SourceMetadataPreviewRow {
-  key: string
-  size: bigint
-  lastModified: Date
 }
 
 interface DestinationMetadataPreviewRow {
@@ -238,16 +233,6 @@ function buildDeleteDestinationAction(params: {
     sourceKey: null,
     destinationKey: params.destinationKey,
   }
-}
-
-function isSameObjectMetadata(
-  sourceRow: SourceMetadataPreviewRow,
-  destinationRow: DestinationMetadataPreviewRow
-): boolean {
-  return (
-    sourceRow.size.toString() === destinationRow.size.toString() &&
-    sourceRow.lastModified.getTime() === destinationRow.lastModified.getTime()
-  )
 }
 
 async function findSyncDestinationDriftPreviewBatch(params: {
@@ -378,30 +363,36 @@ async function buildTransferDetailedPreviewPlan(params: {
 
     scannedSourceObjects += sourceRows.length
 
-    const destinationKeys = sourceRows.map((row) =>
-      mapTransferPreviewDestinationKey({
-        scope: params.scope,
-        sourcePrefix: params.sourcePrefix,
-        destinationPrefix: params.destinationPrefix,
-        sourceKey: row.key,
-      })
-    )
+    const requiresDestinationComparison =
+      params.operation === "copy" || params.operation === "sync"
+    let destinationByKey = new Map<string, DestinationMetadataPreviewRow>()
 
-    const destinationRows = await prisma.fileMetadata.findMany({
-      where: {
-        userId: params.userId,
-        credentialId: params.destinationCredentialId,
-        bucket: params.destinationBucket,
-        isFolder: false,
-        key: { in: destinationKeys },
-      },
-      select: {
-        key: true,
-        size: true,
-        lastModified: true,
-      },
-    })
-    const destinationByKey = new Map(destinationRows.map((row) => [row.key, row]))
+    if (requiresDestinationComparison) {
+      const destinationKeys = sourceRows.map((row) =>
+        mapTransferPreviewDestinationKey({
+          scope: params.scope,
+          sourcePrefix: params.sourcePrefix,
+          destinationPrefix: params.destinationPrefix,
+          sourceKey: row.key,
+        })
+      )
+
+      const destinationRows = await prisma.fileMetadata.findMany({
+        where: {
+          userId: params.userId,
+          credentialId: params.destinationCredentialId,
+          bucket: params.destinationBucket,
+          isFolder: false,
+          key: { in: destinationKeys },
+        },
+        select: {
+          key: true,
+          size: true,
+          lastModified: true,
+        },
+      })
+      destinationByKey = new Map(destinationRows.map((row) => [row.key, row]))
+    }
 
     let consumedAllRows = true
     for (let i = 0; i < sourceRows.length; i++) {
@@ -412,7 +403,9 @@ async function buildTransferDetailedPreviewPlan(params: {
         destinationPrefix: params.destinationPrefix,
         sourceKey: sourceRow.key,
       })
-      const destinationExisting = destinationByKey.get(destinationKey)
+      const destinationExisting = requiresDestinationComparison
+        ? destinationByKey.get(destinationKey)
+        : undefined
       const rowActions: TransferTaskDetailedPreviewAction[] = []
 
       if (params.operation === "move" || params.operation === "migrate") {
@@ -443,7 +436,8 @@ async function buildTransferDetailedPreviewPlan(params: {
         }
       } else {
         const shouldCopy =
-          !destinationExisting || !isSameObjectMetadata(sourceRow, destinationExisting)
+          !destinationExisting ||
+          !isDestinationUpToDateForSync(sourceRow, destinationExisting)
         if (shouldCopy) {
           rowActions.push(
             buildCopyAction({

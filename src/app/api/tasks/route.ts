@@ -226,21 +226,25 @@ export async function GET(request: NextRequest) {
     }
 
     const mappedTasks = normalizedTasks.map((task) => {
-      const effectiveNextRunAt =
-        task.lifecycleState === "active" && task.isRecurring
-          ? getEffectiveNextRunAtForTask(task, now)
-          : task.nextRunAt
+      const resolvedSchedule = resolveTaskSchedule(task)
+      const isRecurringConfigured = task.isRecurring && resolvedSchedule.enabled
+      const scheduleEnabled = task.lifecycleState === "active" && resolvedSchedule.enabled
+      const effectiveNextRunAt = scheduleEnabled
+        ? getEffectiveNextRunAtForTask(task, now)
+        : task.nextRunAt
 
       return {
         ...task,
+        isRecurring: isRecurringConfigured,
+        scheduleCron: resolvedSchedule.cron,
+        scheduleIntervalSeconds: resolvedSchedule.legacyIntervalSeconds,
         nextRunAt: effectiveNextRunAt,
         executionHistory: normalizeExecutionHistory(task.executionHistory),
-        upcomingRuns:
-          task.lifecycleState === "active" && task.isRecurring
-            ? task.scheduleCron
-              ? getUpcomingRunDatesFromCron(task.scheduleCron, effectiveNextRunAt, 3)
-              : getUpcomingRunDates(effectiveNextRunAt, task.scheduleIntervalSeconds, 3)
-            : [],
+        upcomingRuns: scheduleEnabled
+          ? resolvedSchedule.cron
+            ? getUpcomingRunDatesFromCron(resolvedSchedule.cron, effectiveNextRunAt, 3)
+            : getUpcomingRunDates(effectiveNextRunAt, resolvedSchedule.legacyIntervalSeconds, 3)
+          : [],
         lastRunStatus: latestRunByTaskId.get(task.id)?.status ?? null,
         lastRunDurationMs: (() => {
           const latest = latestRunByTaskId.get(task.id)

@@ -40,6 +40,7 @@ import {
   ArrowDown,
   ArrowUp,
   ArrowUpDown,
+  CircleAlert,
   Loader2,
   Plus,
   RefreshCw,
@@ -47,6 +48,12 @@ import {
   Settings,
   Trash2,
 } from "lucide-react"
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip"
 
 interface BucketRow {
   name: string
@@ -100,6 +107,7 @@ export default function BucketsPage() {
   const [createCredentialId, setCreateCredentialId] = useState("")
   const [creating, setCreating] = useState(false)
   const [syncingStats, setSyncingStats] = useState(false)
+  const [syncIssueByBucketKey, setSyncIssueByBucketKey] = useState<Record<string, string>>({})
   const [pendingDeleteBucket, setPendingDeleteBucket] = useState<BucketRow | null>(null)
   const [settingsBucket, setSettingsBucket] = useState<BucketRow | null>(null)
 
@@ -376,8 +384,10 @@ export default function BucketsPage() {
     try {
       let syncedFiles = 0
       let failed = 0
+      const nextSyncIssues: Record<string, string> = {}
 
       for (const bucket of rows) {
+        const bucketKey = `${bucket.credentialId}:${bucket.name}`
         try {
           const res = await fetch("/api/s3/sync", {
             method: "POST",
@@ -392,10 +402,13 @@ export default function BucketsPage() {
             throw new Error(payload?.error ?? `Failed to sync ${bucket.name}`)
           }
           syncedFiles += Number(payload?.synced ?? 0)
-        } catch {
+        } catch (error) {
           failed += 1
+          nextSyncIssues[bucketKey] =
+            error instanceof Error ? error.message : "Failed to sync bucket"
         }
       }
+      setSyncIssueByBucketKey(nextSyncIssues)
 
       await refreshBucketQueries()
 
@@ -412,7 +425,8 @@ export default function BucketsPage() {
   }
 
   return (
-    <div className="space-y-6 p-4 sm:p-6">
+    <TooltipProvider>
+      <div className="space-y-6 p-4 sm:p-6">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
         <div>
           <h1 className="text-2xl font-bold">Buckets</h1>
@@ -636,6 +650,16 @@ export default function BucketsPage() {
                       <TableCell>
                         <div className="flex items-center gap-2">
                           <span className="font-medium">{bucket.name}</span>
+                          {syncIssueByBucketKey[`${bucket.credentialId}:${bucket.name}`] ? (
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <CircleAlert className="h-4 w-4 text-destructive" />
+                              </TooltipTrigger>
+                              <TooltipContent>
+                                {syncIssueByBucketKey[`${bucket.credentialId}:${bucket.name}`]}
+                              </TooltipContent>
+                            </Tooltip>
+                          ) : null}
                         </div>
                       </TableCell>
                       <TableCell>
@@ -768,6 +792,7 @@ export default function BucketsPage() {
           await handleDeleteBucket(pendingDeleteBucket)
         }}
       />
-    </div>
+      </div>
+    </TooltipProvider>
   )
 }

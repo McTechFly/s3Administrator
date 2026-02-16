@@ -27,9 +27,23 @@ export const addCredentialSchema = z.object({
   label: z.string().min(1).max(100),
   provider: z.enum(['AWS', 'HETZNER', 'CLOUDFLARE_R2', 'MINIO', 'GENERIC']),
   endpoint: z.string().min(1),
-  region: z.string().min(1).max(50),
+  region: z.preprocess(
+    (value) =>
+      typeof value === "string" && value.trim().length === 0
+        ? undefined
+        : value,
+    z.string().trim().max(50).optional()
+  ),
   accessKey: z.string().min(1),
   secretKey: z.string().min(1),
+}).superRefine((value, ctx) => {
+  if (value.provider !== "MINIO" && !value.region) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["region"],
+      message: "Region is required for this provider",
+    })
+  }
 })
 
 export const listObjectsSchema = z.object({
@@ -134,6 +148,21 @@ export const previewSchema = z.object({
 
 export const taskScheduleSchema = z.object({
   cron: z.string().trim().min(1).max(120),
+})
+
+export const batchPartUrlsSchema = z.object({
+  bucket: s3BucketSchema,
+  key: s3KeySchema,
+  credentialId: z.string().optional(),
+  uploadId: z.string().min(1),
+  partNumbers: z.array(z.number().int().min(1).max(10000)).min(1).max(100),
+})
+
+export const listPartsSchema = z.object({
+  bucket: s3BucketSchema,
+  key: s3KeySchema,
+  credentialId: z.string().optional(),
+  uploadId: z.string().min(1),
 })
 
 export const transferTaskSchema = z.object({

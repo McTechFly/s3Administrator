@@ -1,6 +1,6 @@
 import parser from "cron-parser"
 
-export const MIN_TASK_SCHEDULE_INTERVAL_SECONDS = 60
+export const MIN_TASK_SCHEDULE_INTERVAL_SECONDS = 60 * 60
 const MAX_TASK_CRON_LENGTH = 120
 
 export interface TaskSchedulePayload {
@@ -14,6 +14,19 @@ export interface ResolvedTaskSchedule {
 }
 
 export class TaskScheduleValidationError extends Error {}
+
+function formatIntervalLabel(seconds: number): string {
+  const normalized = Math.max(1, Math.floor(seconds))
+  if (normalized % 3600 === 0) {
+    const hours = normalized / 3600
+    return hours === 1 ? "1 hour" : `${hours} hours`
+  }
+  if (normalized % 60 === 0) {
+    const minutes = normalized / 60
+    return minutes === 1 ? "1 minute" : `${minutes} minutes`
+  }
+  return normalized === 1 ? "1 second" : `${normalized} seconds`
+}
 
 function normalizeWhitespace(value: string): string {
   return value.trim().replace(/\s+/g, " ")
@@ -51,7 +64,7 @@ export function assertValidTaskScheduleCron(
       const diffSeconds = Math.floor((next.getTime() - previous.getTime()) / 1000)
       if (diffSeconds < minIntervalSeconds) {
         throw new TaskScheduleValidationError(
-          `Schedule is too frequent. Minimum interval is ${minIntervalSeconds} seconds`
+          `Schedule is too frequent. Minimum interval is ${formatIntervalLabel(minIntervalSeconds)}`
         )
       }
       previous = next
@@ -104,15 +117,24 @@ export function resolveTaskSchedule(schedule: {
     }
   }
 
-  const cron =
+  const cronCandidate =
     typeof schedule.scheduleCron === "string" && schedule.scheduleCron.trim().length > 0
       ? normalizeWhitespace(schedule.scheduleCron)
       : null
-  if (cron) {
-    return {
-      enabled: true,
-      cron,
-      legacyIntervalSeconds: null,
+  if (cronCandidate) {
+    try {
+      const cron = assertValidTaskScheduleCron(cronCandidate)
+      return {
+        enabled: true,
+        cron,
+        legacyIntervalSeconds: null,
+      }
+    } catch {
+      return {
+        enabled: false,
+        cron: null,
+        legacyIntervalSeconds: null,
+      }
     }
   }
 

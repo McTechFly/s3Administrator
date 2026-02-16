@@ -241,7 +241,7 @@ export default function TasksPage() {
   const [sourcePrefix, setSourcePrefix] = useState("")
   const [destinationPrefix, setDestinationPrefix] = useState("")
   const [scheduleMode, setScheduleMode] = useState<"once" | "cron">("once")
-  const [scheduleCron, setScheduleCron] = useState("* * * * *")
+  const [scheduleCron, setScheduleCron] = useState("0 * * * *")
   const [submitting, setSubmitting] = useState(false)
   const [controllingTaskId, setControllingTaskId] = useState<string | null>(null)
   const [transferPreviewOpen, setTransferPreviewOpen] = useState(false)
@@ -553,7 +553,10 @@ export default function TasksPage() {
 
   async function handleTaskControl(
     taskId: string,
-    action: "pause" | "resume" | "restart" | "retry_failed" | "cancel"
+    action: "pause" | "resume" | "restart" | "retry_failed" | "cancel",
+    options?: {
+      cancelLabel?: "task" | "schedule"
+    }
   ) {
     setControllingTaskId(taskId)
     try {
@@ -575,10 +578,12 @@ export default function TasksPage() {
           : action === "resume"
             ? "Task resumed"
             : action === "cancel"
-              ? "Task schedule canceled"
-            : action === "retry_failed"
-              ? "Retry for failed items started"
-              : "Task restarted"
+              ? options?.cancelLabel === "schedule"
+                ? "Task schedule canceled"
+                : "Task canceled"
+              : action === "retry_failed"
+                ? "Retry for failed items started"
+                : "Task restarted"
       )
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Failed to control task")
@@ -711,10 +716,10 @@ export default function TasksPage() {
                 <Input
                   value={scheduleCron}
                   onChange={(event) => setScheduleCron(event.target.value)}
-                  placeholder="* * * * *"
+                  placeholder="0 * * * *"
                 />
                 <p className="text-xs text-muted-foreground">
-                  Minimum supported frequency is once per minute.
+                  Minimum supported frequency is once per hour.
                 </p>
               </div>
             ) : null}
@@ -917,16 +922,18 @@ export default function TasksPage() {
                         <RotateCcw className="mr-1 h-3.5 w-3.5" />
                         Restart
                       </Button>
-                      {task.isRecurring ? (
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          disabled={controllingTaskId === task.id || task.status === "in_progress"}
-                          onClick={() => void handleTaskControl(task.id, "cancel")}
-                        >
-                          Cancel Schedule
-                        </Button>
-                      ) : null}
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={controllingTaskId === task.id || task.status === "in_progress"}
+                        onClick={() =>
+                          void handleTaskControl(task.id, "cancel", {
+                            cancelLabel: task.isRecurring ? "schedule" : "task",
+                          })
+                        }
+                      >
+                        {task.isRecurring ? "Cancel Schedule" : "Cancel Task"}
+                      </Button>
                     </div>
                   </div>
                 </div>
@@ -1036,7 +1043,7 @@ export default function TasksPage() {
           }
         }}
       >
-        <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-2xl">
+        <DialogContent className="max-h-[85vh] overflow-y-auto overflow-x-hidden sm:max-w-2xl">
           <DialogHeader>
             <DialogTitle>Task Execution Plan</DialogTitle>
             <DialogDescription>
@@ -1069,11 +1076,11 @@ export default function TasksPage() {
                   Planned object actions ({transferPreview.detailedPlan.actions.length} loaded)
                 </p>
                 {transferPreview.detailedPlan.actions.length > 0 ? (
-                  <ul className="max-h-64 overflow-y-auto rounded-md border p-2 font-mono text-xs">
+                  <ul className="max-h-72 overflow-y-auto overflow-x-hidden rounded-md border p-2 font-mono text-xs">
                     {transferPreview.detailedPlan.actions.map((action, index) => (
                       <li
                         key={`${action.command}:${action.sourceKey ?? "none"}:${action.destinationKey ?? "none"}:${index}`}
-                        className="truncate py-0.5"
+                        className="break-all py-0.5 whitespace-normal"
                       >
                         {action.command}
                       </li>
@@ -1106,23 +1113,6 @@ export default function TasksPage() {
                   <p className="text-xs text-muted-foreground">
                     Full plan loaded for the current cached metadata snapshot.
                   </p>
-                )}
-              </div>
-
-              <div className="space-y-2">
-                <p className="font-medium">
-                  Sample source objects ({transferPreview.sampleObjects.length})
-                </p>
-                {transferPreview.sampleObjects.length > 0 ? (
-                  <ul className="max-h-44 overflow-y-auto rounded-md border p-2 font-mono text-xs">
-                    {transferPreview.sampleObjects.map((item) => (
-                      <li key={item} className="truncate">
-                        {item}
-                      </li>
-                    ))}
-                  </ul>
-                ) : (
-                  <p className="text-xs text-muted-foreground">No sample objects available.</p>
                 )}
               </div>
 

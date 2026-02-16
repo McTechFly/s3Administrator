@@ -44,6 +44,7 @@ import {
   ChevronsLeft,
   ChevronsRight,
   Cog,
+  CircleAlert,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { ThemeSwitcher } from "@/components/theme-switcher"
@@ -92,6 +93,7 @@ export function Sidebar({
   const [selectedCredentials, setSelectedCredentials] = useState<string[]>([])
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settingsBucket, setSettingsBucket] = useState<Bucket | null>(null)
+  const [syncIssueByBucketKey, setSyncIssueByBucketKey] = useState<Record<string, string>>({})
   const sidebarCollapsed = collapsible && isCollapsed
   const isAdmin = session?.user?.role === "admin"
   const isCommunity = (process.env.NEXT_PUBLIC_EDITION || "").trim().toLowerCase() !== "cloud"
@@ -180,30 +182,46 @@ export function Sidebar({
     setIsSyncingAll(true)
     try {
       let syncedTotal = 0
+      let failed = 0
+      const nextSyncIssues: Record<string, string> = {}
+
       for (const bucket of buckets) {
-        const res = await fetch("/api/s3/sync", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            bucket: bucket.name,
-            credentialId: bucket.credentialId,
-          }),
-        })
+        const bucketKey = `${bucket.credentialId}:${bucket.name}`
+        try {
+          const res = await fetch("/api/s3/sync", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              bucket: bucket.name,
+              credentialId: bucket.credentialId,
+            }),
+          })
 
-        const data = await res.json()
-        if (!res.ok) {
-          throw new Error(data?.error ?? `Failed to sync ${bucket.name}`)
+          const data = await res.json().catch(() => null)
+          if (!res.ok) {
+            throw new Error(data?.error ?? `Failed to sync ${bucket.name}`)
+          }
+
+          syncedTotal += Number(data?.synced ?? 0)
+        } catch (error) {
+          failed++
+          nextSyncIssues[bucketKey] =
+            error instanceof Error ? error.message : "Failed to sync bucket"
         }
-
-        syncedTotal += Number(data?.synced ?? 0)
       }
+
+      setSyncIssueByBucketKey(nextSyncIssues)
 
       queryClient.invalidateQueries({ queryKey: ["objects"] })
       queryClient.invalidateQueries({ queryKey: ["bucket-stats"] })
-      toast.success(`Synced ${syncedTotal} files across ${buckets.length} buckets`)
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Failed to sync all buckets"
-      toast.error(message)
+
+      if (failed === 0) {
+        toast.success(`Synced ${syncedTotal} files across ${buckets.length} buckets`)
+      } else {
+        toast.error(
+          `Synced ${syncedTotal} files across ${buckets.length - failed} buckets (${failed} failed)`
+        )
+      }
     } finally {
       setIsSyncingAll(false)
     }
@@ -489,6 +507,8 @@ export function Sidebar({
                   const bucketStat = statsByBucket.get(`${bucket.credentialId}:${bucket.name}`)
                   const totalSize = bucketStat?.totalSize ?? 0
                   const fileCount = bucketStat?.fileCount ?? 0
+                  const bucketKey = `${bucket.credentialId}:${bucket.name}`
+                  const syncIssue = syncIssueByBucketKey[bucketKey]
                   return (
                     <div
                       key={`${bucket.credentialId}:${bucket.name}`}
@@ -503,7 +523,17 @@ export function Sidebar({
                       >
                         <HardDrive className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
                         <div className="min-w-0 flex-1">
-                          <p className="text-sm leading-tight break-words">{bucket.name}</p>
+                          <p className="flex items-center gap-1 text-sm leading-tight break-words">
+                            <span>{bucket.name}</span>
+                            {syncIssue ? (
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <CircleAlert className="h-3.5 w-3.5 shrink-0 text-destructive" />
+                                </TooltipTrigger>
+                                <TooltipContent>{syncIssue}</TooltipContent>
+                              </Tooltip>
+                            ) : null}
+                          </p>
                           <p className="text-xs text-muted-foreground">
                             {formatSize(totalSize)} · {fileCount}{" "}
                             {fileCount === 1 ? "file" : "files"}

@@ -4,7 +4,6 @@ import { prisma } from "@/lib/db"
 import { rebuildUserExtensionStats } from "@/lib/file-stats"
 import { encrypt } from "@/lib/crypto"
 import { addCredentialSchema } from "@/lib/validations"
-import { rateLimitByUser, rateLimitResponse } from "@/lib/rate-limit"
 
 export async function GET() {
   const session = await auth()
@@ -38,10 +37,19 @@ export async function POST(req: NextRequest) {
   const body = await req.json()
   const parsed = addCredentialSchema.safeParse(body)
   if (!parsed.success) {
-    return NextResponse.json({ error: "Invalid input" }, { status: 400 })
+    return NextResponse.json(
+      { error: "Invalid input", details: parsed.error.flatten() },
+      { status: 400 }
+    )
   }
 
   const { label, provider, endpoint, region, accessKey, secretKey } = parsed.data
+  const normalizedRegion =
+    typeof region === "string" && region.trim().length > 0
+      ? region.trim()
+      : provider === "MINIO"
+        ? "us-east-1"
+        : ""
 
   const encAccessKey = encrypt(accessKey)
   const encSecretKey = encrypt(secretKey)
@@ -56,7 +64,7 @@ export async function POST(req: NextRequest) {
       label,
       provider,
       endpoint,
-      region,
+      region: normalizedRegion,
       accessKeyEnc: encAccessKey.ciphertext,
       ivAccessKey: encAccessKey.iv,
       secretKeyEnc: encSecretKey.ciphertext,
