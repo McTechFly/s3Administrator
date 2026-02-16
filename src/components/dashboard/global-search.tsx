@@ -3,30 +3,17 @@
 import { useMemo, useState } from "react"
 import { useRouter } from "next/navigation"
 import { useQuery, useQueryClient } from "@tanstack/react-query"
-import { Loader2, Search } from "lucide-react"
+import { Loader2 } from "lucide-react"
 import { toast } from "sonner"
-import { Input } from "@/components/ui/input"
-import { Button } from "@/components/ui/button"
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog"
-import {
-  DropdownMenu,
-  DropdownMenuCheckboxItem,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu"
 import { FileBrowser } from "@/components/dashboard/file-browser"
 import { MultiSelectToolbar } from "@/components/dashboard/multi-select-toolbar"
 import { DeleteConfirmDialog } from "@/components/dashboard/delete-confirm-dialog"
 import { RenameDialog } from "@/components/dashboard/rename-dialog"
+import { SearchFilters } from "@/components/dashboard/search-filters"
+import {
+  BulkDeletePreviewDialog,
+  type BulkDeleteTaskPreview,
+} from "@/components/dashboard/bulk-delete-preview-dialog"
 import { DestructiveConfirmDialog } from "@/components/shared/destructive-confirm-dialog"
 import {
   DESTRUCTIVE_CONFIRM_SCOPE,
@@ -75,16 +62,6 @@ interface BulkDeleteTaskBody {
   confirmDestructiveSchedule?: boolean
 }
 
-interface BulkDeleteTaskPreview {
-  type: "bulk_delete"
-  summary: string[]
-  commands: string[]
-  estimatedObjects: number
-  sampleObjects: string[]
-  warnings: string[]
-}
-
-const FILE_TYPES = ["all", "image", "video", "audio", "document", "archive", "code", "other"]
 const PAGE_SIZE = 100
 const MIN_QUERY_LENGTH = 2
 
@@ -521,157 +498,37 @@ export function GlobalSearch() {
 
   return (
     <div className="flex h-full flex-col">
-      <div className="space-y-3 border-b px-4 py-3">
-        <div>
-          <h1 className="text-xl font-semibold">Global Search</h1>
-          <p className="text-sm text-muted-foreground">
-            Search across all credentials and buckets
-          </p>
-        </div>
-
-        <div className="flex flex-wrap items-center gap-2">
-          <div className="relative min-w-[280px] flex-1">
-            <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-            <Input
-              placeholder="Search by file name..."
-              value={query}
-              onChange={(event) => {
-                setQuery(event.target.value)
-                resetSelection()
-              }}
-              className="h-9 pl-9"
-              autoFocus
-            />
-          </div>
-
-          <DropdownMenu modal={false}>
-            <DropdownMenuTrigger asChild>
-              <Button variant="outline" size="sm">
-                Accounts {selectedCredentialIds.length > 0 && `(${selectedCredentialIds.length})`}
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent
-              align="start"
-              className="w-56"
-              onCloseAutoFocus={(event) => event.preventDefault()}
-            >
-              <DropdownMenuLabel>Filter by account</DropdownMenuLabel>
-              <DropdownMenuSeparator />
-              <DropdownMenuCheckboxItem
-                checked={selectedCredentialIds.length === 0}
-                onCheckedChange={() => {
-                  setSelectedCredentialIds([])
-                  resetSelection()
-                }}
-                onSelect={(event) => event.preventDefault()}
-              >
-                All Accounts
-              </DropdownMenuCheckboxItem>
-              {credentials.length > 0 && <DropdownMenuSeparator />}
-              {credentials.map((credential) => (
-                <DropdownMenuCheckboxItem
-                  key={credential.id}
-                  checked={selectedCredentialIds.includes(credential.id)}
-                  onCheckedChange={() => toggleCredential(credential.id)}
-                  onSelect={(event) => event.preventDefault()}
-                >
-                  {credential.label}
-                </DropdownMenuCheckboxItem>
-              ))}
-            </DropdownMenuContent>
-          </DropdownMenu>
-
-          <DropdownMenu modal={false}>
-            <DropdownMenuTrigger asChild>
-              <Button variant="outline" size="sm">
-                Buckets {selectedBucketScopes.length > 0 && `(${selectedBucketScopes.length})`}
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent
-              align="start"
-              className="w-72"
-              onCloseAutoFocus={(event) => event.preventDefault()}
-            >
-              <DropdownMenuLabel>Filter by bucket</DropdownMenuLabel>
-              <DropdownMenuSeparator />
-              <DropdownMenuCheckboxItem
-                checked={selectedBucketScopes.length === 0}
-                onCheckedChange={() => {
-                  setSelectedBucketScopes([])
-                  resetSelection()
-                }}
-                onSelect={(event) => event.preventDefault()}
-              >
-                All Buckets
-              </DropdownMenuCheckboxItem>
-              {filteredBucketScopes.length > 0 && <DropdownMenuSeparator />}
-              {filteredBucketScopes.map((bucket) => {
-                const scope = `${bucket.credentialId}::${bucket.name}`
-                const label = credentialsById.get(bucket.credentialId) ?? "Unknown"
-                return (
-                  <DropdownMenuCheckboxItem
-                    key={scope}
-                    checked={selectedBucketScopes.includes(scope)}
-                    onCheckedChange={() => toggleBucketScope(scope)}
-                    onSelect={(event) => event.preventDefault()}
-                  >
-                    {bucket.name} · {label}
-                  </DropdownMenuCheckboxItem>
-                )
-              })}
-            </DropdownMenuContent>
-          </DropdownMenu>
-
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button variant="outline" size="sm">
-                Type: {selectedType === "all" ? "All" : selectedType}
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="start" className="w-44">
-              {FILE_TYPES.map((type) => (
-                <DropdownMenuItem
-                  key={type}
-                  onClick={() => {
-                    setSelectedType(type)
-                    resetSelection()
-                  }}
-                >
-                  {type === "all" ? "All Types" : `${type[0].toUpperCase()}${type.slice(1)}`}
-                  {selectedType === type && " ✓"}
-                </DropdownMenuItem>
-              ))}
-            </DropdownMenuContent>
-          </DropdownMenu>
-        </div>
-
-        <div className="flex flex-wrap items-center gap-2">
-          <Button
-            type="button"
-            size="sm"
-            variant={bulkDeleteScheduleMode === "once" ? "default" : "outline"}
-            onClick={() => setBulkDeleteScheduleMode("once")}
-          >
-            Bulk Delete: One-time
-          </Button>
-          <Button
-            type="button"
-            size="sm"
-            variant={bulkDeleteScheduleMode === "cron" ? "default" : "outline"}
-            onClick={() => setBulkDeleteScheduleMode("cron")}
-          >
-            Bulk Delete: Scheduled (UTC)
-          </Button>
-          {bulkDeleteScheduleMode === "cron" ? (
-            <Input
-              className="h-9 w-full max-w-xs"
-              value={bulkDeleteScheduleCron}
-              onChange={(event) => setBulkDeleteScheduleCron(event.target.value)}
-              placeholder="0 * * * *"
-            />
-          ) : null}
-        </div>
-      </div>
+      <SearchFilters
+        query={query}
+        onQueryChange={(value) => {
+          setQuery(value)
+          resetSelection()
+        }}
+        credentials={credentials}
+        selectedCredentialIds={selectedCredentialIds}
+        onToggleCredential={toggleCredential}
+        onClearCredentials={() => {
+          setSelectedCredentialIds([])
+          resetSelection()
+        }}
+        filteredBucketScopes={filteredBucketScopes}
+        credentialsById={credentialsById}
+        selectedBucketScopes={selectedBucketScopes}
+        onToggleBucketScope={toggleBucketScope}
+        onClearBucketScopes={() => {
+          setSelectedBucketScopes([])
+          resetSelection()
+        }}
+        selectedType={selectedType}
+        onTypeChange={(type) => {
+          setSelectedType(type)
+          resetSelection()
+        }}
+        bulkDeleteScheduleMode={bulkDeleteScheduleMode}
+        onBulkDeleteScheduleModeChange={setBulkDeleteScheduleMode}
+        bulkDeleteScheduleCron={bulkDeleteScheduleCron}
+        onBulkDeleteScheduleCronChange={setBulkDeleteScheduleCron}
+      />
 
       {selectedCount > 0 && (
         <MultiSelectToolbar
@@ -824,7 +681,7 @@ export function GlobalSearch() {
         />
       )}
 
-      <Dialog
+      <BulkDeletePreviewDialog
         open={bulkDeletePreviewOpen}
         onOpenChange={(open) => {
           setBulkDeletePreviewOpen(open)
@@ -835,80 +692,11 @@ export function GlobalSearch() {
             }
           }
         }}
-      >
-        <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-2xl">
-          <DialogHeader>
-            <DialogTitle>Bulk Delete Execution Plan</DialogTitle>
-            <DialogDescription>
-              Review the planned execution summary before this task starts.
-            </DialogDescription>
-          </DialogHeader>
-
-          {bulkDeletePreview ? (
-            <div className="space-y-4 text-sm">
-              <div className="space-y-2">
-                <p className="font-medium">Summary</p>
-                <ul className="list-disc space-y-1 pl-5 text-muted-foreground">
-                  {bulkDeletePreview.summary.map((line) => (
-                    <li key={line}>{line}</li>
-                  ))}
-                </ul>
-              </div>
-
-              <div className="space-y-2">
-                <p className="font-medium">Planned commands</p>
-                <ul className="list-disc space-y-1 pl-5 text-muted-foreground">
-                  {bulkDeletePreview.commands.map((line) => (
-                    <li key={line}>{line}</li>
-                  ))}
-                </ul>
-              </div>
-
-              <div className="space-y-2">
-                <p className="font-medium">
-                  Sample matching objects ({bulkDeletePreview.sampleObjects.length})
-                </p>
-                {bulkDeletePreview.sampleObjects.length > 0 ? (
-                  <ul className="max-h-44 overflow-y-auto rounded-md border p-2 font-mono text-xs">
-                    {bulkDeletePreview.sampleObjects.map((item) => (
-                      <li key={item} className="truncate">
-                        {item}
-                      </li>
-                    ))}
-                  </ul>
-                ) : (
-                  <p className="text-xs text-muted-foreground">No sample objects available.</p>
-                )}
-              </div>
-
-              {bulkDeletePreview.warnings.length > 0 ? (
-                <div className="space-y-2 rounded-md border border-destructive/40 bg-destructive/5 p-3">
-                  <p className="font-medium text-destructive">Warnings</p>
-                  <ul className="list-disc space-y-1 pl-5 text-xs text-destructive">
-                    {bulkDeletePreview.warnings.map((line) => (
-                      <li key={line}>{line}</li>
-                    ))}
-                  </ul>
-                </div>
-              ) : null}
-            </div>
-          ) : null}
-
-          <div className="flex justify-end gap-2">
-            <Button
-              variant="outline"
-              onClick={() => setBulkDeletePreviewOpen(false)}
-              disabled={isBulkRunning}
-            >
-              Cancel
-            </Button>
-            <Button onClick={() => void handleConfirmBulkDeleteFromPreview()} disabled={isBulkRunning}>
-              {isBulkRunning ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
-              Start Delete Task
-            </Button>
-          </div>
-        </DialogContent>
-      </Dialog>
+        preview={bulkDeletePreview}
+        isRunning={isBulkRunning}
+        onConfirm={() => void handleConfirmBulkDeleteFromPreview()}
+        onCancel={() => setBulkDeletePreviewOpen(false)}
+      />
 
       <DestructiveConfirmDialog
         open={bulkDeleteConfirmOpen}

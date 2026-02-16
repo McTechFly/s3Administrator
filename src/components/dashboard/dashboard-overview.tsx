@@ -22,6 +22,7 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { Skeleton } from "@/components/ui/skeleton"
+import { formatSize, formatDate } from "@/lib/format"
 
 interface OverviewSummary {
   indexedBucketCount: number
@@ -70,20 +71,8 @@ interface RefreshProgress {
   bucketName: string
 }
 
-function formatSize(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B"
-  const units = ["B", "KB", "MB", "GB", "TB"]
-  const i = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)))
-  return `${(bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0)} ${units[i]}`
-}
-
 function formatCount(value: number): string {
   return Number(value || 0).toLocaleString()
-}
-
-function formatDate(value: string | null): string {
-  if (!value) return "Never"
-  return new Date(value).toLocaleString()
 }
 
 function titleCase(value: string): string {
@@ -312,7 +301,7 @@ export function DashboardOverview() {
         <CardHeader>
           <CardTitle className="text-base">Index status</CardTitle>
           <CardDescription>
-            Last indexed object timestamp: {formatDate(data.summary.lastIndexedAt)}
+            Last indexed object timestamp: {formatDate(data.summary.lastIndexedAt, "Never")}
           </CardDescription>
         </CardHeader>
         {data.summary.indexedFileCount === 0 && (

@@ -11,7 +11,6 @@ import { Button } from "@/components/ui/button"
 import {
   Upload,
   X,
-  CheckCircle,
   Loader2,
   FolderUp,
   Pause,
@@ -21,7 +20,6 @@ import {
 import { toast } from "sonner"
 import {
   UploadEngine,
-  shouldUseMultipart,
   type UploadState,
 } from "@/lib/upload-engine"
 import {
@@ -29,6 +27,8 @@ import {
   removeUploadState,
   type PersistedUploadState,
 } from "@/lib/upload-persistence"
+import { formatSize } from "@/lib/format"
+import { UploadFileItem } from "@/components/dashboard/upload-file-item"
 
 interface UploadDialogProps {
   open: boolean
@@ -54,25 +54,6 @@ function normalizeRelativePath(file: File): string {
   return raw.replace(/^\/+/, "")
 }
 
-function formatBytes(bytes: number): string {
-  if (bytes === 0) return "0 B"
-  const units = ["B", "KB", "MB", "GB", "TB"]
-  const i = Math.floor(Math.log(bytes) / Math.log(1024))
-  return `${(bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0)} ${units[i]}`
-}
-
-function formatSpeed(bytesPerSec: number): string {
-  if (bytesPerSec <= 0) return ""
-  return `${formatBytes(bytesPerSec)}/s`
-}
-
-function formatEta(bytesRemaining: number, speed: number): string {
-  if (speed <= 0) return ""
-  const seconds = Math.ceil(bytesRemaining / speed)
-  if (seconds < 60) return `${seconds}s left`
-  if (seconds < 3600) return `${Math.ceil(seconds / 60)}m left`
-  return `${Math.floor(seconds / 3600)}h ${Math.ceil((seconds % 3600) / 60)}m left`
-}
 
 export function UploadDialog({
   open,
@@ -280,8 +261,8 @@ export function UploadDialog({
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ bucket, credentialId, items: uploadedItems }),
         })
-      } catch {
-        // Metadata can still be refreshed via manual sync
+      } catch (error) {
+        console.warn("Failed to update metadata after upload:", error)
       }
     }
 
@@ -351,7 +332,7 @@ export function UploadDialog({
         credentialId: upload.credentialId,
         uploadId: upload.uploadId,
       }),
-    }).catch(() => {})
+    }).catch((error) => console.warn("Failed to abort persisted upload on S3:", error))
   }
 
   function handleResumePersistedUpload(upload: PersistedUploadState) {
@@ -415,8 +396,8 @@ export function UploadDialog({
               items: [{ key: savedUpload.key, size: file.size, lastModified: new Date().toISOString() }],
             }),
           })
-        } catch {
-          // Metadata can still be refreshed via manual sync
+        } catch (error) {
+          console.warn("Failed to update metadata after resumed upload:", error)
         }
 
         toast.success("Upload resumed and completed")
@@ -427,8 +408,8 @@ export function UploadDialog({
           toast.error("Upload finished, but bucket sync failed")
         }
       }
-    } catch {
-      // Error handling done via engine callbacks
+    } catch (error) {
+      console.warn("Resume upload failed (handled via engine callbacks):", error)
     }
 
     setIsUploading(false)
@@ -546,7 +527,7 @@ export function UploadDialog({
                 <div className="min-w-0 flex-1">
                   <p className="truncate text-sm">{upload.fileName}</p>
                   <p className="truncate text-xs text-muted-foreground">
-                    {formatBytes(upload.fileSize)} &mdash;{" "}
+                    {formatSize(upload.fileSize)} &mdash;{" "}
                     {upload.completedPartNumbers.length}/{upload.totalParts} parts
                   </p>
                 </div>
@@ -575,80 +556,18 @@ export function UploadDialog({
         {files.length > 0 && (
           <div className="max-h-60 space-y-2 overflow-auto">
             {files.map((item, index) => (
-              <div
+              <UploadFileItem
                 key={`${item.relativePath}-${index}`}
-                className="flex items-center gap-3 rounded-md border px-3 py-2"
-              >
-                <div className="min-w-0 flex-1">
-                  <p className="truncate text-sm">{item.relativePath}</p>
-                  <div className="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-muted">
-                    <div
-                      className="h-full rounded-full bg-primary transition-all"
-                      style={{ width: `${Math.min(item.progress, 100)}%` }}
-                    />
-                  </div>
-                  {(item.status === "uploading" || item.status === "completing" || item.status === "paused") ? (
-                    <p className="mt-0.5 text-xs text-muted-foreground">
-                      {item.progress}%
-                      {item.speed > 0
-                        ? ` — ${formatSpeed(item.speed)}`
-                        : ""}
-                      {item.speed > 0 && item.progress > 0 && item.progress < 100
-                        ? ` — ${formatEta(
-                            item.file.size * (1 - item.progress / 100),
-                            item.speed
-                          )}`
-                        : ""}
-                    </p>
-                  ) : null}
-                  {item.error ? (
-                    <p className="mt-1 text-xs text-destructive">{item.error}</p>
-                  ) : null}
-                </div>
-
-                {item.status === "done" ? (
-                  <CheckCircle className="h-4 w-4 shrink-0 text-green-500" />
-                ) : item.status === "uploading" || item.status === "completing" ? (
-                  shouldUseMultipart(item.file.size) ? (
-                    <button
-                      type="button"
-                      onClick={(event) => {
-                        event.stopPropagation()
-                        handlePauseFile(index)
-                      }}
-                      className="shrink-0"
-                      title="Pause upload"
-                    >
-                      <Pause className="h-4 w-4 text-muted-foreground hover:text-foreground" />
-                    </button>
-                  ) : (
-                    <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
-                  )
-                ) : item.status === "paused" ? (
-                  <button
-                    type="button"
-                    onClick={(event) => {
-                      event.stopPropagation()
-                      handleResumeFile(index)
-                    }}
-                    className="shrink-0"
-                    title="Resume upload"
-                  >
-                    <Play className="h-4 w-4 text-muted-foreground hover:text-foreground" />
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    onClick={(event) => {
-                      event.stopPropagation()
-                      removeFile(index)
-                    }}
-                    className="shrink-0"
-                  >
-                    <X className="h-4 w-4 text-muted-foreground hover:text-foreground" />
-                  </button>
-                )}
-              </div>
+                relativePath={item.relativePath}
+                fileSize={item.file.size}
+                progress={item.progress}
+                speed={item.speed}
+                status={item.status}
+                error={item.error}
+                onPause={() => handlePauseFile(index)}
+                onResume={() => handleResumeFile(index)}
+                onRemove={() => removeFile(index)}
+              />
             ))}
           </div>
         )}

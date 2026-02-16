@@ -5,6 +5,7 @@ import { Download, FolderOpen, Loader2, Trash2, Video } from "lucide-react"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Button } from "@/components/ui/button"
 import { EmptyState } from "@/components/dashboard/empty-state"
+import { formatSize, formatDate } from "@/lib/format"
 import type { GalleryItem } from "@/types"
 
 interface GalleryBrowserProps {
@@ -22,16 +23,6 @@ interface GalleryBrowserProps {
   onLoadMore: () => void
 }
 
-function formatSize(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B"
-  const units = ["B", "KB", "MB", "GB", "TB"]
-  const index = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)))
-  return `${(bytes / Math.pow(1024, index)).toFixed(index > 0 ? 1 : 0)} ${units[index]}`
-}
-
-function formatDate(value: string): string {
-  return new Date(value).toLocaleString()
-}
 
 function getDisplayName(key: string): string {
   const normalized = key.endsWith("/") ? key.slice(0, -1) : key
