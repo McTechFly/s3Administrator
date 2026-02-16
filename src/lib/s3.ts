@@ -3,6 +3,79 @@ import { prisma } from "@/lib/db"
 import { decrypt } from "@/lib/crypto"
 import { quietAwsLogger } from "@/lib/aws-logger"
 
+const LOCAL_HOSTNAMES = new Set(["localhost", "127.0.0.1", "0.0.0.0", "::1"])
+
+function hasProtocol(value: string): boolean {
+  return /^https?:\/\//i.test(value)
+}
+
+export function normalizeS3Endpoint(endpoint: string): string {
+  const trimmed = endpoint.trim()
+  if (!trimmed) {
+    throw new Error("Endpoint is required")
+  }
+
+  let withProtocol = trimmed
+  if (!hasProtocol(withProtocol)) {
+    const hostPort = withProtocol.split("/")[0] || withProtocol
+    const hostname = hostPort.split(":")[0]?.toLowerCase() || ""
+    const protocol = LOCAL_HOSTNAMES.has(hostname) ? "http" : "https"
+    withProtocol = `${protocol}://${withProtocol}`
+  }
+
+  let parsed: URL
+  try {
+    parsed = new URL(withProtocol)
+  } catch {
+    throw new Error("Endpoint must be a valid URL")
+  }
+
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("Endpoint protocol must be http or https")
+  }
+
+  return parsed.toString().replace(/\/+$/, "")
+}
+
+export function normalizeS3Region(provider: string, region: string | null | undefined): string {
+  const normalizedRegion = region?.trim() ?? ""
+  if (normalizedRegion) return normalizedRegion
+
+  const normalizedProvider = provider.trim().toUpperCase()
+  if (normalizedProvider === "MINIO" || normalizedProvider === "GENERIC") {
+    return "us-east-1"
+  }
+
+  throw new Error("Region is required for this provider")
+}
+
+export function createS3ClientFromConfig(config: {
+  endpoint: string
+  region: string | null | undefined
+  provider: string
+  accessKeyId: string
+  secretAccessKey: string
+}): {
+  client: S3Client
+  endpoint: string
+  region: string
+} {
+  const endpoint = normalizeS3Endpoint(config.endpoint)
+  const region = normalizeS3Region(config.provider, config.region)
+  const client = new S3Client({
+    endpoint,
+    region,
+    credentials: {
+      accessKeyId: config.accessKeyId,
+      secretAccessKey: config.secretAccessKey,
+    },
+    forcePathStyle: true,
+    logger: quietAwsLogger,
+  })
+
+  return { client, endpoint, region }
+}
+
 export async function getS3Client(
   userId: string,
   credentialId?: string
@@ -28,24 +101,20 @@ export async function getS3Client(
 
   const accessKey = decrypt(credential.accessKeyEnc, credential.ivAccessKey)
   const secretKey = decrypt(credential.secretKeyEnc, credential.ivSecretKey)
-
-  const client = new S3Client({
+  const { client, endpoint, region } = createS3ClientFromConfig({
     endpoint: credential.endpoint,
     region: credential.region,
-    credentials: {
-      accessKeyId: accessKey,
-      secretAccessKey: secretKey,
-    },
-    forcePathStyle: true,
-    logger: quietAwsLogger,
+    provider: credential.provider,
+    accessKeyId: accessKey,
+    secretAccessKey: secretKey,
   })
 
   return {
     client,
     credential: {
       id: credential.id,
-      endpoint: credential.endpoint,
-      region: credential.region,
+      endpoint,
+      region,
       provider: credential.provider,
       label: credential.label,
     },

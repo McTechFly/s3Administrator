@@ -1,7 +1,7 @@
 "use client"
 
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query"
-import { useState } from "react"
+import { useState, type FormEvent } from "react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -46,11 +46,60 @@ interface Credential {
   createdAt: string
 }
 
+interface CredentialFormState {
+  label: string
+  provider: Provider
+  endpoint: string
+  region: string
+  accessKey: string
+  secretKey: string
+}
+
+interface CredentialProbeSummary {
+  endpoint: string
+  provider: string
+  region: string
+  bucketCount: number
+  sampleBuckets: string[]
+  probeBucket?: string
+  permissions: {
+    listBuckets: "allowed" | "denied" | "not_tested" | "error"
+    listObjects: "allowed" | "denied" | "not_tested" | "error"
+    readObject: "allowed" | "denied" | "not_tested" | "error"
+    putObject: "allowed" | "denied" | "not_tested" | "error"
+    deleteObject: "allowed" | "denied" | "not_tested" | "error"
+  }
+  notes: string[]
+}
+
+interface CredentialDraftTestPayload {
+  provider: Provider
+  endpoint: string
+  region: string
+  accessKey: string
+  secretKey: string
+}
+
+function buildProbeFingerprint(payload: CredentialDraftTestPayload): string {
+  return [
+    payload.provider,
+    payload.endpoint.trim(),
+    payload.region.trim(),
+    payload.accessKey,
+    payload.secretKey,
+  ].join("|")
+}
+
+function formatPermissionState(state: "allowed" | "denied" | "not_tested" | "error"): string {
+  if (state === "not_tested") return "not tested"
+  return state
+}
+
 export default function SettingsPage() {
   const queryClient = useQueryClient()
   const [addOpen, setAddOpen] = useState(false)
   const [selectedProvider, setSelectedProvider] = useState<Provider>("HETZNER")
-  const [form, setForm] = useState({
+  const [form, setForm] = useState<CredentialFormState>({
     label: "",
     provider: "HETZNER" as Provider,
     endpoint: "",
@@ -58,8 +107,36 @@ export default function SettingsPage() {
     accessKey: "",
     secretKey: "",
   })
+  const [draftProbe, setDraftProbe] = useState<{
+    fingerprint: string
+    summary: CredentialProbeSummary
+  } | null>(null)
+  const [isDraftTesting, setIsDraftTesting] = useState(false)
   const [testing, setTesting] = useState<string | null>(null)
   const [pendingDeleteCredential, setPendingDeleteCredential] = useState<Credential | null>(null)
+
+  const draftPayload: CredentialDraftTestPayload = {
+    provider: form.provider,
+    endpoint: form.endpoint,
+    region: form.region,
+    accessKey: form.accessKey,
+    secretKey: form.secretKey,
+  }
+  const currentProbeFingerprint = buildProbeFingerprint(draftPayload)
+  const isCurrentProbe = draftProbe?.fingerprint === currentProbeFingerprint
+
+  function updateForm(patch: Partial<CredentialFormState>) {
+    setForm((prev) => ({ ...prev, ...patch }))
+    if (
+      patch.provider !== undefined ||
+      patch.endpoint !== undefined ||
+      patch.region !== undefined ||
+      patch.accessKey !== undefined ||
+      patch.secretKey !== undefined
+    ) {
+      setDraftProbe(null)
+    }
+  }
 
   const { data: credentials, isLoading } = useQuery<Credential[]>({
     queryKey: ["credentials"],
@@ -77,7 +154,12 @@ export default function SettingsPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(data),
       })
-      if (!res.ok) throw new Error("Failed to save credentials")
+      if (!res.ok) {
+        const body = (await res.json().catch(() => null)) as
+          | { error?: string; message?: string }
+          | null
+        throw new Error(body?.error || body?.message || "Failed to save credentials")
+      }
       return res.json()
     },
     onSuccess: () => {
@@ -86,9 +168,11 @@ export default function SettingsPage() {
       setAddOpen(false)
       setSelectedProvider("HETZNER")
       setForm({ label: "", provider: "HETZNER", endpoint: "", region: "", accessKey: "", secretKey: "" })
+      setDraftProbe(null)
       toast.success("Credentials saved")
     },
-    onError: () => toast.error("Failed to save credentials"),
+    onError: (error) =>
+      toast.error(error instanceof Error ? error.message : "Failed to save credentials"),
   })
 
   const deleteMutation = useMutation({
@@ -121,6 +205,70 @@ export default function SettingsPage() {
     },
   })
 
+  async function runDraftProbe(payload: CredentialDraftTestPayload): Promise<boolean> {
+    setIsDraftTesting(true)
+    try {
+      const res = await fetch("/api/s3/credentials/test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      })
+
+      const body = (await res.json().catch(() => null)) as
+        | {
+            error?: string
+            message?: string
+            hint?: string
+            summary?: CredentialProbeSummary
+          }
+        | null
+
+      if (!res.ok) {
+        const detail = [body?.message || body?.error, body?.hint].filter(Boolean).join(" ")
+        toast.error(detail || "Connection failed")
+        setDraftProbe(null)
+        return false
+      }
+
+      if (!body?.summary) {
+        toast.error("Credential test returned no summary")
+        setDraftProbe(null)
+        return false
+      }
+
+      setDraftProbe({
+        fingerprint: buildProbeFingerprint(payload),
+        summary: body.summary,
+      })
+      toast.success("Connection test passed")
+      return true
+    } catch {
+      toast.error("Connection failed")
+      setDraftProbe(null)
+      return false
+    } finally {
+      setIsDraftTesting(false)
+    }
+  }
+
+  async function handleAddCredentialSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const payload: CredentialDraftTestPayload = {
+      provider: form.provider,
+      endpoint: form.endpoint,
+      region: form.region,
+      accessKey: form.accessKey,
+      secretKey: form.secretKey,
+    }
+
+    if (!isCurrentProbe) {
+      const ok = await runDraftProbe(payload)
+      if (!ok) return
+    }
+
+    addMutation.mutate(form)
+  }
+
   async function handleTest(id: string) {
     setTesting(id)
     try {
@@ -128,7 +276,11 @@ export default function SettingsPage() {
       if (res.ok) {
         toast.success("Connection successful")
       } else {
-        toast.error("Connection failed")
+        const data = (await res.json().catch(() => null)) as
+          | { message?: string; hint?: string }
+          | null
+        const detail = [data?.message, data?.hint].filter(Boolean).join(" ")
+        toast.error(detail || "Connection failed")
       }
     } catch {
       toast.error("Connection failed")
@@ -139,12 +291,11 @@ export default function SettingsPage() {
   function handleProviderChange(provider: Provider) {
     setSelectedProvider(provider)
     const config = getProviderConfig(provider)
-    setForm((f) => ({
-      ...f,
+    updateForm({
       provider,
       region: provider === "MINIO" ? "" : config.defaultRegion,
-      endpoint: "",
-    }))
+      endpoint: provider === "MINIO" ? config.endpoint : "",
+    })
   }
 
   function selectRegion(region: string) {
@@ -161,11 +312,10 @@ export default function SettingsPage() {
       endpoint = "http://localhost:9000"
     }
 
-    setForm((f) => ({
-      ...f,
+    updateForm({
       endpoint,
       region,
-    }))
+    })
   }
 
   return (
@@ -177,7 +327,15 @@ export default function SettingsPage() {
             Manage your S3 credentials
           </p>
         </div>
-        <Dialog open={addOpen} onOpenChange={setAddOpen}>
+        <Dialog
+          open={addOpen}
+          onOpenChange={(open) => {
+            setAddOpen(open)
+            if (!open) {
+              setDraftProbe(null)
+            }
+          }}
+        >
           <DialogTrigger asChild>
             <Button>
               <Plus className="mr-2 h-4 w-4" />
@@ -189,10 +347,7 @@ export default function SettingsPage() {
               <DialogTitle>Add S3 Credential</DialogTitle>
             </DialogHeader>
             <form
-              onSubmit={(e) => {
-                e.preventDefault()
-                addMutation.mutate(form)
-              }}
+              onSubmit={handleAddCredentialSubmit}
               className="space-y-4"
             >
               <div className="space-y-2">
@@ -241,9 +396,7 @@ export default function SettingsPage() {
                 <Input
                   id="label"
                   value={form.label}
-                  onChange={(e) =>
-                    setForm((f) => ({ ...f, label: e.target.value }))
-                  }
+                  onChange={(e) => updateForm({ label: e.target.value })}
                   placeholder="My S3 Storage"
                   required
                 />
@@ -253,9 +406,7 @@ export default function SettingsPage() {
                 <Input
                   id="endpoint"
                   value={form.endpoint}
-                  onChange={(e) =>
-                    setForm((f) => ({ ...f, endpoint: e.target.value }))
-                  }
+                  onChange={(e) => updateForm({ endpoint: e.target.value })}
                   placeholder={PROVIDERS[selectedProvider].endpoint || "https://example.com"}
                   required
                 />
@@ -265,9 +416,7 @@ export default function SettingsPage() {
                 <Input
                   id="region"
                   value={form.region}
-                  onChange={(e) =>
-                    setForm((f) => ({ ...f, region: e.target.value }))
-                  }
+                  onChange={(e) => updateForm({ region: e.target.value })}
                   placeholder={
                     selectedProvider === "MINIO"
                       ? "Optional (defaults to us-east-1)"
@@ -286,9 +435,7 @@ export default function SettingsPage() {
                 <Input
                   id="accessKey"
                   value={form.accessKey}
-                  onChange={(e) =>
-                    setForm((f) => ({ ...f, accessKey: e.target.value }))
-                  }
+                  onChange={(e) => updateForm({ accessKey: e.target.value })}
                   required
                 />
               </div>
@@ -298,22 +445,119 @@ export default function SettingsPage() {
                   id="secretKey"
                   type="password"
                   value={form.secretKey}
-                  onChange={(e) =>
-                    setForm((f) => ({ ...f, secretKey: e.target.value }))
-                  }
+                  onChange={(e) => updateForm({ secretKey: e.target.value })}
                   required
                 />
               </div>
-              <Button
-                type="submit"
-                className="w-full"
-                disabled={addMutation.isPending}
-              >
-                {addMutation.isPending ? (
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                ) : null}
-                Save Credential
-              </Button>
+              {isCurrentProbe ? (
+                <div className="space-y-2 rounded-md border p-3">
+                  <p className="text-sm font-medium">Connection & permission summary</p>
+                  <p className="text-xs text-muted-foreground">
+                    Endpoint: {draftProbe.summary.endpoint} | Region: {draftProbe.summary.region} |
+                    Buckets visible: {draftProbe.summary.bucketCount}
+                  </p>
+                  <div className="flex flex-wrap gap-2">
+                    <Badge
+                      variant={
+                        draftProbe.summary.permissions.listBuckets === "allowed"
+                          ? "secondary"
+                          : draftProbe.summary.permissions.listBuckets === "denied" ||
+                              draftProbe.summary.permissions.listBuckets === "error"
+                            ? "destructive"
+                            : "outline"
+                      }
+                    >
+                      list buckets: {formatPermissionState(draftProbe.summary.permissions.listBuckets)}
+                    </Badge>
+                    <Badge
+                      variant={
+                        draftProbe.summary.permissions.listObjects === "allowed"
+                          ? "secondary"
+                          : draftProbe.summary.permissions.listObjects === "denied" ||
+                              draftProbe.summary.permissions.listObjects === "error"
+                            ? "destructive"
+                            : "outline"
+                      }
+                    >
+                      list objects: {formatPermissionState(draftProbe.summary.permissions.listObjects)}
+                    </Badge>
+                    <Badge
+                      variant={
+                        draftProbe.summary.permissions.readObject === "allowed"
+                          ? "secondary"
+                          : draftProbe.summary.permissions.readObject === "denied" ||
+                              draftProbe.summary.permissions.readObject === "error"
+                            ? "destructive"
+                            : "outline"
+                      }
+                    >
+                      read object: {formatPermissionState(draftProbe.summary.permissions.readObject)}
+                    </Badge>
+                    <Badge
+                      variant={
+                        draftProbe.summary.permissions.putObject === "allowed"
+                          ? "secondary"
+                          : draftProbe.summary.permissions.putObject === "denied" ||
+                              draftProbe.summary.permissions.putObject === "error"
+                            ? "destructive"
+                            : "outline"
+                      }
+                    >
+                      put object: {formatPermissionState(draftProbe.summary.permissions.putObject)}
+                    </Badge>
+                    <Badge
+                      variant={
+                        draftProbe.summary.permissions.deleteObject === "allowed"
+                          ? "secondary"
+                          : draftProbe.summary.permissions.deleteObject === "denied" ||
+                              draftProbe.summary.permissions.deleteObject === "error"
+                            ? "destructive"
+                            : "outline"
+                      }
+                    >
+                      delete object: {formatPermissionState(draftProbe.summary.permissions.deleteObject)}
+                    </Badge>
+                  </div>
+                  {draftProbe.summary.sampleBuckets.length > 0 ? (
+                    <p className="text-xs text-muted-foreground">
+                      Sample buckets: {draftProbe.summary.sampleBuckets.join(", ")}
+                    </p>
+                  ) : null}
+                  {draftProbe.summary.notes.length > 0 ? (
+                    <div className="space-y-1">
+                      {draftProbe.summary.notes.map((note) => (
+                        <p key={note} className="text-xs text-muted-foreground">
+                          {note}
+                        </p>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+              <div className="flex gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="flex-1"
+                  onClick={() => void runDraftProbe(draftPayload)}
+                  disabled={isDraftTesting || addMutation.isPending}
+                >
+                  {isDraftTesting ? (
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  ) : null}
+                  Test Connection & Permissions
+                </Button>
+                <Button
+                  type="submit"
+                  className="flex-1"
+                  disabled={addMutation.isPending || isDraftTesting}
+                >
+                  {addMutation.isPending ? (
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  ) : null}
+                  Save Credential
+                </Button>
+              </div>
             </form>
           </DialogContent>
         </Dialog>

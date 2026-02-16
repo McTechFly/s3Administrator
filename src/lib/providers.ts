@@ -59,7 +59,7 @@ export const PROVIDERS: Record<Provider, ProviderConfig> = {
     endpoint: 'http://localhost:9000',
     defaultRegion: 'us-east-1',
     helpText:
-      'Enter your MinIO endpoint and credentials. Region is usually us-east-1 unless customized.',
+      'Enter your MinIO endpoint and credentials. If app runs in Docker, use host.docker.internal or a container service name instead of localhost.',
   },
   GENERIC: {
     name: 'Generic S3-Compatible',

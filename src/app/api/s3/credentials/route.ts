@@ -3,6 +3,7 @@ import { auth } from "@/lib/auth"
 import { prisma } from "@/lib/db"
 import { rebuildUserExtensionStats } from "@/lib/file-stats"
 import { encrypt } from "@/lib/crypto"
+import { normalizeS3Endpoint, normalizeS3Region } from "@/lib/s3"
 import { addCredentialSchema } from "@/lib/validations"
 
 export async function GET() {
@@ -44,12 +45,15 @@ export async function POST(req: NextRequest) {
   }
 
   const { label, provider, endpoint, region, accessKey, secretKey } = parsed.data
-  const normalizedRegion =
-    typeof region === "string" && region.trim().length > 0
-      ? region.trim()
-      : provider === "MINIO"
-        ? "us-east-1"
-        : ""
+  let normalizedEndpoint: string
+  let normalizedRegion: string
+  try {
+    normalizedEndpoint = normalizeS3Endpoint(endpoint)
+    normalizedRegion = normalizeS3Region(provider, region)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Invalid S3 credential settings"
+    return NextResponse.json({ error: message }, { status: 400 })
+  }
 
   const encAccessKey = encrypt(accessKey)
   const encSecretKey = encrypt(secretKey)
@@ -63,7 +67,7 @@ export async function POST(req: NextRequest) {
       userId: session.user.id,
       label,
       provider,
-      endpoint,
+      endpoint: normalizedEndpoint,
       region: normalizedRegion,
       accessKeyEnc: encAccessKey.ciphertext,
       ivAccessKey: encAccessKey.iv,

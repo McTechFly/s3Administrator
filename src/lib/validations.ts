@@ -23,20 +23,20 @@ export const s3OperationSchema = z.object({
   credentialId: z.string().optional(),
 })
 
-export const addCredentialSchema = z.object({
-  label: z.string().min(1).max(100),
-  provider: z.enum(['AWS', 'HETZNER', 'CLOUDFLARE_R2', 'MINIO', 'GENERIC']),
-  endpoint: z.string().min(1),
-  region: z.preprocess(
-    (value) =>
-      typeof value === "string" && value.trim().length === 0
-        ? undefined
-        : value,
-    z.string().trim().max(50).optional()
-  ),
-  accessKey: z.string().min(1),
-  secretKey: z.string().min(1),
-}).superRefine((value, ctx) => {
+const credentialProviderSchema = z.enum(["AWS", "HETZNER", "CLOUDFLARE_R2", "MINIO", "GENERIC"])
+
+const credentialRegionSchema = z.preprocess(
+  (value) =>
+    typeof value === "string" && value.trim().length === 0
+      ? undefined
+      : value,
+  z.string().trim().max(50).optional()
+)
+
+function validateCredentialRegion(
+  value: { provider: z.infer<typeof credentialProviderSchema>; region?: string },
+  ctx: z.RefinementCtx
+) {
   if (value.provider !== "MINIO" && !value.region) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
@@ -44,7 +44,28 @@ export const addCredentialSchema = z.object({
       message: "Region is required for this provider",
     })
   }
-})
+}
+
+export const testCredentialConnectionSchema = z
+  .object({
+    provider: credentialProviderSchema,
+    endpoint: z.string().min(1),
+    region: credentialRegionSchema,
+    accessKey: z.string().min(1),
+    secretKey: z.string().min(1),
+  })
+  .superRefine(validateCredentialRegion)
+
+export const addCredentialSchema = z
+  .object({
+    label: z.string().min(1).max(100),
+    provider: credentialProviderSchema,
+    endpoint: z.string().min(1),
+    region: credentialRegionSchema,
+    accessKey: z.string().min(1),
+    secretKey: z.string().min(1),
+  })
+  .superRefine(validateCredentialRegion)
 
 export const listObjectsSchema = z.object({
   bucket: s3BucketSchema,
