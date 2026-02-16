@@ -9,16 +9,8 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select"
 import { Loader2, AlertTriangle } from "lucide-react"
+import { DestructiveConfirmationSection } from "@/components/shared/destructive-confirmation-section"
 import {
   DESTRUCTIVE_CONFIRM_PHRASE,
   DESTRUCTIVE_CONFIRM_SCOPE,
@@ -88,39 +80,13 @@ export function DestructiveConfirmDialog({
           <DialogDescription>{description}</DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-3 rounded-md border border-destructive/40 bg-destructive/5 p-3">
-          <div className="space-y-1">
-            <Label htmlFor="destructive-confirm-input">Confirmation</Label>
-            <p className="text-xs text-muted-foreground">
-              Type <span className="font-mono">{DESTRUCTIVE_CONFIRM_PHRASE}</span> to continue.
-            </p>
-            <Input
-              id="destructive-confirm-input"
-              value={confirmValue}
-              onChange={(event) => setConfirmValue(event.target.value)}
-              placeholder={DESTRUCTIVE_CONFIRM_PHRASE}
-              autoComplete="off"
-            />
-          </div>
-
-          <div className="space-y-1">
-            <Label htmlFor="destructive-confirm-remember">Prompt behavior</Label>
-            <Select
-              value={rememberOption}
-              onValueChange={(value) =>
-                setRememberOption(value as DestructiveConfirmRememberOption)
-              }
-            >
-              <SelectTrigger id="destructive-confirm-remember" className="w-full">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="ask">Ask every time</SelectItem>
-                <SelectItem value="one_hour">Don&apos;t ask again for 1 hour</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-        </div>
+        <DestructiveConfirmationSection
+          bypassActive={false}
+          confirmValue={confirmValue}
+          onConfirmValueChange={setConfirmValue}
+          rememberOption={rememberOption}
+          onRememberOptionChange={setRememberOption}
+        />
 
         <div className="flex justify-end gap-2">
           <Button

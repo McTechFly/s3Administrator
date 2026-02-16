@@ -1,7 +1,7 @@
 "use client"
 
 import { useEffect, useMemo, useState } from "react"
-import { useQuery, useQueryClient } from "@tanstack/react-query"
+import { useQuery } from "@tanstack/react-query"
 import { toast } from "sonner"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -19,6 +19,8 @@ import {
 } from "@/lib/destructive-confirmation"
 import { PROVIDERS, type Provider } from "@/lib/providers"
 import { Loader2, Trash2 } from "lucide-react"
+import { useRefreshBucketQueries } from "@/hooks/use-refresh-bucket-queries"
+import { useDeleteBucket } from "@/hooks/use-delete-bucket"
 
 interface BucketRef {
   name: string
@@ -124,7 +126,8 @@ export function BucketSettingsSheet({
   bucket: BucketRef | null
   onDeleted?: () => void | Promise<void>
 }) {
-  const queryClient = useQueryClient()
+  const refreshBucketQueries = useRefreshBucketQueries()
+  const { deleteBucket, isDeleting: isDeletingBucket } = useDeleteBucket()
   const [savingSection, setSavingSection] = useState<SavingSection>(null)
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false)
 
@@ -175,15 +178,6 @@ export function BucketSettingsSheet({
     setExpirationDays(data.settings.lifecycle.expirationDays ? String(data.settings.lifecycle.expirationDays) : "")
   }, [data])
 
-  async function refreshRelevantQueries() {
-    await Promise.all([
-      queryClient.invalidateQueries({ queryKey: ["buckets"] }),
-      queryClient.invalidateQueries({ queryKey: ["bucket-stats"] }),
-      queryClient.invalidateQueries({ queryKey: ["bucket-settings"] }),
-      queryClient.invalidateQueries({ queryKey: ["objects"] }),
-    ])
-  }
-
   async function patchBucketSettings(body: Record<string, unknown>, successMessage: string) {
     if (!bucket) return
 
@@ -203,7 +197,7 @@ export function BucketSettingsSheet({
     }
 
     toast.success(successMessage)
-    await refreshRelevantQueries()
+    await refreshBucketQueries()
     await refetch()
   }
 
@@ -308,27 +302,12 @@ export function BucketSettingsSheet({
 
     setSavingSection("delete")
     try {
-      const res = await fetch("/api/s3/buckets", {
-        method: "DELETE",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          bucket: bucket.name,
-          credentialId: bucket.credentialId,
-        }),
-      })
-      const payload = await res.json().catch(() => null)
-      if (!res.ok) {
-        throw new Error(payload?.error ?? "Failed to delete bucket")
-      }
-
-      toast.success("Bucket deleted")
-      await refreshRelevantQueries()
+      await deleteBucket(bucket.name, bucket.credentialId)
       await onDeleted?.()
       setDeleteConfirmOpen(false)
       onOpenChange(false)
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Failed to delete bucket")
-      throw error
+    } catch {
+      // deleteBucket already shows the error toast
     } finally {
       setSavingSection(null)
     }

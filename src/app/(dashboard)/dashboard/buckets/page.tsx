@@ -1,7 +1,7 @@
 "use client"
 
 import { useEffect, useMemo, useState } from "react"
-import { useQuery, useQueryClient } from "@tanstack/react-query"
+import { useQuery } from "@tanstack/react-query"
 import { toast } from "sonner"
 import { BucketSettingsSheet } from "@/components/dashboard/bucket-settings-sheet"
 import { DestructiveConfirmDialog } from "@/components/shared/destructive-confirm-dialog"
@@ -54,6 +54,8 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip"
+import { useRefreshBucketQueries } from "@/hooks/use-refresh-bucket-queries"
+import { useDeleteBucket } from "@/hooks/use-delete-bucket"
 
 interface BucketRow {
   name: string
@@ -94,7 +96,8 @@ function providerLabel(provider: string): string {
 }
 
 export default function BucketsPage() {
-  const queryClient = useQueryClient()
+  const refreshBucketQueries = useRefreshBucketQueries()
+  const { deleteBucket } = useDeleteBucket()
   const [query, setQuery] = useState("")
   const [bucketNameFilter, setBucketNameFilter] = useState("")
   const [providerFilter, setProviderFilter] = useState("all")
@@ -311,15 +314,6 @@ export default function BucketsPage() {
     currentPage * PAGE_SIZE
   )
 
-  async function refreshBucketQueries() {
-    await Promise.all([
-      queryClient.invalidateQueries({ queryKey: ["buckets"] }),
-      queryClient.invalidateQueries({ queryKey: ["bucket-stats"] }),
-      queryClient.invalidateQueries({ queryKey: ["bucket-settings"] }),
-      queryClient.invalidateQueries({ queryKey: ["objects"] }),
-    ])
-  }
-
   async function handleCreateBucket(event: React.FormEvent) {
     event.preventDefault()
     if (!createBucketName.trim()) {
@@ -358,21 +352,7 @@ export default function BucketsPage() {
   }
 
   async function handleDeleteBucket(bucket: BucketRow) {
-    const res = await fetch("/api/s3/buckets", {
-      method: "DELETE",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        bucket: bucket.name,
-        credentialId: bucket.credentialId,
-      }),
-    })
-    const payload = await res.json().catch(() => null)
-    if (!res.ok) {
-      throw new Error(payload?.error ?? "Failed to delete bucket")
-    }
-
-    toast.success("Bucket deleted")
-    await refreshBucketQueries()
+    await deleteBucket(bucket.name, bucket.credentialId)
     setPendingDeleteBucket(null)
   }
 

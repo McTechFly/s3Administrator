@@ -10,14 +10,8 @@ import {
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select"
 import { Loader2 } from "lucide-react"
+import { DestructiveConfirmationSection } from "@/components/shared/destructive-confirmation-section"
 import { toast } from "sonner"
 import {
   DESTRUCTIVE_CONFIRM_PHRASE,
@@ -121,45 +115,16 @@ export function RenameDialog({
               required
             />
           </div>
-          <div className="space-y-3 rounded-md border border-destructive/40 bg-destructive/5 p-3">
-            {!bypassActive ? (
-              <div className="space-y-1">
-                <Label htmlFor="rename-confirm-input">Confirmation</Label>
-                <p className="text-xs text-muted-foreground">
-                  Renaming moves the object and deletes the original key. Type{" "}
-                  <span className="font-mono">{DESTRUCTIVE_CONFIRM_PHRASE}</span> to continue.
-                </p>
-                <Input
-                  id="rename-confirm-input"
-                  value={confirmValue}
-                  onChange={(event) => setConfirmValue(event.target.value)}
-                  placeholder={DESTRUCTIVE_CONFIRM_PHRASE}
-                  autoComplete="off"
-                />
-              </div>
-            ) : (
-              <p className="text-xs text-muted-foreground">
-                Confirmation bypass is currently active on this browser.
-              </p>
-            )}
-            <div className="space-y-1">
-              <Label htmlFor="rename-confirm-remember">Prompt behavior</Label>
-              <Select
-                value={rememberOption}
-                onValueChange={(value) =>
-                  setRememberOption(value as DestructiveConfirmRememberOption)
-                }
-              >
-                <SelectTrigger id="rename-confirm-remember" className="w-full">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="ask">Ask every time</SelectItem>
-                  <SelectItem value="one_hour">Don&apos;t ask again for 1 hour</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-          </div>
+          <DestructiveConfirmationSection
+            bypassActive={bypassActive}
+            confirmValue={confirmValue}
+            onConfirmValueChange={setConfirmValue}
+            rememberOption={rememberOption}
+            onRememberOptionChange={setRememberOption}
+            inputId="rename-confirm-input"
+            selectId="rename-confirm-remember"
+            description="Renaming moves the object and deletes the original key."
+          />
           <div className="flex justify-end gap-2">
             <Button
               type="button"

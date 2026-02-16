@@ -12,6 +12,7 @@ import {
   assertValidTaskScheduleCron,
   TaskScheduleValidationError,
 } from "@/lib/task-schedule"
+import { isBackgroundTaskSchemaOutdated, backgroundTaskSchemaOutdatedResponse } from "@/lib/task-errors"
 
 interface BulkDeletePayload {
   query: string
@@ -87,22 +88,6 @@ function buildBulkDeletePreview(params: {
     sampleObjects: params.sampleObjects,
     warnings,
   }
-}
-
-function isBackgroundTaskSchemaOutdated(error: unknown): boolean {
-  if (!error || typeof error !== "object") return false
-  const candidate = error as {
-    code?: unknown
-    meta?: {
-      modelName?: unknown
-      column?: unknown
-    }
-  }
-
-  return (
-    candidate.code === "P2022" &&
-    candidate.meta?.modelName === "BackgroundTask"
-  )
 }
 
 export async function POST(request: NextRequest) {
@@ -286,13 +271,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: error.message }, { status: 400 })
     }
     if (isBackgroundTaskSchemaOutdated(error)) {
-      return NextResponse.json(
-        {
-          error:
-            "Database schema is out of date for background tasks. Run `make community-migrate` and restart the app.",
-        },
-        { status: 503 }
-      )
+      return backgroundTaskSchemaOutdatedResponse()
     }
     const message = error instanceof Error ? error.message : "Failed to create bulk delete task"
     return NextResponse.json({ error: message }, { status: 500 })
