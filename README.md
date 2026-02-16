@@ -2,6 +2,11 @@
 
 Open-source S3 file manager for Hetzner, AWS, Cloudflare R2, and any S3-compatible storage provider. Browse, upload, download, move, and manage files across multiple buckets and providers from a single dashboard.
 
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=s3administrator/s3Administrator&type=Date)](https://star-history.com/#s3administrator/s3Administrator&Date)
+
 ## Features
 
 - **File Management** - Browse, upload, download, delete, move, and rename files
@@ -141,10 +146,6 @@ pre-commit run --all-files
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=s3administrator/s3Administrator&type=Date)](https://star-history.com/#s3administrator/s3Administrator&Date)
 
 ## License
 
