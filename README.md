@@ -2,6 +2,7 @@
 
 Open-source S3 file manager for Hetzner, AWS, Cloudflare R2, and any S3-compatible storage provider. Browse, upload, download, move, and manage files across multiple buckets and providers from a single dashboard.
 
+![S3 Administrator Showcase](docs/showcase.gif)
 
 ## Star History
 
