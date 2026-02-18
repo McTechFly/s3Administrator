@@ -1,11 +1,12 @@
 "use client"
 
-import { useCallback, useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useRouter } from "next/navigation"
 import { useQuery, useQueryClient } from "@tanstack/react-query"
-import { RefreshCw } from "lucide-react"
+import { RefreshCw, RotateCcw, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 import { Button } from "@/components/ui/button"
+import { Badge } from "@/components/ui/badge"
 import {
   Card,
   CardContent,
@@ -13,6 +14,20 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 import {
   Table,
   TableBody,
@@ -30,6 +45,19 @@ interface OverviewSummary {
   indexedTotalSize: number
   distinctExtensionCount: number
   lastIndexedAt: string | null
+  multipartIncomplete: {
+    uploads: number
+    parts: number
+    totalSize: number
+    scannedBuckets: number
+    failedBuckets: number
+  }
+  thumbnails: {
+    ready: number
+    pending: number
+    failed: number
+    total: number
+  }
 }
 
 interface OverviewBucket {
@@ -51,6 +79,9 @@ interface OverviewType {
   type: string
   fileCount: number
   totalSize: number
+  multipartIncompleteUploads: number
+  multipartIncompleteParts: number
+  multipartIncompleteSize: number
 }
 
 interface OverviewResponse {
@@ -69,6 +100,25 @@ interface RefreshProgress {
   current: number
   total: number
   bucketName: string
+}
+
+interface ThumbnailTaskRow {
+  id: string
+  type: string
+  title: string
+  status: "pending" | "in_progress" | "completed" | "failed"
+  lifecycleState: "active" | "paused"
+  lastError: string | null
+  updatedAt: string
+}
+
+type ThumbnailStatusFilter = "all" | "pending" | "in_progress" | "completed" | "failed"
+
+function getStatusBadgeVariant(status: string): "default" | "secondary" | "destructive" | "outline" {
+  if (status === "completed") return "default"
+  if (status === "failed") return "destructive"
+  if (status === "in_progress") return "secondary"
+  return "outline"
 }
 
 function formatCount(value: number): string {
@@ -90,6 +140,10 @@ export function DashboardOverview() {
 
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [refreshProgress, setRefreshProgress] = useState<RefreshProgress | null>(null)
+  const [isGeneratingAll, setIsGeneratingAll] = useState(false)
+  const [thumbnailDetailOpen, setThumbnailDetailOpen] = useState(false)
+  const [thumbnailStatusFilter, setThumbnailStatusFilter] = useState<ThumbnailStatusFilter>("all")
+  const [controllingTaskId, setControllingTaskId] = useState<string | null>(null)
   const isRefreshingRef = useRef(false)
   const autoRefreshStartedRef = useRef(false)
 
@@ -187,6 +241,84 @@ export function DashboardOverview() {
       `Refresh finished: ${successCount} bucket(s) succeeded, ${failureCount} failed, ${formatCount(syncedTotal)} file(s) synced`
     )
   }, [queryClient])
+
+  const generateAllThumbnails = useCallback(async () => {
+    if (isGeneratingAll) return
+    setIsGeneratingAll(true)
+
+    try {
+      const res = await fetch("/api/s3/thumbnails/generate-all", {
+        method: "POST",
+      })
+
+      const data = await res.json()
+      if (!res.ok) {
+        throw new Error(data?.error ?? "Failed to queue thumbnails")
+      }
+
+      if (data.disabled) {
+        toast.error("Thumbnail generation is disabled")
+        return
+      }
+
+      toast.success(`Queued ${Number(data.queued ?? 0).toLocaleString()} thumbnails (${Number(data.skipped ?? 0).toLocaleString()} skipped)`)
+      await queryClient.invalidateQueries({ queryKey: ["dashboard-overview"] })
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Failed to queue thumbnails")
+    } finally {
+      setIsGeneratingAll(false)
+    }
+  }, [isGeneratingAll, queryClient])
+
+  const thumbnailScope = thumbnailStatusFilter === "all"
+    ? "all"
+    : thumbnailStatusFilter === "completed" || thumbnailStatusFilter === "failed"
+      ? "history"
+      : "ongoing"
+
+  const { data: thumbnailTasksData, refetch: refetchThumbnailTasks } = useQuery<{ tasks: ThumbnailTaskRow[] }>({
+    queryKey: ["thumbnail-tasks", thumbnailScope],
+    queryFn: async () => {
+      const params = new URLSearchParams({
+        type: "thumbnail_generate",
+        scope: thumbnailScope,
+        limit: "200",
+      })
+      const res = await fetch(`/api/tasks?${params}`)
+      if (!res.ok) return { tasks: [] }
+      return (await res.json()) as { tasks: ThumbnailTaskRow[] }
+    },
+    enabled: thumbnailDetailOpen,
+    refetchInterval: thumbnailDetailOpen ? 10_000 : false,
+  })
+
+  const filteredThumbnailTasks = useMemo(() => {
+    const tasks = thumbnailTasksData?.tasks ?? []
+    if (thumbnailStatusFilter === "all") return tasks
+    return tasks.filter((task) => task.status === thumbnailStatusFilter)
+  }, [thumbnailTasksData?.tasks, thumbnailStatusFilter])
+
+  async function handleThumbnailTaskControl(taskId: string, action: "restart" | "cancel") {
+    setControllingTaskId(taskId)
+    try {
+      const res = await fetch(`/api/tasks/${taskId}`, {
+        method: action === "cancel" ? "DELETE" : "PATCH",
+        headers: { "Content-Type": "application/json" },
+        ...(action === "restart" ? { body: JSON.stringify({ action: "restart" }) } : {}),
+      })
+      const responseData = await res.json()
+      if (!res.ok) {
+        throw new Error(responseData?.error ?? `Failed to ${action} task`)
+      }
+      toast.success(action === "restart" ? "Task restarted" : "Task removed")
+      void refetchThumbnailTasks()
+      await queryClient.invalidateQueries({ queryKey: ["dashboard-overview"] })
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : `Failed to ${action} task`)
+    } finally {
+      setControllingTaskId(null)
+    }
+  }
 
   useEffect(() => {
     if (autoRefreshStartedRef.current) return
@@ -295,6 +427,65 @@ export function DashboardOverview() {
             <CardTitle>{formatCount(data.summary.distinctExtensionCount)}</CardTitle>
           </CardHeader>
         </Card>
+        <Card>
+          <CardHeader className="pb-2">
+            <CardDescription>Incomplete Multipart Size</CardDescription>
+            <CardTitle>{formatSize(data.summary.multipartIncomplete.totalSize)}</CardTitle>
+          </CardHeader>
+          <CardContent className="pt-0">
+            <p className="text-xs text-muted-foreground">
+              {formatCount(data.summary.multipartIncomplete.uploads)} uploads, {formatCount(data.summary.multipartIncomplete.parts)} parts
+            </p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              scanned {formatCount(data.summary.multipartIncomplete.scannedBuckets)} bucket(s)
+              {data.summary.multipartIncomplete.failedBuckets > 0 && `, ${formatCount(data.summary.multipartIncomplete.failedBuckets)} failed`}
+            </p>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader className="pb-2">
+            <CardDescription>Thumbnails Generated</CardDescription>
+            <CardTitle>
+              {formatCount(data.summary.thumbnails.ready)}
+              {data.summary.thumbnails.total > 0 && (
+                <span className="text-sm font-normal text-muted-foreground">
+                  {" "}/ {formatCount(data.summary.thumbnails.total)}
+                </span>
+              )}
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="pt-0">
+            {(data.summary.thumbnails.pending > 0 || data.summary.thumbnails.failed > 0) && (
+              <p className="text-xs text-muted-foreground">
+                {[
+                  data.summary.thumbnails.pending > 0 && `${formatCount(data.summary.thumbnails.pending)} pending`,
+                  data.summary.thumbnails.failed > 0 && `${formatCount(data.summary.thumbnails.failed)} failed`,
+                ].filter(Boolean).join(", ")}
+              </p>
+            )}
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              {data.summary.thumbnails.total > 0 && data.summary.thumbnails.ready < data.summary.thumbnails.total && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 text-xs"
+                  disabled={isGeneratingAll}
+                  onClick={() => void generateAllThumbnails()}
+                >
+                  {isGeneratingAll ? "Queuing..." : "Generate All"}
+                </Button>
+              )}
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 text-xs"
+                onClick={() => setThumbnailDetailOpen(true)}
+              >
+                View Details
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
       </div>
 
       <Card>
@@ -325,9 +516,19 @@ export function DashboardOverview() {
                 <div key={entry.type} className="flex items-center justify-between rounded-md border px-3 py-2">
                   <div>
                     <p className="text-sm font-medium">{titleCase(entry.type)}</p>
-                    <p className="text-xs text-muted-foreground">{formatCount(entry.fileCount)} files</p>
+                    <p className="text-xs text-muted-foreground">
+                      {formatCount(entry.fileCount)} files
+                    </p>
+                    <p className="text-xs text-muted-foreground">
+                      {formatCount(entry.multipartIncompleteUploads)} incomplete upload(s), {formatCount(entry.multipartIncompleteParts)} part(s)
+                    </p>
                   </div>
-                  <p className="text-sm">{formatSize(entry.totalSize)}</p>
+                  <div className="text-right">
+                    <p className="text-sm">{formatSize(entry.totalSize)}</p>
+                    <p className="text-xs text-muted-foreground">
+                      {formatSize(entry.multipartIncompleteSize)} incomplete
+                    </p>
+                  </div>
                 </div>
               ))}
             </div>
@@ -420,6 +621,91 @@ export function DashboardOverview() {
           </div>
         </CardContent>
       </Card>
+
+      <Dialog open={thumbnailDetailOpen} onOpenChange={setThumbnailDetailOpen}>
+        <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>Thumbnail Generation Tasks</DialogTitle>
+            <DialogDescription>
+              {formatCount(data.summary.thumbnails.ready)} ready, {formatCount(data.summary.thumbnails.pending)} pending, {formatCount(data.summary.thumbnails.failed)} failed of {formatCount(data.summary.thumbnails.total)} media files
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="flex items-center gap-2">
+            <Select
+              value={thumbnailStatusFilter}
+              onValueChange={(value) => setThumbnailStatusFilter(value as ThumbnailStatusFilter)}
+            >
+              <SelectTrigger className="w-40">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All statuses</SelectItem>
+                <SelectItem value="pending">Pending</SelectItem>
+                <SelectItem value="in_progress">In progress</SelectItem>
+                <SelectItem value="completed">Completed</SelectItem>
+                <SelectItem value="failed">Failed</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+
+          <div className="max-h-[60vh] space-y-2 overflow-y-auto">
+            {filteredThumbnailTasks.length === 0 ? (
+              <p className="py-4 text-center text-sm text-muted-foreground">
+                No thumbnail tasks match this filter.
+              </p>
+            ) : (
+              filteredThumbnailTasks.map((task) => (
+                <div key={task.id} className="rounded-md border px-3 py-2">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-sm font-medium">{task.title}</p>
+                      <p className="mt-0.5 text-xs text-muted-foreground">
+                        Updated {new Date(task.updatedAt).toLocaleString()}
+                      </p>
+                      {task.lastError && (
+                        <p className="mt-0.5 truncate text-xs text-destructive">{task.lastError}</p>
+                      )}
+                    </div>
+                    <div className="flex shrink-0 items-center gap-1.5">
+                      <Badge
+                        variant={getStatusBadgeVariant(task.status)}
+                        className="h-5 px-1.5 text-[10px] capitalize"
+                      >
+                        {task.status.replace("_", " ")}
+                      </Badge>
+                      {task.status === "failed" && (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="h-6 w-6 p-0"
+                          disabled={controllingTaskId === task.id}
+                          onClick={() => void handleThumbnailTaskControl(task.id, "restart")}
+                          title="Restart"
+                        >
+                          <RotateCcw className="h-3 w-3" />
+                        </Button>
+                      )}
+                      {(task.status === "completed" || task.status === "failed") && (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="h-6 w-6 p-0 text-muted-foreground hover:text-destructive"
+                          disabled={controllingTaskId === task.id}
+                          onClick={() => void handleThumbnailTaskControl(task.id, "cancel")}
+                          title="Remove"
+                        >
+                          <Trash2 className="h-3 w-3" />
+                        </Button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

@@ -4,7 +4,10 @@ import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { pipeline } from "node:stream/promises"
 import ffmpeg from "fluent-ffmpeg"
+import sharp from "sharp"
 import { GetObjectCommand, type S3Client } from "@aws-sdk/client-s3"
+
+const MAX_IMAGE_SIZE_BYTES = 100 * 1024 * 1024 // 100 MB — images are loaded into memory
 
 class Semaphore {
   private active = 0
@@ -98,6 +101,33 @@ async function saveS3ObjectToFile(client: S3Client, bucket: string, key: string,
   throw new Error("Unsupported S3 object body stream type")
 }
 
+async function downloadS3ObjectToBuffer(client: S3Client, bucket: string, key: string): Promise<Buffer> {
+  const response = await client.send(
+    new GetObjectCommand({
+      Bucket: bucket,
+      Key: key,
+    })
+  )
+
+  if (!response.Body) {
+    throw new Error("Source object body is empty")
+  }
+
+  const body = response.Body as {
+    transformToByteArray?: () => Promise<Uint8Array>
+  }
+
+  if (typeof body.transformToByteArray === "function") {
+    return Buffer.from(await body.transformToByteArray())
+  }
+
+  const chunks: Buffer[] = []
+  for await (const chunk of response.Body as AsyncIterable<Buffer>) {
+    chunks.push(chunk)
+  }
+  return Buffer.concat(chunks)
+}
+
 export async function generateVideoThumbnail(params: {
   client: S3Client
   bucket: string
@@ -134,4 +164,52 @@ export async function generateVideoThumbnail(params: {
       await rm(workDir, { recursive: true, force: true }).catch(() => {})
     }
   }
+}
+
+export async function generateImageThumbnail(params: {
+  client: S3Client
+  bucket: string
+  key: string
+  maxWidth: number
+}): Promise<{ buffer: Buffer; mimeType: string; durationMs: number }> {
+  const release = await thumbnailSemaphore.acquire()
+  const startedAt = Date.now()
+
+  try {
+    const sourceBuffer = await downloadS3ObjectToBuffer(params.client, params.bucket, params.key)
+
+    const buffer = await sharp(sourceBuffer)
+      .resize({ width: params.maxWidth, withoutEnlargement: true })
+      .webp({ quality: 80 })
+      .toBuffer()
+
+    return {
+      buffer,
+      mimeType: "image/webp",
+      durationMs: Date.now() - startedAt,
+    }
+  } finally {
+    release()
+  }
+}
+
+export async function generateThumbnail(params: {
+  client: S3Client
+  bucket: string
+  key: string
+  mediaType: "image" | "video"
+  maxWidth: number
+  timeoutMs: number
+  sourceSize?: bigint
+}): Promise<{ buffer: Buffer; mimeType: string; durationMs: number }> {
+  // Size guard only for images (loaded fully into memory by sharp).
+  // Videos are streamed to disk by ffmpeg, so no memory concern.
+  if (params.mediaType === "image" && params.sourceSize !== undefined && params.sourceSize > BigInt(MAX_IMAGE_SIZE_BYTES)) {
+    throw new Error(`Source image too large for thumbnail generation (${params.sourceSize} bytes, max ${MAX_IMAGE_SIZE_BYTES})`)
+  }
+
+  if (params.mediaType === "video") {
+    return generateVideoThumbnail(params)
+  }
+  return generateImageThumbnail(params)
 }

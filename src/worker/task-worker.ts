@@ -19,14 +19,15 @@ function buildWorkerId(): string {
   return `${host}:${process.pid}`
 }
 
-async function processUserOnce(userId: string, workerId: string) {
+async function processUserOnce(userId: string, workerId: string, type?: string) {
   const token = getTaskEngineInternalToken()
   if (!token) {
     throw new Error("TASK_ENGINE_INTERNAL_TOKEN must be configured for worker processing")
   }
 
   const baseUrl = getTaskWorkerAppUrl().replace(/\/+$/, "")
-  const url = `${baseUrl}/api/tasks/process?userId=${encodeURIComponent(userId)}`
+  const typeParam = type ? `&type=${encodeURIComponent(type)}` : ""
+  const url = `${baseUrl}/api/tasks/process?userId=${encodeURIComponent(userId)}${typeParam}`
 
   const startedAt = new Date()
   const response = await fetch(url, {
@@ -98,7 +99,7 @@ async function main() {
   const stop = await startTaskQueueWorker({
     workerId,
     enabled: true,
-    processUserOnce: (userId) => processUserOnce(userId, workerId),
+    processUserOnce: (userId, type) => processUserOnce(userId, workerId, type),
   })
 
   console.info(`[task-worker] started (${workerId})`)

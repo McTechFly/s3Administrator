@@ -117,17 +117,13 @@ make community-local
 The dashboard supports List and Gallery view modes.
 
 - Gallery uses infinite scrolling with recursive listing
-- Image previews loaded from signed S3 URLs
-- Video thumbnails generated asynchronously via ffmpeg
+- Image and video thumbnails generated as WebP and stored in `.s3-admin-generated-thumbnails/` within each bucket
+- No separate S3 bucket needed — thumbnails use the same credentials as your files
 
-Optional environment variables for thumbnail storage:
+Thumbnail environment variables:
 
 ```bash
-THUMBNAIL_S3_ENDPOINT=
-THUMBNAIL_S3_REGION=
-THUMBNAIL_S3_ACCESS_KEY=
-THUMBNAIL_S3_SECRET_KEY=
-THUMBNAIL_S3_BUCKET=
+THUMBNAIL_GENERATION_ENABLED=true   # Set to "false" to disable
 THUMBNAIL_MAX_WIDTH=480
 THUMBNAIL_URL_TTL_SECONDS=3600
 ```

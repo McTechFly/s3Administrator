@@ -18,12 +18,16 @@ import { buildFileSearchSqlWhereClause, parseScopes } from "@/lib/file-search"
 import { getMediaTypeFromExtension } from "@/lib/media"
 import { getUserPlanEntitlements } from "@/lib/plan-entitlements"
 import { getBucketLimitViolation } from "@/lib/plan-limits"
-import { generateVideoThumbnail } from "@/lib/thumbnail-worker"
+import { generateThumbnail } from "@/lib/thumbnail-worker"
 import {
+  buildLegacyThumbnailObjectKey,
   buildThumbnailObjectKey,
-  getThumbnailBucketName,
+  buildThumbnailSourceMetadata,
+  doesThumbnailMetadataMatchSource,
   getThumbnailMaxWidth,
-  uploadThumbnailObject,
+  THUMBNAIL_SOURCE_LAST_MODIFIED_META_KEY,
+  THUMBNAIL_SOURCE_SIZE_META_KEY,
+  uploadThumbnailToSameBucket,
 } from "@/lib/thumbnail-storage"
 import { deleteMediaThumbnailsForKeys } from "@/lib/media-thumbnails"
 import { isThumbnailCacheEnabledForUser } from "@/lib/thumbnail-cache-policy"
@@ -35,6 +39,7 @@ import {
   getTaskEngineInternalToken,
   getTaskMaxActivePerUser,
   getTaskMissedScheduleGraceSeconds,
+  getTaskWorkerUserBudgetMs,
 } from "@/lib/task-engine-config"
 import {
   appendExecutionHistory,
@@ -56,7 +61,6 @@ const TRANSFER_CHUNK_SIZE = 50
 const LOCK_SECONDS = 45
 const THUMBNAIL_TIMEOUT_MS = 5_000
 const SYNC_POLL_INTERVAL_SECONDS = 60
-const TRANSFER_BATCH_TIME_BUDGET_MS = 8_000
 const MAX_STALE_SCHEDULE_SKIPS_PER_CALL = 32
 
 interface BulkDeleteTaskPayload {
@@ -886,19 +890,40 @@ export async function POST(request: Request) {
     }
     const actorUserId = userId
 
+    const TASK_TYPES = ["bulk_delete", "thumbnail_generate", "object_transfer"] as const
+    const requestedType = (new URL(request.url).searchParams.get("type") ?? "").trim()
+    const typeFilter = requestedType && TASK_TYPES.includes(requestedType as typeof TASK_TYPES[number])
+      ? [requestedType]
+      : [...TASK_TYPES]
+
     const now = new Date()
-    const lockedCount = await prisma.backgroundTask.count({
+    const maxActive = getTaskMaxActivePerUser()
+
+    // Per-type concurrency: each type gets a reserved share of the total slots
+    // so one type (e.g. thumbnail_generate) can never starve another (e.g. object_transfer).
+    // Reserved slots = floor(maxActive / number_of_types), minimum 1.
+    // Remaining slots are available to any type on a first-come basis.
+    const typeCount = TASK_TYPES.length
+    const reservedPerType = Math.max(1, Math.floor(maxActive / typeCount))
+
+    const lockedByType = await prisma.backgroundTask.groupBy({
+      by: ["type"],
       where: {
         userId: actorUserId,
         lifecycleState: "active",
         status: "in_progress",
-        nextRunAt: {
-          gt: now,
-        },
+        nextRunAt: { gt: now },
       },
+      _count: { _all: true },
     })
 
-    if (lockedCount >= getTaskMaxActivePerUser()) {
+    const lockedCounts = new Map(lockedByType.map((r) => [r.type, r._count._all]))
+    const totalLocked = lockedByType.reduce((sum, r) => sum + r._count._all, 0)
+    const requestedTypeName = typeFilter.length === 1 ? typeFilter[0] : null
+    const lockedForRequestedType = requestedTypeName ? (lockedCounts.get(requestedTypeName) ?? 0) : totalLocked
+
+    // Block if: this type already used its reserved slots AND overall limit is reached
+    if (totalLocked >= maxActive && lockedForRequestedType >= reservedPerType) {
       return NextResponse.json({
         processed: false,
         message: "Task concurrency limit reached for user",
@@ -920,7 +945,7 @@ export async function POST(request: Request) {
           userId: actorUserId,
           lifecycleState: "active",
           type: {
-            in: ["bulk_delete", "thumbnail_generate", "object_transfer"],
+            in: typeFilter,
           },
           status: {
             in: ["pending", "in_progress"],
@@ -1155,7 +1180,8 @@ export async function POST(request: Request) {
         })
       }
 
-      if (getMediaTypeFromExtension(sourceFile.extension) !== "video") {
+      const mediaType = getMediaTypeFromExtension(sourceFile.extension)
+      if (mediaType !== "video" && mediaType !== "image") {
         await prisma.mediaThumbnail.updateMany({
           where: {
             userId: actorUserId,
@@ -1192,15 +1218,23 @@ export async function POST(request: Request) {
 
       const sourceLastModified = sourceFile.lastModified
       const sourceSize = sourceFile.size
+      const sourceMetadata = buildThumbnailSourceMetadata({
+        sourceLastModified,
+        sourceSize,
+      })
       const thumbnailKey = buildThumbnailObjectKey({
-        userId: actorUserId,
-        credentialId: thumbnailPayload.credentialId,
         bucket: thumbnailPayload.bucket,
         key: thumbnailPayload.key,
         sourceLastModified,
         sourceSize,
       })
-      const thumbnailBucket = getThumbnailBucketName()
+      const legacyThumbnailKey = buildLegacyThumbnailObjectKey({
+        bucket: thumbnailPayload.bucket,
+        key: thumbnailPayload.key,
+        sourceLastModified,
+        sourceSize,
+      })
+      const thumbnailBucket = thumbnailPayload.bucket
 
       await prisma.mediaThumbnail.upsert({
         where: {
@@ -1236,12 +1270,120 @@ export async function POST(request: Request) {
       })
 
       const queueLagMs = Math.max(0, Date.now() - candidate.createdAt.getTime())
-      const generated = await generateVideoThumbnail({
+
+      // Reuse existing thumbnails by deterministic object key, including legacy-key fallback.
+      let reusableThumbnailFound = false
+      let reusableThumbnailKey = thumbnailKey
+      let requiresLegacyCopy = false
+      try {
+        const head = await client.send(new HeadObjectCommand({
+          Bucket: thumbnailPayload.bucket,
+          Key: thumbnailKey,
+        }))
+        reusableThumbnailFound = doesThumbnailMetadataMatchSource(head.Metadata, {
+          sourceLastModified,
+          sourceSize,
+        })
+      } catch {
+        reusableThumbnailFound = false
+      }
+
+      if (!reusableThumbnailFound && legacyThumbnailKey !== thumbnailKey) {
+        try {
+          const legacyHead = await client.send(new HeadObjectCommand({
+            Bucket: thumbnailPayload.bucket,
+            Key: legacyThumbnailKey,
+          }))
+          const legacyHasSourceMetadata =
+            Boolean(legacyHead.Metadata?.[THUMBNAIL_SOURCE_LAST_MODIFIED_META_KEY]) &&
+            Boolean(legacyHead.Metadata?.[THUMBNAIL_SOURCE_SIZE_META_KEY])
+          const legacyMatches = legacyHasSourceMetadata
+            ? doesThumbnailMetadataMatchSource(legacyHead.Metadata, {
+                sourceLastModified,
+                sourceSize,
+              })
+            : true
+          if (legacyMatches) {
+            reusableThumbnailFound = true
+            reusableThumbnailKey = legacyThumbnailKey
+            requiresLegacyCopy = true
+          }
+        } catch {
+          reusableThumbnailFound = false
+        }
+      }
+
+      if (reusableThumbnailFound) {
+        if (requiresLegacyCopy) {
+          try {
+            await client.send(
+              new CopyObjectCommand({
+                Bucket: thumbnailPayload.bucket,
+                Key: thumbnailKey,
+                CopySource: encodeURIComponent(`${thumbnailPayload.bucket}/${reusableThumbnailKey}`),
+                CacheControl: "public, max-age=31536000, immutable",
+                ContentType: "image/webp",
+                MetadataDirective: "REPLACE",
+                Metadata: sourceMetadata,
+              })
+            )
+          } catch {
+            // Best effort copy; keep using legacy object key when copy is denied.
+            reusableThumbnailKey = legacyThumbnailKey
+          }
+        }
+
+        await prisma.mediaThumbnail.update({
+          where: {
+            userId_credentialId_bucket_key: {
+              userId: actorUserId,
+              credentialId: thumbnailPayload.credentialId,
+              bucket: thumbnailPayload.bucket,
+              key: thumbnailPayload.key,
+            },
+          },
+          data: {
+            status: "ready",
+            thumbnailBucket,
+            thumbnailKey: reusableThumbnailKey,
+            mimeType: "image/webp",
+            sourceLastModified,
+            sourceSize,
+            lastError: null,
+          },
+        })
+
+        await prisma.backgroundTask.update({
+          where: { id: candidate.id },
+          data: {
+            status: "completed",
+            attempts: 0,
+            completedAt: new Date(),
+            nextRunAt: new Date(),
+            lastError: null,
+            executionHistory: addTaskHistoryEntry(taskExecutionHistory, {
+              status: "succeeded",
+              message: "Thumbnail already exists in S3; reused existing object",
+              metadata: { queueLagMs },
+            }),
+          },
+        })
+
+        return NextResponse.json({
+          processed: true,
+          taskId: candidate.id,
+          done: true,
+        })
+      }
+
+      const generated = await generateThumbnail({
         client,
         bucket: thumbnailPayload.bucket,
         key: thumbnailPayload.key,
+        mediaType,
         maxWidth: getThumbnailMaxWidth(),
         timeoutMs: THUMBNAIL_TIMEOUT_MS,
+        sourceSize,
       })
 
       const stillEnabled = await isThumbnailCacheEnabledForUser(actorUserId)
@@ -1276,10 +1418,13 @@ export async function POST(request: Request) {
         })
       }
 
-      await uploadThumbnailObject({
+      await uploadThumbnailToSameBucket({
+        client,
+        bucket: thumbnailPayload.bucket,
         key: thumbnailKey,
         body: generated.buffer,
         contentType: generated.mimeType,
+        metadata: sourceMetadata,
       })
 
       await prisma.mediaThumbnail.update({
@@ -1750,7 +1895,7 @@ export async function POST(request: Request) {
         // instead of hitting function/request time limits.
         if (
           processedInBatch > 0 &&
-          Date.now() - batchStartedAt >= TRANSFER_BATCH_TIME_BUDGET_MS
+          Date.now() - batchStartedAt >= getTaskWorkerUserBudgetMs()
         ) {
           timeBudgetReached = true
           break

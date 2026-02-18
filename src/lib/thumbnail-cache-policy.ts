@@ -1,13 +1,12 @@
 import { purgeMediaThumbnailsForUser } from "@/lib/media-thumbnails"
-import { getUserPlanEntitlements } from "@/lib/plan-entitlements"
+import { isThumbnailGenerationEnabled } from "@/lib/thumbnail-storage"
 
-export async function isThumbnailCacheEnabledForUser(userId: string): Promise<boolean> {
-  const entitlements = await getUserPlanEntitlements(userId)
-  return entitlements?.thumbnailCache ?? false
+export async function isThumbnailCacheEnabledForUser(_userId: string): Promise<boolean> {
+  return isThumbnailGenerationEnabled()
 }
 
 export async function enforceThumbnailCachePolicyForUser(userId: string) {
-  const enabled = await isThumbnailCacheEnabledForUser(userId)
+  const enabled = isThumbnailGenerationEnabled()
   if (enabled) {
     return {
       enabled: true,

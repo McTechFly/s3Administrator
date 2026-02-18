@@ -227,7 +227,6 @@ function DashboardContent() {
       .filter(
         (item) =>
           !item.isFolder &&
-          item.isVideo &&
           item.thumbnailStatus !== null &&
           item.thumbnailStatus !== "ready" &&
           !requestedThumbnailKeysRef.current.has(item.key)

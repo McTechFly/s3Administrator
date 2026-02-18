@@ -1,3 +1,7 @@
+import { isCommunityEdition } from "@/lib/edition"
+
+const community = isCommunityEdition()
+
 function parseBooleanEnv(value: string | undefined, defaultValue: boolean): boolean {
   if (value === undefined) return defaultValue
   const normalized = value.trim().toLowerCase()
@@ -27,23 +31,23 @@ export function isTaskEngineV2Enabled(): boolean {
 }
 
 export function getTaskWorkerConcurrency(): number {
-  return parseIntegerEnv(process.env.TASK_WORKER_CONCURRENCY, 12, 1, 128)
+  return parseIntegerEnv(process.env.TASK_WORKER_CONCURRENCY, community ? 24 : 12, 1, 128)
 }
 
 export function getTaskMaxActivePerUser(): number {
-  return parseIntegerEnv(process.env.TASK_MAX_ACTIVE_PER_USER, 2, 1, 16)
+  return parseIntegerEnv(process.env.TASK_MAX_ACTIVE_PER_USER, community ? 8 : 4, 1, 32)
 }
 
 export function getTaskWorkerUserBurst(): number {
-  return parseIntegerEnv(process.env.TASK_WORKER_USER_BURST, 8, 1, 64)
+  return parseIntegerEnv(process.env.TASK_WORKER_USER_BURST, community ? 16 : 8, 1, 64)
 }
 
 export function getTaskWorkerUserBudgetMs(): number {
-  return parseIntegerEnv(process.env.TASK_WORKER_USER_BUDGET_MS, 10_000, 1_000, 120_000)
+  return parseIntegerEnv(process.env.TASK_WORKER_USER_BUDGET_MS, community ? 20_000 : 10_000, 1_000, 120_000)
 }
 
 export function getTaskWorkerScanIntervalSeconds(): number {
-  return parseIntegerEnv(process.env.TASK_WORKER_SCAN_INTERVAL_SECONDS, 10, 2, 300)
+  return parseIntegerEnv(process.env.TASK_WORKER_SCAN_INTERVAL_SECONDS, community ? 5 : 10, 2, 300)
 }
 
 export function getTaskMissedScheduleGraceSeconds(): number {

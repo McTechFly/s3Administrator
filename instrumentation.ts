@@ -5,4 +5,10 @@ export async function register() {
   const { startServerMetricsCollector } = await import("./src/lib/server-metrics")
   setupServerErrorLogging()
   startServerMetricsCollector()
+
+  const { isTaskEngineV2Enabled } = await import("./src/lib/task-engine-config")
+  if (!isTaskEngineV2Enabled()) {
+    const { startEmbeddedTaskWorker } = await import("./src/lib/embedded-task-worker")
+    startEmbeddedTaskWorker()
+  }
 }

@@ -2,8 +2,17 @@ import { NextResponse } from "next/server"
 import { auth } from "@/lib/auth"
 import { prisma } from "@/lib/db"
 import { FILE_TYPE_EXTENSIONS } from "@/lib/file-search"
+import { IMAGE_EXTENSIONS, VIDEO_EXTENSIONS } from "@/lib/media"
+import { getS3Client } from "@/lib/s3"
+import { scanIncompleteMultipart } from "@/lib/s3-multipart-incomplete"
+
+const THUMBNAIL_SUPPORTED_EXTENSIONS = [
+  ...IMAGE_EXTENSIONS.filter((ext) => ext !== "svg"),
+  ...VIDEO_EXTENSIONS,
+]
 
 const TYPE_KEYS = ["image", "video", "audio", "document", "archive", "code", "other"] as const
+const MULTIPART_SCAN_CONCURRENCY = 3
 
 type OverviewType = typeof TYPE_KEYS[number]
 
@@ -25,6 +34,17 @@ function getTypeFromExtension(extension: string): OverviewType {
   return extensionToType.get(extension.toLowerCase()) ?? "other"
 }
 
+function getTypeFromObjectKey(key: string): OverviewType {
+  const fileName = key.split("/").pop() ?? key
+  if (!fileName) return "other"
+  const dotIndex = fileName.lastIndexOf(".")
+  if (dotIndex <= 0 || dotIndex === fileName.length - 1) {
+    return "other"
+  }
+  const extension = fileName.slice(dotIndex + 1)
+  return getTypeFromExtension(extension)
+}
+
 export async function GET() {
   try {
     const session = await auth()
@@ -34,7 +54,7 @@ export async function GET() {
 
     const userId = session.user.id
 
-    const [bucketGroups, extensionStats, fileAggregate] = await Promise.all([
+    const [bucketGroups, extensionStats, fileAggregate, readyThumbnails, pendingThumbnails, failedThumbnails, totalMediaFiles] = await Promise.all([
       prisma.fileMetadata.groupBy({
         by: ["bucket", "credentialId"],
         where: {
@@ -75,7 +95,98 @@ export async function GET() {
           lastModified: true,
         },
       }),
+      prisma.mediaThumbnail.count({
+        where: { userId, status: "ready" },
+      }),
+      prisma.mediaThumbnail.count({
+        where: { userId, status: { in: ["pending", "processing"] } },
+      }),
+      prisma.mediaThumbnail.count({
+        where: { userId, status: "failed" },
+      }),
+      prisma.fileMetadata.count({
+        where: {
+          userId,
+          isFolder: false,
+          extension: { in: [...THUMBNAIL_SUPPORTED_EXTENSIONS] },
+        },
+      }),
     ])
+
+    const multipartTypeAggregates = new Map<
+      OverviewType,
+      { uploads: number; parts: number; totalSize: number }
+    >(TYPE_KEYS.map((type) => [type, { uploads: 0, parts: 0, totalSize: 0 }]))
+
+    let multipartUploads = 0
+    let multipartParts = 0
+    let multipartTotalSize = 0
+    let multipartScannedBuckets = 0
+    let multipartFailedBuckets = 0
+
+    const multipartTargets = bucketGroups.map((entry) => ({
+      bucket: entry.bucket,
+      credentialId: entry.credentialId,
+    }))
+
+    if (multipartTargets.length > 0) {
+      const clientPromiseByCredential = new Map<string, ReturnType<typeof getS3Client>>()
+      let nextTargetIndex = 0
+      const workerCount = Math.min(MULTIPART_SCAN_CONCURRENCY, multipartTargets.length)
+
+      const workers = Array.from({ length: workerCount }, async () => {
+        while (true) {
+          const targetIndex = nextTargetIndex
+          nextTargetIndex += 1
+
+          if (targetIndex >= multipartTargets.length) {
+            break
+          }
+
+          const target = multipartTargets[targetIndex]
+          if (!target) continue
+
+          try {
+            const existingClientPromise = clientPromiseByCredential.get(target.credentialId)
+            const clientPromise =
+              existingClientPromise ??
+              getS3Client(userId, target.credentialId)
+
+            if (!existingClientPromise) {
+              clientPromiseByCredential.set(target.credentialId, clientPromise)
+            }
+
+            const { client } = await clientPromise
+            const scan = await scanIncompleteMultipart(client, target.bucket, true)
+
+            multipartScannedBuckets += 1
+            multipartUploads += scan.summary.uploads
+            multipartParts += scan.summary.parts
+            multipartTotalSize += scan.summary.incompleteSize
+
+            for (const upload of scan.uploads) {
+              const type = getTypeFromObjectKey(upload.key)
+              const typeAggregate = multipartTypeAggregates.get(type)
+              if (!typeAggregate) continue
+
+              typeAggregate.uploads += 1
+              typeAggregate.parts += upload.partCount
+              typeAggregate.totalSize += upload.size
+            }
+          } catch (error) {
+            multipartFailedBuckets += 1
+            const bucketName = target.bucket
+            const credentialId = target.credentialId
+            console.warn(
+              `Failed to scan incomplete multipart uploads for ${credentialId}:${bucketName}:`,
+              error
+            )
+          }
+        }
+      })
+
+      await Promise.all(workers)
+    }
 
     const credentialIds = Array.from(new Set(bucketGroups.map((entry) => entry.credentialId)))
     const credentials = credentialIds.length > 0
@@ -139,6 +250,9 @@ export async function GET() {
         type,
         fileCount: typeAggregates.get(type)?.fileCount ?? 0,
         totalSize: typeAggregates.get(type)?.totalSize ?? 0,
+        multipartIncompleteUploads: multipartTypeAggregates.get(type)?.uploads ?? 0,
+        multipartIncompleteParts: multipartTypeAggregates.get(type)?.parts ?? 0,
+        multipartIncompleteSize: multipartTypeAggregates.get(type)?.totalSize ?? 0,
       }))
       .sort((a, b) => {
         if (b.fileCount !== a.fileCount) return b.fileCount - a.fileCount
@@ -153,6 +267,19 @@ export async function GET() {
         indexedTotalSize: toNumber(fileAggregate._sum.size),
         distinctExtensionCount: extensionStats.length,
         lastIndexedAt: fileAggregate._max.lastModified?.toISOString() ?? null,
+        thumbnails: {
+          ready: readyThumbnails,
+          pending: pendingThumbnails,
+          failed: failedThumbnails,
+          total: totalMediaFiles,
+        },
+        multipartIncomplete: {
+          uploads: multipartUploads,
+          parts: multipartParts,
+          totalSize: multipartTotalSize,
+          scannedBuckets: multipartScannedBuckets,
+          failedBuckets: multipartFailedBuckets,
+        },
       },
       buckets,
       extensions,

@@ -1,9 +1,13 @@
 "use client"
 
-import { useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useQuery } from "@tanstack/react-query"
 import { toast } from "sonner"
 import { BucketSettingsSheet } from "@/components/dashboard/bucket-settings-sheet"
+import {
+  MultipartIncompleteDialog,
+  type MultipartIncompleteSummary,
+} from "@/components/dashboard/multipart-incomplete-dialog"
 import { DestructiveConfirmDialog } from "@/components/shared/destructive-confirm-dialog"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -78,10 +82,15 @@ interface BucketStatsItem {
   credentialId: string
 }
 
+interface MultipartIncompleteScanResponse {
+  summary: MultipartIncompleteSummary
+}
+
 type SortField = "name" | "provider" | "credential" | "fileCount" | "indexedSize" | "createdAt"
 type SortDirection = "asc" | "desc"
 
 const PAGE_SIZE = 50
+const MULTIPART_SCAN_TIMEOUT_MS = 45_000
 
 function formatSize(bytes: number): string {
   if (bytes === 0) return "0 B"
@@ -93,6 +102,16 @@ function formatSize(bytes: number): string {
 function providerLabel(provider: string): string {
   const key = provider as Provider
   return PROVIDERS[key]?.name ?? provider
+}
+
+function isAbortError(error: unknown): boolean {
+  if (error instanceof DOMException && error.name === "AbortError") {
+    return true
+  }
+  if (error instanceof Error && error.name === "AbortError") {
+    return true
+  }
+  return false
 }
 
 export default function BucketsPage() {
@@ -113,6 +132,15 @@ export default function BucketsPage() {
   const [syncIssueByBucketKey, setSyncIssueByBucketKey] = useState<Record<string, string>>({})
   const [pendingDeleteBucket, setPendingDeleteBucket] = useState<BucketRow | null>(null)
   const [settingsBucket, setSettingsBucket] = useState<BucketRow | null>(null)
+  const [multipartBucket, setMultipartBucket] = useState<BucketRow | null>(null)
+  const [multipartSummaryByBucketKey, setMultipartSummaryByBucketKey] = useState<
+    Record<string, MultipartIncompleteSummary>
+  >({})
+  const [multipartLoadingByBucketKey, setMultipartLoadingByBucketKey] = useState<
+    Record<string, boolean>
+  >({})
+  const [multipartErrorByBucketKey, setMultipartErrorByBucketKey] = useState<Record<string, string>>({})
+  const multipartScanInFlightRef = useRef<Set<string>>(new Set())
 
   const { data: buckets = [], isLoading: bucketsLoading } = useQuery<BucketRow[]>({
     queryKey: ["buckets"],
@@ -309,10 +337,128 @@ export default function BucketsPage() {
   const totalRows = filteredAndSortedBuckets.length
   const totalPages = Math.max(1, Math.ceil(totalRows / PAGE_SIZE))
   const currentPage = Math.min(page, totalPages)
-  const pagedBuckets = filteredAndSortedBuckets.slice(
-    (currentPage - 1) * PAGE_SIZE,
-    currentPage * PAGE_SIZE
+  const pagedBuckets = useMemo(
+    () =>
+      filteredAndSortedBuckets.slice(
+        (currentPage - 1) * PAGE_SIZE,
+        currentPage * PAGE_SIZE
+      ),
+    [currentPage, filteredAndSortedBuckets]
   )
+
+  const setMultipartSummaryForBucket = useCallback(
+    (bucketKey: string, summary: MultipartIncompleteSummary) => {
+      setMultipartSummaryByBucketKey((previous) => ({
+        ...previous,
+        [bucketKey]: summary,
+      }))
+      setMultipartErrorByBucketKey((previous) => {
+        if (!(bucketKey in previous)) {
+          return previous
+        }
+        const next = { ...previous }
+        delete next[bucketKey]
+        return next
+      })
+    },
+    []
+  )
+
+  const setMultipartErrorForBucket = useCallback((bucketKey: string, error: string) => {
+    setMultipartErrorByBucketKey((previous) => ({
+      ...previous,
+      [bucketKey]: error,
+    }))
+  }, [])
+
+  const scanMultipartBucketSummary = useCallback(
+    async (bucket: Pick<BucketRow, "name" | "credentialId">) => {
+      const bucketKey = `${bucket.credentialId}:${bucket.name}`
+      if (multipartScanInFlightRef.current.has(bucketKey)) {
+        return
+      }
+      multipartScanInFlightRef.current.add(bucketKey)
+      const abortController = new AbortController()
+      const timeoutId = setTimeout(() => {
+        abortController.abort()
+      }, MULTIPART_SCAN_TIMEOUT_MS)
+
+      setMultipartLoadingByBucketKey((previous) => ({
+        ...previous,
+        [bucketKey]: true,
+      }))
+
+      try {
+        const params = new URLSearchParams({
+          bucket: bucket.name,
+          credentialId: bucket.credentialId,
+          details: "false",
+        })
+        const res = await fetch(`/api/s3/multipart/incomplete?${params.toString()}`, {
+          signal: abortController.signal,
+        })
+        const payload = (await res.json().catch(() => null)) as
+          | (MultipartIncompleteScanResponse & { error?: string })
+          | null
+
+        if (!res.ok) {
+          throw new Error(payload?.error ?? `Failed to scan multipart uploads for ${bucket.name}`)
+        }
+
+        if (!payload) {
+          throw new Error("Invalid server response")
+        }
+
+        setMultipartSummaryForBucket(bucketKey, payload.summary)
+      } catch (error) {
+        const errorMessage = isAbortError(error)
+          ? "Multipart scan timed out. Use Multipart dialog to retry."
+          : error instanceof Error
+            ? error.message
+            : "Failed to scan multipart uploads"
+
+        setMultipartErrorForBucket(
+          bucketKey,
+          errorMessage
+        )
+      } finally {
+        clearTimeout(timeoutId)
+        multipartScanInFlightRef.current.delete(bucketKey)
+        setMultipartLoadingByBucketKey((previous) => ({
+          ...previous,
+          [bucketKey]: false,
+        }))
+      }
+    },
+    [setMultipartErrorForBucket, setMultipartSummaryForBucket]
+  )
+
+  useEffect(() => {
+    if (pagedBuckets.length === 0) return
+
+    let cancelled = false
+    const queue = pagedBuckets.map((bucket) => ({
+      name: bucket.name,
+      credentialId: bucket.credentialId,
+    }))
+    const workerCount = Math.min(3, queue.length)
+
+    const workers = Array.from({ length: workerCount }, async () => {
+      while (!cancelled) {
+        const nextBucket = queue.shift()
+        if (!nextBucket) {
+          break
+        }
+        await scanMultipartBucketSummary(nextBucket)
+      }
+    })
+
+    void Promise.all(workers)
+
+    return () => {
+      cancelled = true
+    }
+  }, [pagedBuckets, scanMultipartBucketSummary])
 
   async function handleCreateBucket(event: React.FormEvent) {
     event.preventDefault()
@@ -621,22 +767,29 @@ export default function BucketsPage() {
                 </TableRow>
               ) : (
                 pagedBuckets.map((bucket) => {
-                  const stats = statsByKey.get(`${bucket.credentialId}:${bucket.name}`)
+                  const bucketKey = `${bucket.credentialId}:${bucket.name}`
+                  const stats = statsByKey.get(bucketKey)
                   const fileCount = stats?.fileCount ?? 0
                   const totalSize = stats?.totalSize ?? 0
+                  const multipartSummary = multipartSummaryByBucketKey[bucketKey]
+                  const multipartError = multipartErrorByBucketKey[bucketKey]
+                  const multipartLoading = multipartLoadingByBucketKey[bucketKey] ?? false
+                  const indexedSizeLabel = multipartSummary
+                    ? `${formatSize(totalSize)} (${formatSize(multipartSummary.incompleteSize)} incomplete)`
+                    : formatSize(totalSize)
 
                   return (
-                    <TableRow key={`${bucket.credentialId}:${bucket.name}`}>
+                    <TableRow key={bucketKey}>
                       <TableCell>
                         <div className="flex items-center gap-2">
                           <span className="font-medium">{bucket.name}</span>
-                          {syncIssueByBucketKey[`${bucket.credentialId}:${bucket.name}`] ? (
+                          {syncIssueByBucketKey[bucketKey] ? (
                             <Tooltip>
                               <TooltipTrigger asChild>
                                 <CircleAlert className="h-4 w-4 text-destructive" />
                               </TooltipTrigger>
                               <TooltipContent>
-                                {syncIssueByBucketKey[`${bucket.credentialId}:${bucket.name}`]}
+                                {syncIssueByBucketKey[bucketKey]}
                               </TooltipContent>
                             </Tooltip>
                           ) : null}
@@ -653,7 +806,22 @@ export default function BucketsPage() {
                           bucket.credentialId}
                       </TableCell>
                       <TableCell>{fileCount.toLocaleString("en-US")}</TableCell>
-                      <TableCell>{formatSize(totalSize)}</TableCell>
+                      <TableCell>
+                        <div className="flex items-center gap-2">
+                          <span>{indexedSizeLabel}</span>
+                          {multipartLoading ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
+                          ) : null}
+                          {multipartError ? (
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <CircleAlert className="h-4 w-4 text-amber-600" />
+                              </TooltipTrigger>
+                              <TooltipContent>{multipartError}</TooltipContent>
+                            </Tooltip>
+                          ) : null}
+                        </div>
+                      </TableCell>
                       <TableCell className="text-xs text-muted-foreground">
                         {bucket.creationDate
                           ? new Date(bucket.creationDate).toLocaleDateString("en-US", {
@@ -663,6 +831,14 @@ export default function BucketsPage() {
                       </TableCell>
                       <TableCell className="text-right">
                         <div className="flex items-center justify-end gap-2">
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            onClick={() => setMultipartBucket(bucket)}
+                          >
+                            Multipart
+                          </Button>
                           <Button
                             type="button"
                             variant="outline"
@@ -732,6 +908,31 @@ export default function BucketsPage() {
           </Button>
         </div>
       </div>
+
+      <MultipartIncompleteDialog
+        open={Boolean(multipartBucket)}
+        onOpenChange={(open) => {
+          if (!open) {
+            setMultipartBucket(null)
+          }
+        }}
+        bucket={
+          multipartBucket
+            ? { name: multipartBucket.name, credentialId: multipartBucket.credentialId }
+            : null
+        }
+        initialSummary={
+          multipartBucket
+            ? multipartSummaryByBucketKey[`${multipartBucket.credentialId}:${multipartBucket.name}`] ?? null
+            : null
+        }
+        onSummaryUpdated={(bucketKey, summary) => {
+          setMultipartSummaryForBucket(bucketKey, summary)
+        }}
+        onSummaryError={(bucketKey, error) => {
+          setMultipartErrorForBucket(bucketKey, error)
+        }}
+      />
 
       <BucketSettingsSheet
         open={Boolean(settingsBucket)}

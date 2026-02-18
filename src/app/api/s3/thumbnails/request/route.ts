@@ -1,13 +1,17 @@
 import { NextRequest, NextResponse } from "next/server"
+import { HeadObjectCommand } from "@aws-sdk/client-s3"
 import { auth } from "@/lib/auth"
 import { prisma } from "@/lib/db"
 import { getS3Client } from "@/lib/s3"
-import { isVideoExtension } from "@/lib/media"
+import { isThumbnailSupportedExtension } from "@/lib/media"
 import { thumbnailRequestSchema } from "@/lib/validations"
 import { rateLimitByUser, rateLimitResponse } from "@/lib/rate-limit"
-import { buildThumbnailObjectKey, getThumbnailBucketName } from "@/lib/thumbnail-storage"
+import {
+  buildThumbnailObjectKey,
+  doesThumbnailMetadataMatchSource,
+  isThumbnailGenerationEnabled,
+} from "@/lib/thumbnail-storage"
 import { queueThumbnailTasks } from "@/lib/media-thumbnails"
-import { enforceThumbnailCachePolicyForUser } from "@/lib/thumbnail-cache-policy"
 import { getRequestContext, logUserAuditAction } from "@/lib/audit-logger"
 
 export async function POST(request: NextRequest) {
@@ -40,8 +44,7 @@ export async function POST(request: NextRequest) {
     auditBucket = bucket
     const dedupedKeys = Array.from(new Set(keys))
 
-    const policy = await enforceThumbnailCachePolicyForUser(session.user.id)
-    if (!policy.enabled) {
+    if (!isThumbnailGenerationEnabled()) {
       await logUserAuditAction({
         userId: session.user.id,
         eventType: "s3_action",
@@ -52,11 +55,7 @@ export async function POST(request: NextRequest) {
         metadata: {
           bucket,
           requested: dedupedKeys.length,
-          reason: "thumbnail_cache_disabled_for_plan",
-          purged: policy.purged,
-          purgedRows: policy.deletedRows,
-          purgedObjects: policy.deletedObjects,
-          purgedTasks: policy.deletedTasks,
+          reason: "thumbnail_generation_disabled",
         },
         ...requestContext,
       })
@@ -66,11 +65,11 @@ export async function POST(request: NextRequest) {
         queued: 0,
         skipped: dedupedKeys.length,
         disabled: true,
-        reason: "thumbnail_cache_disabled_for_plan",
+        reason: "thumbnail_generation_disabled",
       })
     }
 
-    const { credential } = await getS3Client(session.user.id, credentialId)
+    const { client, credential } = await getS3Client(session.user.id, credentialId)
 
     const files = await prisma.fileMetadata.findMany({
       where: {
@@ -88,8 +87,8 @@ export async function POST(request: NextRequest) {
       },
     })
 
-    const videoFiles = files.filter((file) => isVideoExtension(file.extension))
-    if (videoFiles.length === 0) {
+    const mediaFiles = files.filter((file) => isThumbnailSupportedExtension(file.extension))
+    if (mediaFiles.length === 0) {
       return NextResponse.json({
         accepted: 0,
         queued: 0,
@@ -102,7 +101,7 @@ export async function POST(request: NextRequest) {
         userId: session.user.id,
         credentialId: credential.id,
         bucket,
-        key: { in: videoFiles.map((file) => file.key) },
+        key: { in: mediaFiles.map((file) => file.key) },
       },
       select: {
         key: true,
@@ -114,9 +113,8 @@ export async function POST(request: NextRequest) {
     const existingByKey = new Map(existingRows.map((row) => [row.key, row]))
 
     const acceptedForQueue: Array<{ bucket: string; key: string; credentialId: string }> = []
-    const thumbnailBucket = getThumbnailBucketName()
 
-    for (const file of videoFiles) {
+    for (const file of mediaFiles) {
       const existing = existingByKey.get(file.key)
       const sourceLastModified = file.lastModified
       const sourceSize = file.size
@@ -131,13 +129,63 @@ export async function POST(request: NextRequest) {
       }
 
       const thumbnailKey = buildThumbnailObjectKey({
-        userId: session.user.id,
-        credentialId: credential.id,
         bucket,
         key: file.key,
         sourceLastModified,
         sourceSize,
       })
+
+      let reusableThumbnailExists = false
+      try {
+        const head = await client.send(
+          new HeadObjectCommand({
+            Bucket: bucket,
+            Key: thumbnailKey,
+          })
+        )
+        reusableThumbnailExists = doesThumbnailMetadataMatchSource(head.Metadata, {
+          sourceLastModified,
+          sourceSize,
+        })
+      } catch {
+        reusableThumbnailExists = false
+      }
+
+      if (reusableThumbnailExists) {
+        await prisma.mediaThumbnail.upsert({
+          where: {
+            userId_credentialId_bucket_key: {
+              userId: session.user.id,
+              credentialId: credential.id,
+              bucket,
+              key: file.key,
+            },
+          },
+          create: {
+            userId: session.user.id,
+            credentialId: credential.id,
+            bucket,
+            key: file.key,
+            status: "ready",
+            thumbnailBucket: bucket,
+            thumbnailKey,
+            mimeType: "image/webp",
+            sourceLastModified,
+            sourceSize,
+            lastError: null,
+          },
+          update: {
+            status: "ready",
+            thumbnailBucket: bucket,
+            thumbnailKey,
+            mimeType: "image/webp",
+            sourceLastModified,
+            sourceSize,
+            lastError: null,
+          },
+        })
+        continue
+      }
 
       await prisma.mediaThumbnail.upsert({
         where: {
@@ -154,7 +202,7 @@ export async function POST(request: NextRequest) {
           bucket,
           key: file.key,
           status: "pending",
-          thumbnailBucket,
+          thumbnailBucket: bucket,
           thumbnailKey,
           mimeType: "image/webp",
           sourceLastModified,
@@ -163,7 +211,7 @@ export async function POST(request: NextRequest) {
         },
         update: {
           status: "pending",
-          thumbnailBucket,
+          thumbnailBucket: bucket,
           thumbnailKey,
           mimeType: "image/webp",
           sourceLastModified,

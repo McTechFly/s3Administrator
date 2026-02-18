@@ -1,7 +1,7 @@
 "use client"
 
 import { useEffect, useMemo, useRef } from "react"
-import { Download, FolderOpen, Loader2, Trash2, Video } from "lucide-react"
+import { Download, FolderOpen, ImageIcon, Loader2, Trash2, Video } from "lucide-react"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Button } from "@/components/ui/button"
 import { EmptyState } from "@/components/dashboard/empty-state"
@@ -138,15 +138,13 @@ export function GalleryBrowser({
                     />
                   ) : (
                     <div className="flex h-full items-center justify-center text-muted-foreground">
-                      {item.isVideo ? (
+                      {item.thumbnailStatus !== null ? (
                         <div className="flex flex-col items-center gap-2">
-                          <Video className="h-7 w-7" />
+                          {item.isVideo ? <Video className="h-7 w-7" /> : <ImageIcon className="h-7 w-7" />}
                           <span className="text-xs">
-                            {item.thumbnailStatus === null
-                              ? "Preview disabled"
-                              : item.thumbnailStatus === "failed"
-                                ? "Thumbnail failed"
-                                : "Generating..."}
+                            {item.thumbnailStatus === "failed"
+                              ? "Thumbnail failed"
+                              : "Generating..."}
                           </span>
                         </div>
                       ) : (

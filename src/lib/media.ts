@@ -45,6 +45,19 @@ export function isVideoExtension(extension: string | null | undefined): boolean 
   return getMediaTypeFromExtension(extension) === "video"
 }
 
+export function isImageExtension(extension: string | null | undefined): boolean {
+  return getMediaTypeFromExtension(extension) === "image"
+}
+
+const SVG_EXTENSION = "svg"
+
+export function isThumbnailSupportedExtension(extension: string | null | undefined): boolean {
+  const mediaType = getMediaTypeFromExtension(extension)
+  if (!mediaType) return false
+  if (mediaType === "image" && normalizeExtension(extension) === SVG_EXTENSION) return false
+  return true
+}
+
 export function getGalleryExtensions(filter: "all" | "image" | "video"): string[] {
   if (filter === "image") return [...IMAGE_EXTENSIONS]
   if (filter === "video") return [...VIDEO_EXTENSIONS]

@@ -1,17 +1,17 @@
 import { NextRequest, NextResponse } from "next/server"
-import { GetObjectCommand, type S3Client } from "@aws-sdk/client-s3"
+import { GetObjectCommand } from "@aws-sdk/client-s3"
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner"
 import { auth } from "@/lib/auth"
 import { prisma } from "@/lib/db"
 import { getS3Client } from "@/lib/s3"
-import { getUserPlanEntitlements } from "@/lib/plan-entitlements"
 import { getMediaTypeFromExtension, type MediaType } from "@/lib/media"
+import { isThumbnailSupportedExtension } from "@/lib/media"
 import { galleryListSchema } from "@/lib/validations"
 import { rateLimitByUser, rateLimitResponse } from "@/lib/rate-limit"
 import {
-  getThumbnailBucketName,
-  getThumbnailStorageClient,
   getThumbnailUrlTtlSeconds,
+  isThumbnailGenerationEnabled,
+  THUMBNAIL_OBJECT_PREFIX,
 } from "@/lib/thumbnail-storage"
 import { getRequestContext, logUserAuditAction } from "@/lib/audit-logger"
 import type { GalleryItem, ThumbnailStatus } from "@/types"
@@ -38,7 +38,6 @@ type FileCandidate = {
   mediaType: MediaType
   isVideo: boolean
   thumbnailStatus: ThumbnailStatus
-  thumbnailBucket: string | null
   thumbnailKey: string | null
 }
 
@@ -89,11 +88,7 @@ export async function GET(request: NextRequest) {
       return rateLimitResponse(limitResult.retryAfterSeconds)
     }
 
-    const entitlements = await getUserPlanEntitlements(session.user.id)
-    if (!entitlements) {
-      return NextResponse.json({ error: "Failed to resolve plan entitlements" }, { status: 403 })
-    }
-    const previewEnabled = entitlements.thumbnailCache
+    const thumbnailGenerationEnabled = isThumbnailGenerationEnabled()
 
     const { searchParams } = request.nextUrl
     const parsed = galleryListSchema.safeParse({
@@ -124,16 +119,6 @@ export async function GET(request: NextRequest) {
     const { client, credential } = await getS3Client(session.user.id, credentialId)
     const ttlSeconds = getThumbnailUrlTtlSeconds()
 
-    let thumbnailClient: S3Client | null = null
-    let defaultThumbnailBucket: string | null = null
-    try {
-      thumbnailClient = getThumbnailStorageClient()
-      defaultThumbnailBucket = getThumbnailBucketName()
-    } catch {
-      thumbnailClient = null
-      defaultThumbnailBucket = null
-    }
-
     const allEntries = await prisma.fileMetadata.findMany({
       where: {
         userId: session.user.id,
@@ -163,6 +148,9 @@ export async function GET(request: NextRequest) {
     }> = []
 
     for (const entry of allEntries) {
+      // Filter out generated thumbnail objects
+      if (entry.key.startsWith(THUMBNAIL_OBJECT_PREFIX)) continue
+
       const remainder = entry.key.slice(resolvedPrefix.length)
       if (!remainder) continue
 
@@ -170,6 +158,10 @@ export async function GET(request: NextRequest) {
 
       if (slashIndex !== -1) {
         const folderKey = resolvedPrefix + remainder.slice(0, slashIndex + 1)
+
+        // Skip the thumbnail folder from appearing as a visible folder
+        if (folderKey === THUMBNAIL_OBJECT_PREFIX || folderKey.startsWith(THUMBNAIL_OBJECT_PREFIX)) continue
+
         const existing = folderMap.get(folderKey)
         const entrySize = entry.isFolder ? 0 : Number(entry.size)
         const entryCount = entry.isFolder ? 0 : 1
@@ -215,21 +207,24 @@ export async function GET(request: NextRequest) {
       })
     }
 
-    const videoKeys = previewEnabled
-      ? directFiles.filter((entry) => entry.isVideo).map((entry) => entry.key)
+    // Query thumbnail status for all media files that support thumbnails
+    // Query thumbnail status for all media files that support thumbnails (when generation is enabled)
+    const mediaKeysForThumbnails = thumbnailGenerationEnabled
+      ? directFiles
+          .filter((entry) => isThumbnailSupportedExtension(entry.extension))
+          .map((entry) => entry.key)
       : []
-    const thumbnailRows = videoKeys.length > 0
+    const thumbnailRows = mediaKeysForThumbnails.length > 0
       ? await prisma.mediaThumbnail.findMany({
           where: {
             userId: session.user.id,
             credentialId: credential.id,
             bucket,
-            key: { in: videoKeys },
+            key: { in: mediaKeysForThumbnails },
           },
           select: {
             key: true,
             status: true,
-            thumbnailBucket: true,
             thumbnailKey: true,
           },
         })
@@ -240,7 +235,6 @@ export async function GET(request: NextRequest) {
         row.key,
         {
           status: row.status as ThumbnailStatus,
-          thumbnailBucket: row.thumbnailBucket,
           thumbnailKey: row.thumbnailKey,
         },
       ])
@@ -256,6 +250,7 @@ export async function GET(request: NextRequest) {
 
     const fileCandidates: FileCandidate[] = directFiles.map((entry) => {
       const thumbnail = thumbnailByKey.get(entry.key)
+      const hasThumbnailSupport = isThumbnailSupportedExtension(entry.extension)
       return {
         kind: "file",
         id: entry.id,
@@ -266,8 +261,7 @@ export async function GET(request: NextRequest) {
         mediaType: entry.mediaType,
         isVideo: entry.isVideo,
         thumbnailStatus:
-          previewEnabled && entry.isVideo ? (thumbnail?.status ?? "pending") : null,
-        thumbnailBucket: thumbnail?.thumbnailBucket ?? defaultThumbnailBucket,
+          thumbnailGenerationEnabled && hasThumbnailSupport ? (thumbnail?.status ?? "pending") : null,
         thumbnailKey: thumbnail?.thumbnailKey ?? null,
       }
     })
@@ -301,15 +295,17 @@ export async function GET(request: NextRequest) {
 
         let previewUrl: string | null = null
 
-        if (!previewEnabled) {
-          previewUrl = null
-        } else if (!candidate.isVideo) {
+        if (
+          candidate.thumbnailStatus === "ready" &&
+          candidate.thumbnailKey
+        ) {
+          // Use the generated thumbnail (same bucket) for both images and videos
           try {
             previewUrl = await getSignedUrl(
               client,
               new GetObjectCommand({
                 Bucket: bucket,
-                Key: candidate.key,
+                Key: candidate.thumbnailKey,
                 ResponseContentDisposition: "inline",
                 ResponseCacheControl: `public, max-age=${ttlSeconds}`,
               }),
@@ -318,18 +314,16 @@ export async function GET(request: NextRequest) {
           } catch {
             previewUrl = null
           }
-        } else if (
-          candidate.thumbnailStatus === "ready" &&
-          candidate.thumbnailKey &&
-          candidate.thumbnailBucket &&
-          thumbnailClient
-        ) {
+        }
+
+        // For images without a ready thumbnail, always fall back to the original
+        if (!previewUrl && !candidate.isVideo) {
           try {
             previewUrl = await getSignedUrl(
-              thumbnailClient,
+              client,
               new GetObjectCommand({
-                Bucket: candidate.thumbnailBucket,
-                Key: candidate.thumbnailKey,
+                Bucket: bucket,
+                Key: candidate.key,
                 ResponseContentDisposition: "inline",
                 ResponseCacheControl: `public, max-age=${ttlSeconds}`,
               }),
@@ -370,7 +364,7 @@ export async function GET(request: NextRequest) {
         prefix: resolvedPrefix,
           mediaType,
           limit,
-          previewEnabled,
+          thumbnailGenerationEnabled,
           returned: items.length,
           hasMore,
           offset: start,

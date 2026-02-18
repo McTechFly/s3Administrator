@@ -3,7 +3,6 @@ import { prisma } from "@/lib/db"
 import { deleteExpiredTaskEvents } from "@/lib/task-run-history"
 import {
   getTaskEventRetentionDays,
-  getTaskMaxActivePerUser,
   getTaskWorkerConcurrency,
   getTaskWorkerScanIntervalSeconds,
   getTaskWorkerUserBudgetMs,
@@ -40,8 +39,15 @@ export interface ProcessUserResult {
 
 export interface TaskQueueWorkerOptions {
   workerId: string
-  processUserOnce: (userId: string) => Promise<ProcessUserResult>
+  processUserOnce: (userId: string, type?: string) => Promise<ProcessUserResult>
   enabled: boolean
+}
+
+const TASK_TYPES = ["bulk_delete", "object_transfer", "thumbnail_generate"] as const
+
+interface DueUserType {
+  userId: string
+  type: string
 }
 
 function extractUserIdFromJobData(data: unknown): string | null {
@@ -104,64 +110,23 @@ async function loadPgBossConstructor(): Promise<BossConstructor | null> {
   }
 }
 
-async function findDueUsers(limitUsers: number): Promise<string[]> {
-  const maxSlots = getTaskMaxActivePerUser()
-  const rows = await prisma.$queryRaw<Array<{ userId: string; availableSlots: number }>>(Prisma.sql`
-    WITH due AS (
-      SELECT
-        t."userId" AS "userId",
-        COUNT(*)::int AS "dueCount",
-        MIN(t."createdAt") AS "oldestCreatedAt",
-        MIN(t."nextRunAt") AS "oldestNextRunAt"
-      FROM "BackgroundTask" t
-      WHERE t."lifecycleState" = 'active'
-        AND t."status" IN ('pending', 'in_progress')
-        AND t."type" IN ('bulk_delete', 'thumbnail_generate', 'object_transfer')
-        AND t."nextRunAt" <= NOW()
-      GROUP BY t."userId"
-    ),
-    locked AS (
-      SELECT
-        t."userId" AS "userId",
-        COUNT(*)::int AS "lockedCount"
-      FROM "BackgroundTask" t
-      WHERE t."lifecycleState" = 'active'
-        AND t."status" = 'in_progress'
-        AND t."nextRunAt" > NOW()
-      GROUP BY t."userId"
-    )
-    SELECT
-      d."userId" AS "userId",
-      GREATEST(
-        0,
-        LEAST(${maxSlots}, d."dueCount") - COALESCE(l."lockedCount", 0)
-      )::int AS "availableSlots"
-    FROM due d
-    LEFT JOIN locked l
-      ON l."userId" = d."userId"
-    ORDER BY d."oldestCreatedAt" ASC, d."oldestNextRunAt" ASC
-    LIMIT ${limitUsers}
+async function findDueUserTypes(limit: number): Promise<DueUserType[]> {
+  return prisma.$queryRaw<DueUserType[]>(Prisma.sql`
+    SELECT DISTINCT t."userId" AS "userId", t."type"
+    FROM "BackgroundTask" t
+    WHERE t."lifecycleState" = 'active'
+      AND t."status" IN ('pending', 'in_progress')
+      AND t."type" IN ('bulk_delete', 'thumbnail_generate', 'object_transfer')
+      AND t."nextRunAt" <= NOW()
+    ORDER BY t."userId"
+    LIMIT ${limit}
   `)
-
-  const users: string[] = []
-  for (const row of rows) {
-    if (typeof row.userId !== "string" || !row.userId.trim()) {
-      continue
-    }
-    const slots = Number.isFinite(row.availableSlots)
-      ? Math.max(0, Math.floor(row.availableSlots))
-      : 0
-    for (let i = 0; i < slots; i++) {
-      users.push(row.userId)
-    }
-  }
-
-  return users
 }
 
-async function processUserBurst(
+async function processUserTypeBurst(
   userId: string,
-  processUserOnce: (userId: string) => Promise<ProcessUserResult>
+  type: string,
+  processUserOnce: (userId: string, type?: string) => Promise<ProcessUserResult>
 ): Promise<number> {
   const budgetMs = getTaskWorkerUserBudgetMs()
   const maxBurst = getTaskWorkerUserBurst()
@@ -173,7 +138,7 @@ async function processUserBurst(
       break
     }
 
-    const result = await processUserOnce(userId)
+    const result = await processUserOnce(userId, type)
     if (!result.processed) {
       break
     }
@@ -192,7 +157,6 @@ async function runMaintenance(workerId: string): Promise<void> {
 
 async function runFallbackPollingWorker(options: TaskQueueWorkerOptions) {
   const scanIntervalMs = getTaskWorkerScanIntervalSeconds() * 1000
-  const concurrency = getTaskWorkerConcurrency()
 
   let stopped = false
   let nextMaintenanceAt = Date.now() + 24 * 60 * 60 * 1000
@@ -206,28 +170,45 @@ async function runFallbackPollingWorker(options: TaskQueueWorkerOptions) {
         await runMaintenance(options.workerId)
       }
 
-      const dueUsers = await findDueUsers(Math.max(64, concurrency * 8))
-      if (dueUsers.length === 0) {
-        return
+      const dueRows = await findDueUserTypes(64)
+      if (dueRows.length === 0) return
+
+      // Group by user -> set of types with due work
+      const userTypes = new Map<string, Set<string>>()
+      for (const row of dueRows) {
+        const existing = userTypes.get(row.userId)
+        if (existing) {
+          existing.add(row.type)
+        } else {
+          userTypes.set(row.userId, new Set([row.type]))
+        }
       }
 
-      let cursor = 0
-      const workers = Array.from({ length: concurrency }, async () => {
-        while (!stopped) {
-          const current = dueUsers[cursor]
-          cursor += 1
-          if (!current) break
-          try {
-            await processUserBurst(current, options.processUserOnce)
-          } catch (error) {
-            console.error(`[task-worker:${options.workerId}] user burst failed`, {
-              userId: current,
-              error,
-            })
+      for (const [userId, types] of userTypes) {
+        if (stopped) break
+        // Fair round-robin: give each type one burst at a time, rotating until
+        // all types are drained. This ensures no single type can starve another.
+        const activeTypes = new Set(TASK_TYPES.filter((t) => types.has(t)))
+
+        while (activeTypes.size > 0 && !stopped) {
+          for (const type of TASK_TYPES) {
+            if (!activeTypes.has(type)) continue
+            try {
+              const processed = await processUserTypeBurst(userId, type, options.processUserOnce)
+              if (processed === 0) {
+                activeTypes.delete(type)
+              }
+            } catch (error) {
+              console.error(`[task-worker:${options.workerId}] user type burst failed`, {
+                userId,
+                type,
+                error,
+              })
+              activeTypes.delete(type)
+            }
           }
         }
-      })
-      await Promise.all(workers)
+      }
     } catch (error) {
       console.error(`[task-worker:${options.workerId}] fallback scan failed`, error)
     }
@@ -278,16 +259,17 @@ async function runPgBossWorker(
   )
 
   await boss.work(TASK_DISPATCH_SCAN_QUEUE, { teamSize: 1 }, async () => {
-    const dueUsers = await findDueUsers(Math.max(64, getTaskWorkerConcurrency() * 8))
-    const slotByUser = new Map<string, number>()
-    for (const userId of dueUsers) {
-      const slotIndex = slotByUser.get(userId) ?? 0
-      slotByUser.set(userId, slotIndex + 1)
+    const dueRows = await findDueUserTypes(Math.max(64, getTaskWorkerConcurrency() * 8))
+    const slotByUserType = new Map<string, number>()
+    for (const { userId, type } of dueRows) {
+      const key = `${userId}:${type}`
+      const slotIndex = slotByUserType.get(key) ?? 0
+      slotByUserType.set(key, slotIndex + 1)
       await boss.send(
         TASK_USER_DISPATCH_QUEUE,
-        { userId, slotIndex },
+        { userId, type, slotIndex },
         {
-          singletonKey: `user:${userId}:slot:${slotIndex}`,
+          singletonKey: `user:${userId}:type:${type}:slot:${slotIndex}`,
           singletonSeconds: 30,
           retryLimit: 0,
         }
@@ -313,7 +295,10 @@ async function runPgBossWorker(
           console.warn(`[task-worker:${options.workerId}] skipped dispatch job with invalid payload`)
           continue
         }
-        await processUserBurst(userId, options.processUserOnce)
+        const type = rawData && typeof rawData === "object" && "type" in rawData
+          ? String((rawData as { type?: unknown }).type)
+          : undefined
+        await processUserTypeBurst(userId, type ?? "bulk_delete", options.processUserOnce)
       }
     }
   )

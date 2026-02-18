@@ -1,6 +1,7 @@
 import { prisma } from "@/lib/db"
 import type { Prisma } from "@prisma/client"
-import { buildThumbnailObjectKey, copyThumbnailObject, deleteThumbnailObjects, getThumbnailBucketName } from "@/lib/thumbnail-storage"
+import { buildThumbnailObjectKey, copyThumbnailInBucket, deleteThumbnailsFromBucket } from "@/lib/thumbnail-storage"
+import { getS3Client } from "@/lib/s3"
 import { buildTaskDedupeKey, createTaskExecutionPlan } from "@/lib/task-plans"
 
 export interface ThumbnailTaskPayload {
@@ -113,11 +114,14 @@ export async function deleteMediaThumbnailsForKeys(params: {
     new Set(rows.map((row) => row.thumbnailKey).filter((value): value is string => Boolean(value)))
   )
   let deletedObjects = 0
-  try {
-    await deleteThumbnailObjects(thumbnailKeys)
-    deletedObjects = thumbnailKeys.length
-  } catch {
-    deletedObjects = 0
+  if (thumbnailKeys.length > 0) {
+    try {
+      const { client } = await getS3Client(params.userId, params.credentialId)
+      await deleteThumbnailsFromBucket({ client, bucket: params.bucket, keys: thumbnailKeys })
+      deletedObjects = thumbnailKeys.length
+    } catch {
+      deletedObjects = 0
+    }
   }
 
   await prisma.mediaThumbnail.deleteMany({
@@ -136,21 +140,39 @@ export async function purgeMediaThumbnailsForUser(params: { userId: string }) {
     },
     select: {
       id: true,
+      credentialId: true,
+      bucket: true,
       thumbnailKey: true,
     },
   })
 
-  const thumbnailKeys = Array.from(
-    new Set(rows.map((row) => row.thumbnailKey).filter((value): value is string => Boolean(value)))
-  )
+  // Group thumbnail keys by (credentialId, bucket) so we use the right S3 client per group
+  const groups = new Map<string, { credentialId: string; bucket: string; thumbnailKeys: string[] }>()
+  for (const row of rows) {
+    if (!row.thumbnailKey) continue
+    const groupKey = `${row.credentialId}::${row.bucket}`
+    const group = groups.get(groupKey)
+    if (group) {
+      group.thumbnailKeys.push(row.thumbnailKey)
+    } else {
+      groups.set(groupKey, {
+        credentialId: row.credentialId,
+        bucket: row.bucket,
+        thumbnailKeys: [row.thumbnailKey],
+      })
+    }
+  }
 
   let deletedObjects = 0
-  if (thumbnailKeys.length > 0) {
+  for (const group of groups.values()) {
+    const uniqueKeys = Array.from(new Set(group.thumbnailKeys))
+    if (uniqueKeys.length === 0) continue
     try {
-      await deleteThumbnailObjects(thumbnailKeys)
-      deletedObjects = thumbnailKeys.length
+      const { client } = await getS3Client(params.userId, group.credentialId)
+      await deleteThumbnailsFromBucket({ client, bucket: group.bucket, keys: uniqueKeys })
+      deletedObjects += uniqueKeys.length
     } catch {
-      deletedObjects = 0
+      // Continue with other groups even if one fails
     }
   }
 
@@ -202,20 +224,13 @@ export async function moveMediaThumbnailForObject(params: {
   const sourceSize = existing.sourceSize ?? params.sourceSize
 
   const nextThumbnailKey = buildThumbnailObjectKey({
-    userId: params.userId,
-    credentialId: params.credentialId,
     bucket: params.toBucket,
     key: params.toKey,
     sourceLastModified,
     sourceSize,
   })
 
-  let thumbnailBucket: string | null = null
-  try {
-    thumbnailBucket = getThumbnailBucketName()
-  } catch {
-    thumbnailBucket = null
-  }
+  const thumbnailBucket = params.toBucket
 
   const updateBase = {
     bucket: params.toBucket,
@@ -245,9 +260,41 @@ export async function moveMediaThumbnailForObject(params: {
     return { moved: false, queued: true }
   }
 
+  // Cross-bucket moves require regeneration since thumbnails live in the source bucket
+  const sameBucket = params.fromBucket === params.toBucket
+  if (!sameBucket) {
+    // Delete old thumbnail from source bucket, queue regeneration in destination bucket
+    try {
+      const { client } = await getS3Client(params.userId, params.credentialId)
+      await deleteThumbnailsFromBucket({ client, bucket: params.fromBucket, keys: [existing.thumbnailKey] })
+    } catch {
+      // Best effort deletion
+    }
+
+    await prisma.mediaThumbnail.update({
+      where: { id: existing.id },
+      data: {
+        ...updateBase,
+        status: "pending",
+        thumbnailKey: nextThumbnailKey,
+        lastError: "Thumbnail moved to different bucket; requeued",
+      },
+    })
+
+    await queueThumbnailTasks(params.userId, [
+      {
+        credentialId: params.credentialId,
+        bucket: params.toBucket,
+        key: params.toKey,
+      },
+    ])
+    return { moved: false, queued: true }
+  }
+
   try {
-    await copyThumbnailObject(existing.thumbnailKey, nextThumbnailKey)
-    await deleteThumbnailObjects([existing.thumbnailKey])
+    const { client } = await getS3Client(params.userId, params.credentialId)
+    await copyThumbnailInBucket({ client, bucket: params.toBucket, oldKey: existing.thumbnailKey, newKey: nextThumbnailKey })
+    await deleteThumbnailsFromBucket({ client, bucket: params.toBucket, keys: [existing.thumbnailKey] })
 
     await prisma.mediaThumbnail.update({
       where: { id: existing.id },

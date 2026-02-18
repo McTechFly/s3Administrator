@@ -1,27 +1,22 @@
 import { createHash } from "node:crypto"
-import { S3Client, CopyObjectCommand, DeleteObjectsCommand, PutObjectCommand } from "@aws-sdk/client-s3"
+import { CopyObjectCommand, DeleteObjectsCommand, PutObjectCommand, type S3Client } from "@aws-sdk/client-s3"
 import { envVar } from "@/lib/env"
-import { quietAwsLogger } from "@/lib/aws-logger"
 
-let cachedThumbnailClient: S3Client | null = null
+export const THUMBNAIL_OBJECT_PREFIX = ".s3-admin-generated-thumbnails/"
+export const THUMBNAIL_SOURCE_LAST_MODIFIED_META_KEY = "s3admin-source-last-modified"
+export const THUMBNAIL_SOURCE_SIZE_META_KEY = "s3admin-source-size"
 
-function requireValue(name: string, value: string) {
-  const trimmed = value.trim()
-  if (!trimmed) {
-    throw new Error(`Missing required environment variable: ${name}`)
-  }
-  return trimmed
-}
-
-export function getThumbnailBucketName(): string {
-  return requireValue("THUMBNAIL_S3_BUCKET", envVar("THUMBNAIL_S3_BUCKET"))
+export function isThumbnailGenerationEnabled(): boolean {
+  const raw = envVar("THUMBNAIL_GENERATION_ENABLED").trim().toLowerCase()
+  if (!raw) return true // enabled by default in community edition
+  return raw === "true" || raw === "1" || raw === "yes"
 }
 
 export function getThumbnailUrlTtlSeconds(): number {
   const raw = envVar("THUMBNAIL_URL_TTL_SECONDS")
   const parsed = Number.parseInt(raw, 10)
-  if (!Number.isFinite(parsed) || parsed <= 0) return 3600
-  return Math.min(86400, parsed)
+  if (!Number.isFinite(parsed) || parsed <= 0) return 86400 // 24 hours — thumbnails are immutable
+  return Math.min(604800, parsed) // max 7 days
 }
 
 export function getThumbnailMaxWidth(): number {
@@ -31,78 +26,93 @@ export function getThumbnailMaxWidth(): number {
   return Math.min(2048, parsed)
 }
 
-export function getThumbnailStorageClient(): S3Client {
-  if (cachedThumbnailClient) {
-    return cachedThumbnailClient
-  }
-
-  const endpoint = requireValue("THUMBNAIL_S3_ENDPOINT", envVar("THUMBNAIL_S3_ENDPOINT"))
-  const region = requireValue("THUMBNAIL_S3_REGION", envVar("THUMBNAIL_S3_REGION"))
-  const accessKey = requireValue("THUMBNAIL_S3_ACCESS_KEY", envVar("THUMBNAIL_S3_ACCESS_KEY"))
-  const secretKey = requireValue("THUMBNAIL_S3_SECRET_KEY", envVar("THUMBNAIL_S3_SECRET_KEY"))
-
-  cachedThumbnailClient = new S3Client({
-    endpoint,
-    region,
-    credentials: {
-      accessKeyId: accessKey,
-      secretAccessKey: secretKey,
-    },
-    forcePathStyle: true,
-    logger: quietAwsLogger,
-  })
-
-  return cachedThumbnailClient
-}
-
 function sha256(input: string): string {
   return createHash("sha256").update(input).digest("hex")
 }
 
 export function buildThumbnailObjectKey(input: {
-  userId: string
-  credentialId: string
   bucket: string
   key: string
   sourceLastModified: Date
   sourceSize: bigint
 }): string {
-  const bucketHash = sha256(input.bucket).slice(0, 16)
-  const sourceHash = sha256(
-    `${input.key}|${input.sourceLastModified.toISOString()}|${input.sourceSize.toString()}`
-  )
-  return `thumb/v1/${input.userId}/${input.credentialId}/${bucketHash}/${sourceHash}.webp`
+  // Deterministic and credential-agnostic key so thumbnails can be reused after
+  // credential reconfiguration. Source fingerprint is stored in object metadata.
+  const hash = sha256(`v2|${input.bucket}|${input.key}`)
+  return `${THUMBNAIL_OBJECT_PREFIX}${hash}.webp`
 }
 
-export async function uploadThumbnailObject(params: {
+export function buildLegacyThumbnailObjectKey(input: {
+  bucket: string
+  key: string
+  sourceLastModified: Date
+  sourceSize: bigint
+}): string {
+  const hash = sha256(
+    `${input.bucket}|${input.key}|${input.sourceLastModified.toISOString()}|${input.sourceSize.toString()}`
+  )
+  return `${THUMBNAIL_OBJECT_PREFIX}${hash}.webp`
+}
+
+export function buildThumbnailSourceMetadata(input: {
+  sourceLastModified: Date
+  sourceSize: bigint
+}): Record<string, string> {
+  return {
+    [THUMBNAIL_SOURCE_LAST_MODIFIED_META_KEY]: input.sourceLastModified.toISOString(),
+    [THUMBNAIL_SOURCE_SIZE_META_KEY]: input.sourceSize.toString(),
+  }
+}
+
+export function doesThumbnailMetadataMatchSource(
+  metadata: Record<string, string> | undefined,
+  source: { sourceLastModified: Date; sourceSize: bigint }
+): boolean {
+  const sourceLastModified = metadata?.[THUMBNAIL_SOURCE_LAST_MODIFIED_META_KEY]
+  const sourceSize = metadata?.[THUMBNAIL_SOURCE_SIZE_META_KEY]
+
+  if (!sourceLastModified || !sourceSize) {
+    return false
+  }
+
+  return (
+    sourceLastModified === source.sourceLastModified.toISOString() &&
+    sourceSize === source.sourceSize.toString()
+  )
+}
+
+export async function uploadThumbnailToSameBucket(params: {
+  client: S3Client
+  bucket: string
   key: string
   body: Buffer
   contentType?: string
+  metadata?: Record<string, string>
 }) {
-  const client = getThumbnailStorageClient()
-  const bucket = getThumbnailBucketName()
-  await client.send(
+  await params.client.send(
     new PutObjectCommand({
-      Bucket: bucket,
+      Bucket: params.bucket,
       Key: params.key,
       Body: params.body,
       ContentType: params.contentType ?? "image/webp",
       CacheControl: "public, max-age=31536000, immutable",
+      Metadata: params.metadata,
     })
   )
 }
 
-export async function deleteThumbnailObjects(keys: string[]) {
-  if (keys.length === 0) return
+export async function deleteThumbnailsFromBucket(params: {
+  client: S3Client
+  bucket: string
+  keys: string[]
+}) {
+  if (params.keys.length === 0) return
 
-  const client = getThumbnailStorageClient()
-  const bucket = getThumbnailBucketName()
-
-  for (let i = 0; i < keys.length; i += 1000) {
-    const batch = keys.slice(i, i + 1000)
-    await client.send(
+  for (let i = 0; i < params.keys.length; i += 1000) {
+    const batch = params.keys.slice(i, i + 1000)
+    await params.client.send(
       new DeleteObjectsCommand({
-        Bucket: bucket,
+        Bucket: params.bucket,
         Delete: {
           Objects: batch.map((Key) => ({ Key })),
           Quiet: true,
@@ -112,15 +122,17 @@ export async function deleteThumbnailObjects(keys: string[]) {
   }
 }
 
-export async function copyThumbnailObject(oldKey: string, newKey: string) {
-  const client = getThumbnailStorageClient()
-  const bucket = getThumbnailBucketName()
-
-  await client.send(
+export async function copyThumbnailInBucket(params: {
+  client: S3Client
+  bucket: string
+  oldKey: string
+  newKey: string
+}) {
+  await params.client.send(
     new CopyObjectCommand({
-      Bucket: bucket,
-      Key: newKey,
-      CopySource: encodeURIComponent(`${bucket}/${oldKey}`),
+      Bucket: params.bucket,
+      Key: params.newKey,
+      CopySource: encodeURIComponent(`${params.bucket}/${params.oldKey}`),
       CacheControl: "public, max-age=31536000, immutable",
       MetadataDirective: "REPLACE",
       ContentType: "image/webp",

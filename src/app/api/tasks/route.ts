@@ -21,8 +21,10 @@ export async function GET(request: NextRequest) {
     }
 
     const scope = request.nextUrl.searchParams.get("scope") ?? "ongoing"
+    const typeParam = request.nextUrl.searchParams.get("type")
     const limitRaw = Number(request.nextUrl.searchParams.get("limit") ?? "8")
-    const limit = Number.isFinite(limitRaw) ? Math.min(50, Math.max(1, Math.floor(limitRaw))) : 8
+    const limitCap = typeParam ? 200 : 50
+    const limit = Number.isFinite(limitRaw) ? Math.min(limitCap, Math.max(1, Math.floor(limitRaw))) : 8
 
     const statuses: TaskStatus[] =
       scope === "history"
@@ -31,6 +33,11 @@ export async function GET(request: NextRequest) {
           ? ["pending", "in_progress", "completed", "failed"]
           : ["pending", "in_progress", "failed"]
 
+    const ALLOWED_TYPES = new Set(["thumbnail_generate", "bulk_delete", "object_transfer"])
+    const typeFilter = typeParam
+      ? typeParam.split(",").filter((t) => ALLOWED_TYPES.has(t))
+      : undefined
+
     const [tasks, cachedFiles, totalVideoFiles, readyThumbnails, pendingThumbnails, failedThumbnails] = await Promise.all([
       prisma.backgroundTask.findMany({
         where: {
@@ -38,6 +45,9 @@ export async function GET(request: NextRequest) {
           status: {
             in: statuses,
           },
+          ...(typeFilter && typeFilter.length > 0
+            ? { type: { in: typeFilter } }
+            : { type: { not: "thumbnail_generate" } }),
         },
         orderBy: [
           {
