@@ -255,8 +255,11 @@ export async function GET() {
         multipartIncompleteSize: multipartTypeAggregates.get(type)?.totalSize ?? 0,
       }))
       .sort((a, b) => {
-        if (b.fileCount !== a.fileCount) return b.fileCount - a.fileCount
+        if (b.multipartIncompleteSize !== a.multipartIncompleteSize) {
+          return b.multipartIncompleteSize - a.multipartIncompleteSize
+        }
         if (b.totalSize !== a.totalSize) return b.totalSize - a.totalSize
+        if (b.fileCount !== a.fileCount) return b.fileCount - a.fileCount
         return TYPE_KEYS.indexOf(a.type) - TYPE_KEYS.indexOf(b.type)
       })
 
