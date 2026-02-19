@@ -48,19 +48,6 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Failed to resolve plan entitlements" }, { status: 403 })
     }
 
-    if (items.length > 1 && !entitlements.multipleUpload) {
-      return NextResponse.json(
-        {
-          error: "Multiple upload finalize is disabled for the current plan",
-          details: {
-            plan: entitlements.slug,
-            planSource: entitlements.source,
-          },
-        },
-        { status: 403 }
-      )
-    }
-
     const { credential } = await getS3Client(session.user.id, credentialId)
     const bucketLimitViolation = await getBucketLimitViolation({
       userId: session.user.id,

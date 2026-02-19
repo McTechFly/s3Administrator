@@ -31,9 +31,6 @@ import {
 } from "@/lib/thumbnail-storage"
 import { deleteMediaThumbnailsForKeys } from "@/lib/media-thumbnails"
 import { isThumbnailCacheEnabledForUser } from "@/lib/thumbnail-cache-policy"
-import {
-  getObjectTransferDisabledMessage,
-} from "@/lib/transfer-task-policy"
 import { logUserAuditAction } from "@/lib/audit-logger"
 import {
   getTaskEngineInternalToken,
@@ -113,43 +110,6 @@ interface ObjectTransferTaskProgress {
   failed: number
   remaining: number
   cursorKey: string | null
-}
-
-function getTransferOperationDisabledMessage(
-  scope: TransferScope,
-  operation: TransferOperation
-): string {
-  if (operation === "sync") {
-    return "Sync tasks are disabled for the current plan"
-  }
-  if (scope === "folder" && (operation === "copy" || operation === "move")) {
-    return "Folder transfer tasks are disabled for the current plan"
-  }
-  if (scope === "bucket" && (operation === "copy" || operation === "migrate")) {
-    return "Bucket transfer tasks are disabled for the current plan"
-  }
-  return "Transfer operation is disabled for the current plan"
-}
-
-function isTransferOperationEnabledByPlan(
-  entitlements: {
-    syncTasks: boolean
-    copyFolderToFolder: boolean
-    copyBucketToBucket: boolean
-  },
-  scope: TransferScope,
-  operation: TransferOperation
-): boolean {
-  if (operation === "sync") {
-    return entitlements.syncTasks
-  }
-  if (scope === "folder" && (operation === "copy" || operation === "move")) {
-    return entitlements.copyFolderToFolder
-  }
-  if (scope === "bucket" && (operation === "copy" || operation === "migrate")) {
-    return entitlements.copyBucketToBucket
-  }
-  return false
 }
 
 function parsePayload(raw: unknown): BulkDeleteTaskPayload | null {
@@ -1511,7 +1471,7 @@ export async function POST(request: Request) {
       }
 
       const entitlements = await getUserPlanEntitlements(actorUserId)
-      if (!entitlements || !entitlements.transferTasks) {
+      if (!entitlements) {
         await prisma.backgroundTask.update({
           where: { id: candidate.id },
           data: {
@@ -1519,56 +1479,14 @@ export async function POST(request: Request) {
             attempts: candidate.attempts + 1,
             completedAt: new Date(),
             nextRunAt: new Date(),
-            lastError: getObjectTransferDisabledMessage(),
+            lastError: "Failed to resolve plan entitlements",
             executionHistory: addTaskHistoryEntry(taskExecutionHistory, {
               status: "failed",
-              message: getObjectTransferDisabledMessage(),
+              message: "Failed to resolve plan entitlements",
             }),
           },
         })
-
-        return NextResponse.json({
-          processed: true,
-          taskId: candidate.id,
-          done: true,
-          type: "object_transfer",
-          skipped: "transfer_disabled_for_plan",
-        })
-      }
-
-      if (
-        !isTransferOperationEnabledByPlan(
-          entitlements,
-          transferPayload.scope,
-          transferPayload.operation
-        )
-      ) {
-        const message = getTransferOperationDisabledMessage(
-          transferPayload.scope,
-          transferPayload.operation
-        )
-        await prisma.backgroundTask.update({
-          where: { id: candidate.id },
-          data: {
-            status: "failed",
-            attempts: candidate.attempts + 1,
-            completedAt: new Date(),
-            nextRunAt: new Date(),
-            lastError: message,
-            executionHistory: addTaskHistoryEntry(taskExecutionHistory, {
-              status: "failed",
-              message,
-            }),
-          },
-        })
-
-        return NextResponse.json({
-          processed: true,
-          taskId: candidate.id,
-          done: true,
-          type: "object_transfer",
-          skipped: "operation_disabled_for_plan",
-        })
+        return NextResponse.json({ processed: false, message: "Failed to resolve plan entitlements" })
       }
 
       const destinationContextChanged =
@@ -2148,31 +2066,6 @@ export async function POST(request: Request) {
         },
       })
       return NextResponse.json({ processed: false, message: "Invalid task payload" })
-    }
-
-    const searchEntitlements = await getUserPlanEntitlements(actorUserId)
-    if (!searchEntitlements?.searchAllFiles) {
-      await prisma.backgroundTask.update({
-        where: { id: candidate.id },
-        data: {
-          status: "failed",
-          attempts: candidate.attempts + 1,
-          lastError: "Bulk delete via search is disabled for the current plan",
-          completedAt: new Date(),
-          nextRunAt: new Date(),
-          executionHistory: addTaskHistoryEntry(taskExecutionHistory, {
-            status: "failed",
-            message: "Bulk delete via search is disabled for the current plan",
-          }),
-        },
-      })
-      return NextResponse.json({
-        processed: true,
-        taskId: candidate.id,
-        done: true,
-        type: "bulk_delete",
-        skipped: "search_disabled_for_plan",
-      })
     }
 
     const whereClause = buildFileSearchSqlWhereClause({

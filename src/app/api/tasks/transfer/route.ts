@@ -5,9 +5,6 @@ import { prisma } from "@/lib/db"
 import { getS3Client } from "@/lib/s3"
 import { getUserPlanEntitlements } from "@/lib/plan-entitlements"
 import { getBucketLimitViolation } from "@/lib/plan-limits"
-import {
-  getObjectTransferDisabledMessage,
-} from "@/lib/transfer-task-policy"
 import { transferTaskSchema } from "@/lib/validations"
 import { rateLimitByUser, rateLimitResponse } from "@/lib/rate-limit"
 import { buildTaskDedupeKey, createTaskExecutionPlan } from "@/lib/task-plans"
@@ -32,36 +29,6 @@ function isOperationAllowed(scope: TransferScope, operation: TransferOperation):
     return operation === "sync" || operation === "copy" || operation === "move"
   }
   return operation === "sync" || operation === "copy" || operation === "migrate"
-}
-
-function getOperationDisabledMessage(scope: TransferScope, operation: TransferOperation): string | null {
-  if (operation === "sync") {
-    return "Sync tasks are disabled for the current plan"
-  }
-  if (scope === "folder" && (operation === "copy" || operation === "move")) {
-    return "Folder transfer tasks are disabled for the current plan"
-  }
-  if (scope === "bucket" && (operation === "copy" || operation === "migrate")) {
-    return "Bucket transfer tasks are disabled for the current plan"
-  }
-  return null
-}
-
-function isOperationEnabledByPlan(
-  entitlements: NonNullable<Awaited<ReturnType<typeof getUserPlanEntitlements>>>,
-  scope: TransferScope,
-  operation: TransferOperation
-): boolean {
-  if (operation === "sync") {
-    return entitlements.syncTasks
-  }
-  if (scope === "folder" && (operation === "copy" || operation === "move")) {
-    return entitlements.copyFolderToFolder
-  }
-  if (scope === "bucket" && (operation === "copy" || operation === "migrate")) {
-    return entitlements.copyBucketToBucket
-  }
-  return false
 }
 
 interface TransferTaskPreview {
@@ -646,15 +613,9 @@ export async function POST(request: NextRequest) {
     }
 
     const entitlements = await getUserPlanEntitlements(session.user.id)
-    if (!entitlements || !entitlements.transferTasks) {
+    if (!entitlements) {
       return NextResponse.json(
-        {
-          error: getObjectTransferDisabledMessage(),
-          details: {
-            plan: entitlements?.slug ?? "free",
-            planSource: entitlements?.source ?? "default",
-          },
-        },
+        { error: "Failed to resolve plan entitlements" },
         { status: 403 }
       )
     }
@@ -696,21 +657,6 @@ export async function POST(request: NextRequest) {
       return NextResponse.json(
         { error: `Operation '${operation}' is not allowed for scope '${scope}'` },
         { status: 400 }
-      )
-    }
-
-    if (!isOperationEnabledByPlan(entitlements, scope, operation)) {
-      return NextResponse.json(
-        {
-          error: getOperationDisabledMessage(scope, operation) ?? "Transfer operation is disabled for the current plan",
-          details: {
-            plan: entitlements.slug,
-            planSource: entitlements.source,
-            scope,
-            operation,
-          },
-        },
-        { status: 403 }
       )
     }
 
