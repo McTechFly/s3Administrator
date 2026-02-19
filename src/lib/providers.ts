@@ -2,10 +2,10 @@
  * S3 Provider Configuration
  *
  * Defines supported S3 providers with their regions, endpoints, and defaults.
- * Supports AWS S3, Hetzner Object Storage, Cloudflare R2, MinIO, and generic S3-compatible services.
+ * Supports AWS S3, Hetzner Object Storage, Cloudflare R2, Storadera, MinIO, and generic S3-compatible services.
  */
 
-export type Provider = 'AWS' | 'HETZNER' | 'CLOUDFLARE_R2' | 'MINIO' | 'GENERIC'
+export type Provider = 'AWS' | 'HETZNER' | 'CLOUDFLARE_R2' | 'STORADERA' | 'MINIO' | 'GENERIC'
 
 export interface ProviderConfig {
   name: string
@@ -52,6 +52,14 @@ export const PROVIDERS: Record<Provider, ProviderConfig> = {
     defaultRegion: 'auto',
     helpText:
       'Replace {accountId} with your Cloudflare Account ID. Use Auto region for global distribution.',
+  },
+  STORADERA: {
+    name: 'Storadera',
+    regions: ['finland', 'eu-central-1', 'eu-east-1'],
+    endpoint: 'https://s3.{region}.storadera.com',
+    defaultRegion: 'finland',
+    helpText:
+      'Choose a Storadera region. Endpoint host differs by region and is auto-filled when selected.',
   },
   MINIO: {
     name: 'MinIO',

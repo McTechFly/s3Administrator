@@ -37,6 +37,16 @@ export function normalizeS3Endpoint(endpoint: string): string {
   return parsed.toString().replace(/\/+$/, "")
 }
 
+/**
+ * Providers whose S3-compatible API uses a fixed signing region
+ * regardless of the regional endpoint URL selected by the user.
+ * The region the user chose is still stored and used for endpoint
+ * construction, but the SDK signing region must be overridden.
+ */
+const FIXED_SIGNING_REGION_PROVIDERS: Record<string, string> = {
+  STORADERA: "us-east-1",
+}
+
 export function normalizeS3Region(provider: string, region: string | null | undefined): string {
   const normalizedRegion = region?.trim() ?? ""
   if (normalizedRegion) return normalizedRegion
@@ -47,6 +57,16 @@ export function normalizeS3Region(provider: string, region: string | null | unde
   }
 
   throw new Error("Region is required for this provider")
+}
+
+/**
+ * Return the signing region the SDK should use.
+ * Some S3-compatible providers ignore the region in SigV4 and always
+ * expect a fixed value (typically "us-east-1").
+ */
+export function getSigningRegion(provider: string, region: string): string {
+  const override = FIXED_SIGNING_REGION_PROVIDERS[provider.trim().toUpperCase()]
+  return override ?? region
 }
 
 export function createS3ClientFromConfig(config: {
@@ -62,14 +82,19 @@ export function createS3ClientFromConfig(config: {
 } {
   const endpoint = normalizeS3Endpoint(config.endpoint)
   const region = normalizeS3Region(config.provider, config.region)
+  const signingRegion = getSigningRegion(config.provider, region)
   const client = new S3Client({
     endpoint,
-    region,
+    region: signingRegion,
     credentials: {
       accessKeyId: config.accessKeyId,
       secretAccessKey: config.secretAccessKey,
     },
     forcePathStyle: true,
+    // S3-compatible providers may reject optional checksum features on presigned GET URLs.
+    // Keep checksum behavior to required-only for broad compatibility.
+    requestChecksumCalculation: "WHEN_REQUIRED",
+    responseChecksumValidation: "WHEN_REQUIRED",
     logger: quietAwsLogger,
   })
 

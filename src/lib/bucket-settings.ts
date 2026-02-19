@@ -20,6 +20,8 @@ const DEFAULT_CORS_METHODS = ["GET", "HEAD", "PUT", "POST", "DELETE"]
 const DEFAULT_CORS_HEADERS = ["*"]
 const DEFAULT_EXPOSE_HEADERS = ["ETag", "x-amz-request-id", "x-amz-id-2", "x-amz-version-id"]
 const DEFAULT_MAX_AGE_SECONDS = 3600
+const STORADERA_CORS_UNSUPPORTED_REASON = "CORS is not supported by Storadera"
+const STORADERA_LIFECYCLE_UNSUPPORTED_REASON = "Lifecycle rules are not supported by Storadera"
 
 type BucketSettingName = "cors" | "versioning" | "lifecycle"
 
@@ -72,6 +74,27 @@ export interface BucketSettingsSnapshot {
     versioning: BucketVersioningSettings
     lifecycle: BucketLifecycleSettings
   }
+}
+
+function getProviderCapabilityOverride(
+  provider: Provider,
+  setting: BucketSettingName
+): BucketSettingCapability | null {
+  if (provider === "STORADERA" && setting === "cors") {
+    return {
+      supported: false,
+      reason: STORADERA_CORS_UNSUPPORTED_REASON,
+    }
+  }
+
+  if (provider === "STORADERA" && setting === "lifecycle") {
+    return {
+      supported: false,
+      reason: STORADERA_LIFECYCLE_UNSUPPORTED_REASON,
+    }
+  }
+
+  return null
 }
 
 function toUniqueStrings(values: Array<string | undefined> | undefined): string[] {
@@ -151,6 +174,14 @@ function classifyBucketSettingError(
   provider: Provider,
   setting: BucketSettingName
 ): ErrorClassification {
+  const providerCapabilityOverride = getProviderCapabilityOverride(provider, setting)
+  if (providerCapabilityOverride && !providerCapabilityOverride.supported) {
+    return {
+      kind: "unsupported",
+      reason: providerCapabilityOverride.reason ?? "Not supported by this provider/API",
+    }
+  }
+
   const details = readErrorDetails(error)
   const normalizedMessage = details.message.toLowerCase()
 
@@ -227,6 +258,13 @@ async function readCorsSettings(params: {
   provider: Provider
 }): Promise<{ capability: BucketSettingCapability; settings: BucketCorsSettings }> {
   const fallback = defaultCorsSettings()
+  const providerCapabilityOverride = getProviderCapabilityOverride(params.provider, "cors")
+  if (providerCapabilityOverride) {
+    return {
+      capability: providerCapabilityOverride,
+      settings: fallback,
+    }
+  }
 
   try {
     const response = await params.client.send(
@@ -323,6 +361,13 @@ async function readLifecycleSettings(params: {
   const fallback: BucketLifecycleSettings = {
     enabled: false,
     expirationDays: null,
+  }
+  const providerCapabilityOverride = getProviderCapabilityOverride(params.provider, "lifecycle")
+  if (providerCapabilityOverride) {
+    return {
+      capability: providerCapabilityOverride,
+      settings: fallback,
+    }
   }
 
   try {

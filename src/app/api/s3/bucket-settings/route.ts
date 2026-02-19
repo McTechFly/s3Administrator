@@ -18,6 +18,7 @@ const KNOWN_PROVIDERS = new Set<Provider>([
   "AWS",
   "HETZNER",
   "CLOUDFLARE_R2",
+  "STORADERA",
   "MINIO",
   "GENERIC",
 ])

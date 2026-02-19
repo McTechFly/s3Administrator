@@ -12,6 +12,10 @@ const UPLOAD_CORS_RULE_ID = "s3-admin-browser-upload"
 const REQUIRED_METHODS = ["GET", "HEAD", "PUT", "POST", "DELETE"]
 const REQUIRED_EXPOSE_HEADERS = ["ETag", "x-amz-request-id", "x-amz-id-2", "x-amz-version-id"]
 
+function isCorsUnsupportedProvider(provider: string): boolean {
+  return provider.trim().toUpperCase() === "STORADERA"
+}
+
 function normalizeOrigin(value: string): string {
   return value.trim().replace(/\/+$/, "")
 }
@@ -63,7 +67,13 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "origin is required" }, { status: 400 })
     }
 
-    const { client } = await getS3Client(session.user.id, credentialId)
+    const { client, credential } = await getS3Client(session.user.id, credentialId)
+    if (isCorsUnsupportedProvider(credential.provider)) {
+      return NextResponse.json(
+        { error: "Bucket CORS is not supported by this provider" },
+        { status: 409 }
+      )
+    }
 
     let existingRules: CORSRule[] = []
     try {

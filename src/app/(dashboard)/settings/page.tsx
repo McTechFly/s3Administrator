@@ -308,6 +308,13 @@ export default function SettingsPage() {
       endpoint = endpoint.replace("{region}", region)
     } else if (selectedProvider === "HETZNER") {
       endpoint = endpoint.replace("{region}", region)
+    } else if (selectedProvider === "STORADERA") {
+      const storaderaRegionEndpoints: Record<string, string> = {
+        finland: "s3.finland.storadera.com",
+        "eu-central-1": "s3.eu-central-1.storadera.com",
+        "eu-east-1": "eu-east-1.s3.storadera.com",
+      }
+      endpoint = storaderaRegionEndpoints[region] ?? endpoint.replace("{region}", region)
     } else if (selectedProvider === "MINIO") {
       endpoint = "http://localhost:9000"
     }

@@ -23,7 +23,14 @@ export const s3OperationSchema = z.object({
   credentialId: z.string().optional(),
 })
 
-const credentialProviderSchema = z.enum(["AWS", "HETZNER", "CLOUDFLARE_R2", "MINIO", "GENERIC"])
+const credentialProviderSchema = z.enum([
+  "AWS",
+  "HETZNER",
+  "CLOUDFLARE_R2",
+  "STORADERA",
+  "MINIO",
+  "GENERIC",
+])
 
 const credentialRegionSchema = z.preprocess(
   (value) =>
