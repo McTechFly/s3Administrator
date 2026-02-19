@@ -118,6 +118,7 @@ export async function GET(request: NextRequest) {
 
     const { client, credential } = await getS3Client(session.user.id, credentialId)
     const ttlSeconds = getThumbnailUrlTtlSeconds()
+    const isStoradera = credential.provider.trim().toUpperCase() === "STORADERA"
 
     const allEntries = await prisma.fileMetadata.findMany({
       where: {
@@ -295,42 +296,56 @@ export async function GET(request: NextRequest) {
 
         let previewUrl: string | null = null
 
-        if (
-          candidate.thumbnailStatus === "ready" &&
-          candidate.thumbnailKey
-        ) {
-          // Use the generated thumbnail (same bucket) for both images and videos
-          try {
-            previewUrl = await getSignedUrl(
-              client,
-              new GetObjectCommand({
-                Bucket: bucket,
-                Key: candidate.thumbnailKey,
-                ResponseContentDisposition: "inline",
-                ResponseCacheControl: `public, max-age=${ttlSeconds}`,
-              }),
-              { expiresIn: ttlSeconds }
-            )
-          } catch {
-            previewUrl = null
+        if (isStoradera) {
+          // Storadera does not support presigned URLs; use the preview proxy
+          const proxyKey = (candidate.thumbnailStatus === "ready" && candidate.thumbnailKey)
+            ? candidate.thumbnailKey
+            : (!candidate.isVideo ? candidate.key : null)
+          if (proxyKey) {
+            const params = new URLSearchParams({ bucket, key: proxyKey })
+            if (credentialId) {
+              params.set("credentialId", credentialId)
+            }
+            previewUrl = `/api/s3/preview/proxy?${params.toString()}`
           }
-        }
+        } else {
+          if (
+            candidate.thumbnailStatus === "ready" &&
+            candidate.thumbnailKey
+          ) {
+            // Use the generated thumbnail (same bucket) for both images and videos
+            try {
+              previewUrl = await getSignedUrl(
+                client,
+                new GetObjectCommand({
+                  Bucket: bucket,
+                  Key: candidate.thumbnailKey,
+                  ResponseContentDisposition: "inline",
+                  ResponseCacheControl: `public, max-age=${ttlSeconds}`,
+                }),
+                { expiresIn: ttlSeconds }
+              )
+            } catch {
+              previewUrl = null
+            }
+          }
 
-        // For images without a ready thumbnail, always fall back to the original
-        if (!previewUrl && !candidate.isVideo) {
-          try {
-            previewUrl = await getSignedUrl(
-              client,
-              new GetObjectCommand({
-                Bucket: bucket,
-                Key: candidate.key,
-                ResponseContentDisposition: "inline",
-                ResponseCacheControl: `public, max-age=${ttlSeconds}`,
-              }),
-              { expiresIn: ttlSeconds }
-            )
-          } catch {
-            previewUrl = null
+          // For images without a ready thumbnail, always fall back to the original
+          if (!previewUrl && !candidate.isVideo) {
+            try {
+              previewUrl = await getSignedUrl(
+                client,
+                new GetObjectCommand({
+                  Bucket: bucket,
+                  Key: candidate.key,
+                  ResponseContentDisposition: "inline",
+                  ResponseCacheControl: `public, max-age=${ttlSeconds}`,
+                }),
+                { expiresIn: ttlSeconds }
+              )
+            } catch {
+              previewUrl = null
+            }
           }
         }
 

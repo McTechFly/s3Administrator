@@ -45,23 +45,40 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    const { client } = await getS3Client(session.user.id, credentialId)
+    const { client, credential } = await getS3Client(session.user.id, credentialId)
+    const isStoradera = credential.provider.trim().toUpperCase() === "STORADERA"
 
-    const urls = await Promise.all(
-      normalizedParts.map(async (partNumber) => {
-        const url = await getSignedUrl(
-          client,
-          new UploadPartCommand({
-            Bucket: bucket,
-            Key: key,
-            UploadId: uploadId,
-            PartNumber: partNumber,
-          }),
-          { expiresIn: 3600 }
-        )
-        return { partNumber, url }
+    let urls: Array<{ partNumber: number; url: string }>
+    if (isStoradera) {
+      urls = normalizedParts.map((partNumber) => {
+        const params = new URLSearchParams({
+          bucket,
+          key,
+          uploadId,
+          partNumber: String(partNumber),
+        })
+        if (credentialId) {
+          params.set("credentialId", credentialId)
+        }
+        return { partNumber, url: `/api/s3/upload/multipart/part-proxy?${params.toString()}` }
       })
-    )
+    } else {
+      urls = await Promise.all(
+        normalizedParts.map(async (partNumber) => {
+          const url = await getSignedUrl(
+            client,
+            new UploadPartCommand({
+              Bucket: bucket,
+              Key: key,
+              UploadId: uploadId,
+              PartNumber: partNumber,
+            }),
+            { expiresIn: 3600 }
+          )
+          return { partNumber, url }
+        })
+      )
+    }
 
     return NextResponse.json({ urls })
   } catch (error) {

@@ -9,6 +9,12 @@ const nextConfig: NextConfig = {
     "@s3administrator/audit",
     "@s3administrator/marketing",
   ],
+  experimental: {
+    // Storadera (and potentially other S3-compatible providers) require
+    // proxy uploads where multipart chunks pass through the server.
+    // Default is 10 MB which truncates larger chunks silently.
+    proxyClientMaxBodySize: "200mb",
+  },
 }
 
 export default nextConfig

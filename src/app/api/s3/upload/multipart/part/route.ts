@@ -29,18 +29,33 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    const { client } = await getS3Client(session.user.id, credentialId)
+    const { client, credential } = await getS3Client(session.user.id, credentialId)
+    const isStoradera = credential.provider.trim().toUpperCase() === "STORADERA"
 
-    const url = await getSignedUrl(
-      client,
-      new UploadPartCommand({
-        Bucket: bucket,
-        Key: key,
-        UploadId: uploadId,
-        PartNumber: normalizedPartNumber,
-      }),
-      { expiresIn: 3600 }
-    )
+    let url: string
+    if (isStoradera) {
+      const params = new URLSearchParams({
+        bucket,
+        key,
+        uploadId,
+        partNumber: String(normalizedPartNumber),
+      })
+      if (credentialId) {
+        params.set("credentialId", credentialId)
+      }
+      url = `/api/s3/upload/multipart/part-proxy?${params.toString()}`
+    } else {
+      url = await getSignedUrl(
+        client,
+        new UploadPartCommand({
+          Bucket: bucket,
+          Key: key,
+          UploadId: uploadId,
+          PartNumber: normalizedPartNumber,
+        }),
+        { expiresIn: 3600 }
+      )
+    }
 
     return NextResponse.json({ url })
   } catch (error) {

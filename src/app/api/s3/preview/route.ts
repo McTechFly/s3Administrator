@@ -40,17 +40,27 @@ export async function POST(request: NextRequest) {
     auditKey = key
     const { client, credential } = await getS3Client(session.user.id, credentialId)
     const ttlSeconds = getThumbnailUrlTtlSeconds()
+    const isStoradera = credential.provider.trim().toUpperCase() === "STORADERA"
 
-    const url = await getSignedUrl(
-      client,
-      new GetObjectCommand({
-        Bucket: bucket,
-        Key: key,
-        ResponseContentDisposition: "inline",
-        ResponseCacheControl: `public, max-age=${ttlSeconds}`,
-      }),
-      { expiresIn: ttlSeconds }
-    )
+    let url: string
+    if (isStoradera) {
+      const params = new URLSearchParams({ bucket, key })
+      if (credentialId) {
+        params.set("credentialId", credentialId)
+      }
+      url = `/api/s3/preview/proxy?${params.toString()}`
+    } else {
+      url = await getSignedUrl(
+        client,
+        new GetObjectCommand({
+          Bucket: bucket,
+          Key: key,
+          ResponseContentDisposition: "inline",
+          ResponseCacheControl: `public, max-age=${ttlSeconds}`,
+        }),
+        { expiresIn: ttlSeconds }
+      )
+    }
 
     await logUserAuditAction({
       userId: session.user.id,

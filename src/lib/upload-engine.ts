@@ -167,6 +167,16 @@ export class UploadEngine {
         await this.completeMultipartUpload()
       }
     } catch (error) {
+      if (!this.abortRequested && isCorsLikeError(error)) {
+        try {
+          await this.cleanupMultipartForFallback()
+          await this.uploadSinglePut()
+          return
+        } catch (fallbackError) {
+          error = fallbackError
+        }
+      }
+
       if (!this.abortRequested) {
         this.setState("error")
         this.config.callbacks.onError(
@@ -216,6 +226,16 @@ export class UploadEngine {
         await this.completeMultipartUpload()
       }
     } catch (error) {
+      if (!this.abortRequested && isCorsLikeError(error)) {
+        try {
+          await this.cleanupMultipartForFallback()
+          await this.uploadSinglePut()
+          return
+        } catch (fallbackError) {
+          error = fallbackError
+        }
+      }
+
       if (!this.abortRequested) {
         this.setState("error")
         this.config.callbacks.onError(
@@ -297,6 +317,32 @@ export class UploadEngine {
         }),
       }).catch(() => {})
     }
+  }
+
+  private async cleanupMultipartForFallback(): Promise<void> {
+    if (!this.uploadId) {
+      return
+    }
+
+    const uploadId = this.uploadId
+    removeUploadState(uploadId)
+
+    await fetch("/api/s3/upload/multipart/abort", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        bucket: this.config.bucket,
+        key: this.config.key,
+        credentialId: this.config.credentialId,
+        uploadId,
+      }),
+    }).catch(() => {})
+
+    this.uploadId = null
+    this.completedParts.clear()
+    this.inFlightProgress.clear()
+    this.urlCache.clear()
+    this.emitProgress()
   }
 
   getState(): UploadState {
@@ -545,6 +591,9 @@ export class UploadEngine {
           this.persistState()
           return
         }
+
+        // ETag missing — treat as a retryable error
+        throw new Error("Upload succeeded but ETag is missing from response")
       } catch (error) {
         this.inFlightProgress.delete(partNumber)
 
@@ -653,7 +702,17 @@ export class UploadEngine {
       xhr.onload = () => {
         this.activeXHRs.delete(xhr)
         if (xhr.status >= 200 && xhr.status < 300) {
-          resolve(xhr.getResponseHeader("ETag"))
+          // Read ETag from header first; fall back to JSON body for proxy routes
+          let etag = xhr.getResponseHeader("ETag")
+          if (!etag && xhr.responseText) {
+            try {
+              const body = JSON.parse(xhr.responseText) as { ETag?: string }
+              if (body.ETag) etag = body.ETag
+            } catch {
+              // not JSON, ignore
+            }
+          }
+          resolve(etag)
         } else if (xhr.status === 0) {
           reject(
             new Error(

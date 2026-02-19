@@ -188,6 +188,7 @@ export async function listAllMultipartUploads(
     const response = await client.send(
       new ListMultipartUploadsCommand({
         Bucket: bucket,
+        MaxUploads: 1000,
         KeyMarker: keyMarker,
         UploadIdMarker: uploadIdMarker,
       })
@@ -243,6 +244,7 @@ async function listMultipartUploadsPage(
     const response = await client.send(
       new ListMultipartUploadsCommand({
         Bucket: bucket,
+        MaxUploads: 1000,
         KeyMarker: keyMarker,
         UploadIdMarker: uploadIdMarker,
       })
@@ -327,16 +329,29 @@ export async function listAllPartsForUpload(
         Bucket: bucket,
         Key: key,
         UploadId: uploadId,
+        MaxParts: 1000,
         PartNumberMarker: partNumberMarker,
       })
     )
 
     for (const part of response.Parts ?? []) {
-      if (typeof part.PartNumber !== "number") continue
-      if (typeof part.Size !== "number") continue
+      const partNumber = typeof part.PartNumber === "number"
+        ? part.PartNumber
+        : typeof part.PartNumber === "string"
+          ? Number(part.PartNumber)
+          : NaN
+      if (!Number.isFinite(partNumber) || partNumber < 1) continue
+
+      const size = typeof part.Size === "number"
+        ? part.Size
+        : typeof part.Size === "string" || typeof part.Size === "bigint"
+          ? Number(part.Size)
+          : NaN
+      if (!Number.isFinite(size)) continue
+
       parts.push({
-        partNumber: part.PartNumber,
-        size: Math.max(0, part.Size),
+        partNumber,
+        size: Math.max(0, size),
       })
     }
 
@@ -344,17 +359,23 @@ export async function listAllPartsForUpload(
       break
     }
 
-    if (
-      typeof response.NextPartNumberMarker !== "string" ||
-      response.NextPartNumberMarker.length === 0
-    ) {
+    // Some S3-compatible providers return NextPartNumberMarker as a number
+    const rawNextMarker = response.NextPartNumberMarker
+    const nextMarkerStr =
+      typeof rawNextMarker === "string" && rawNextMarker.length > 0
+        ? rawNextMarker
+        : typeof rawNextMarker === "number"
+          ? String(rawNextMarker)
+          : ""
+
+    if (!nextMarkerStr) {
       throw new Error("Multipart parts pagination stalled (missing cursor)")
     }
-    if (response.NextPartNumberMarker === partNumberMarker) {
+    if (nextMarkerStr === partNumberMarker) {
       throw new Error("Multipart parts pagination stalled (cursor did not advance)")
     }
 
-    const nextMarker = Number(response.NextPartNumberMarker)
+    const nextMarker = Number(nextMarkerStr)
     if (!Number.isFinite(nextMarker)) {
       throw new Error("Multipart parts pagination stalled (invalid cursor)")
     }
@@ -369,7 +390,7 @@ export async function listAllPartsForUpload(
       }
     }
 
-    partNumberMarker = response.NextPartNumberMarker
+    partNumberMarker = nextMarkerStr
   }
 
   return parts
@@ -382,10 +403,15 @@ export async function scanIncompleteMultipart(
 ): Promise<MultipartIncompleteScanResult> {
   const listedUploads = await listAllMultipartUploads(client, bucket)
 
+  console.log(
+    `[multipart-scan] bucket=${bucket} found ${listedUploads.length} incomplete upload(s)`
+  )
+
   const perUpload: Array<MultipartIncompleteUploadDetail | null> = new Array(
     listedUploads.length
   ).fill(null)
 
+  let skippedMissing = 0
   let nextIndex = 0
   const workerCount = Math.min(SCAN_PARTS_CONCURRENCY, listedUploads.length)
 
@@ -406,22 +432,30 @@ export async function scanIncompleteMultipart(
         parts = await listAllPartsForUpload(client, bucket, upload.key, upload.uploadId)
       } catch (error) {
         if (isMissingUploadError(error)) {
+          skippedMissing += 1
           continue
         }
         throw error
       }
 
+      const uploadSize = parts.reduce((sum, part) => sum + part.size, 0)
       perUpload[index] = {
         key: upload.key,
         uploadId: upload.uploadId,
         initiatedUtc: upload.initiatedUtc,
         partCount: parts.length,
-        size: parts.reduce((sum, part) => sum + part.size, 0),
+        size: uploadSize,
       }
     }
   })
 
   await Promise.all(workers)
+
+  if (skippedMissing > 0) {
+    console.log(
+      `[multipart-scan] bucket=${bucket} skipped ${skippedMissing} upload(s) (no longer exist)`
+    )
+  }
 
   let totalUploads = 0
   let totalParts = 0
@@ -437,6 +471,10 @@ export async function scanIncompleteMultipart(
       uploadDetails.push(item)
     }
   }
+
+  console.log(
+    `[multipart-scan] bucket=${bucket} result: ${totalUploads} upload(s), ${totalParts} part(s), ${(totalIncompleteSize / (1024 * 1024)).toFixed(1)} MB total`
+  )
 
   if (details) {
     uploadDetails.sort((a, b) => {

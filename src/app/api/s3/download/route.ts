@@ -17,6 +17,10 @@ function toContentDispositionFilename(filename: string): string {
   return filename.replace(/["\\]/g, "_")
 }
 
+function shouldUseProxyDownload(provider: string): boolean {
+  return provider.trim().toUpperCase() === "STORADERA"
+}
+
 export async function POST(request: NextRequest) {
   let userId: string | undefined
   let auditBucket = ""
@@ -42,16 +46,24 @@ export async function POST(request: NextRequest) {
     auditBucket = bucket
     auditKey = key
 
-    const { client } = await getS3Client(session.user.id, credentialId)
+    const { client, credential } = await getS3Client(session.user.id, credentialId)
     const filename = extractFilename(key)
 
-    const command = new GetObjectCommand({
-      Bucket: bucket,
-      Key: key,
-      ResponseContentDisposition: `attachment; filename="${toContentDispositionFilename(filename)}"`,
-    })
-
-    const url = await getSignedUrl(client, command, { expiresIn: 3600 })
+    let url: string
+    if (shouldUseProxyDownload(credential.provider)) {
+      const params = new URLSearchParams({ bucket, key })
+      if (credentialId) {
+        params.set("credentialId", credentialId)
+      }
+      url = `/api/s3/download/proxy?${params.toString()}`
+    } else {
+      const commandInput: ConstructorParameters<typeof GetObjectCommand>[0] = {
+        Bucket: bucket,
+        Key: key,
+        ResponseContentDisposition: `attachment; filename="${toContentDispositionFilename(filename)}"`,
+      }
+      url = await getSignedUrl(client, new GetObjectCommand(commandInput), { expiresIn: 3600 })
+    }
 
     await logUserAuditAction({
       userId: session.user.id,
