@@ -72,6 +72,7 @@ function DashboardContent() {
   const [sortBy, setSortBy] = useState<"name" | "size" | "lastModified">("name")
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc")
   const [viewMode, setViewMode] = useState<"list" | "gallery">("list")
+  const [showVersions, setShowVersions] = useState(false)
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null)
   const requestedThumbnailKeysRef = useRef<Set<string>>(new Set())
   const selectionAnchorRef = useRef<string | null>(null)
@@ -153,10 +154,84 @@ function DashboardContent() {
     enabled: !bucket,
   })
 
-  const allItems = useMemo(
-    () => [...(data?.folders ?? []), ...(data?.files ?? [])],
-    [data?.files, data?.folders]
-  )
+  // Check versioning status for the current bucket
+  const { data: bucketSettings } = useQuery<{
+    settings: { versioning: { status: string } }
+  }>({
+    queryKey: ["bucket-settings", credentialId ?? "", bucket],
+    queryFn: async () => {
+      const params = new URLSearchParams({ bucket })
+      if (credentialId) params.set("credentialId", credentialId)
+      const res = await fetch(`/api/s3/bucket-settings?${params}`)
+      if (!res.ok) return { settings: { versioning: { status: "unversioned" } } }
+      return res.json()
+    },
+    enabled: !!bucket,
+  })
+
+  const versioningEnabled =
+    bucketSettings?.settings?.versioning?.status === "enabled" ||
+    bucketSettings?.settings?.versioning?.status === "suspended"
+
+  // Fetch versions when toggle is on
+  interface VersionsListResponse {
+    versions: {
+      key: string
+      versionId: string
+      size: number
+      lastModifiedUtc: string
+      isLatest: boolean
+      isDeleteMarker: boolean
+    }[]
+    pagination: { hasMore: boolean }
+  }
+
+  const { data: versionsData, refetch: refetchVersions } = useQuery<VersionsListResponse>({
+    queryKey: ["versions-list", bucket, prefix, credentialId],
+    queryFn: async () => {
+      const params = new URLSearchParams({ bucket, limit: "500" })
+      if (prefix) params.set("prefix", prefix)
+      if (credentialId) params.set("credentialId", credentialId)
+      const res = await fetch(`/api/s3/versions/list?${params}`)
+      if (!res.ok) throw new Error("Failed to load versions")
+      return res.json() as Promise<VersionsListResponse>
+    },
+    enabled: !!bucket && showVersions && versioningEnabled,
+  })
+
+  const allItems = useMemo(() => {
+    const base: S3Object[] = [...(data?.folders ?? []), ...(data?.files ?? [])]
+    if (!showVersions || !versionsData?.versions) return base
+
+    // Add non-current versions and delete markers as extra rows
+    const extraItems: S3Object[] = []
+    for (const v of versionsData.versions) {
+      if (v.isLatest && !v.isDeleteMarker) continue // current version already in base list
+      extraItems.push({
+        key: v.key,
+        size: v.size,
+        lastModified: v.lastModifiedUtc,
+        isFolder: false,
+        versionId: v.versionId,
+        isLatest: v.isLatest,
+        isDeleteMarker: v.isDeleteMarker,
+      })
+    }
+
+    // Mark base files with isLatest for visual distinction
+    const withVersionInfo = base.map((item) => {
+      if (item.isFolder) return item
+      const currentVersion = versionsData.versions.find(
+        (v) => v.key === item.key && v.isLatest && !v.isDeleteMarker
+      )
+      if (currentVersion) {
+        return { ...item, versionId: currentVersion.versionId, isLatest: true }
+      }
+      return item
+    })
+
+    return [...withVersionInfo, ...extraItems]
+  }, [data?.files, data?.folders, showVersions, versionsData])
 
   const galleryItems = useMemo(
     () => galleryData?.pages.flatMap((page) => page.items) ?? [],
@@ -269,6 +344,27 @@ function DashboardContent() {
   const previewableGalleryItems = useMemo(
     () => sortedGalleryItems.filter((item) => !item.isFolder),
     [sortedGalleryItems]
+  )
+
+  const handleDeleteVersion = useCallback(
+    async (key: string, versionId: string) => {
+      try {
+        const res = await fetch("/api/s3/versions/delete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ bucket, credentialId, key, versionId }),
+        })
+        if (!res.ok) {
+          const payload = await res.json().catch(() => null)
+          throw new Error(payload?.error ?? "Failed to delete version")
+        }
+        toast.success("Version deleted")
+        void refetchVersions()
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : "Failed to delete version")
+      }
+    },
+    [bucket, credentialId, refetchVersions]
   )
 
   const invalidateBucketQueries = useCallback(() => {
@@ -703,6 +799,8 @@ function DashboardContent() {
         sortDir={sortDir}
         viewMode={viewMode}
         onViewModeChange={setViewMode}
+        showVersions={showVersions}
+        onShowVersionsChange={versioningEnabled ? setShowVersions : undefined}
       />
 
       {selectedKeys.size > 0 && (
@@ -801,6 +899,8 @@ function DashboardContent() {
             setDeleteOpen(true)
           }}
           onDownload={(file) => handleDownload([file.key])}
+          showVersions={showVersions}
+          onDeleteVersion={handleDeleteVersion}
         />
       )}
 

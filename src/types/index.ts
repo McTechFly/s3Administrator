@@ -10,6 +10,10 @@ export interface S3Object {
   isFolder: boolean
   fileCount?: number
   totalSize?: number
+  // Version fields (present when "Show Versions" is on)
+  versionId?: string
+  isLatest?: boolean
+  isDeleteMarker?: boolean
 }
 
 export interface ListObjectsResponse {

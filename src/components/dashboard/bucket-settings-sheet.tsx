@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useState } from "react"
 import { useQuery } from "@tanstack/react-query"
 import { toast } from "sonner"
 import { Badge } from "@/components/ui/badge"
@@ -18,9 +18,14 @@ import {
   hasDestructiveConfirmBypass,
 } from "@/lib/destructive-confirmation"
 import { PROVIDERS, type Provider } from "@/lib/providers"
-import { Loader2, Trash2 } from "lucide-react"
+import { formatSize } from "@/lib/format"
+import { Loader2, Search, Trash2 } from "lucide-react"
 import { useRefreshBucketQueries } from "@/hooks/use-refresh-bucket-queries"
 import { useDeleteBucket } from "@/hooks/use-delete-bucket"
+import {
+  NoncurrentVersionsDialog,
+  type NoncurrentVersionsSummary,
+} from "@/components/dashboard/noncurrent-versions-dialog"
 
 interface BucketRef {
   name: string
@@ -141,6 +146,12 @@ export function BucketSettingsSheet({
   const [versioningEnabled, setVersioningEnabled] = useState(false)
   const [lifecycleEnabled, setLifecycleEnabled] = useState(false)
   const [expirationDays, setExpirationDays] = useState("")
+
+  // Version scan state
+  const [versionScanLoading, setVersionScanLoading] = useState(false)
+  const [versionSummary, setVersionSummary] = useState<NoncurrentVersionsSummary | null>(null)
+  const [versionScanError, setVersionScanError] = useState<string | null>(null)
+  const [versionDialogOpen, setVersionDialogOpen] = useState(false)
 
   const queryKey = useMemo(
     () => ["bucket-settings", bucket?.credentialId ?? "", bucket?.name ?? ""],
@@ -265,6 +276,29 @@ export function BucketSettingsSheet({
       setSavingSection(null)
     }
   }
+
+  const handleScanVersions = useCallback(async () => {
+    if (!bucket) return
+    setVersionScanLoading(true)
+    setVersionScanError(null)
+    try {
+      const params = new URLSearchParams({
+        bucket: bucket.name,
+        credentialId: bucket.credentialId,
+        details: "false",
+      })
+      const res = await fetch(`/api/s3/versions?${params.toString()}`)
+      const payload = await res.json().catch(() => null)
+      if (!res.ok) {
+        throw new Error(payload?.error ?? "Failed to scan versions")
+      }
+      setVersionSummary(payload.summary as NoncurrentVersionsSummary)
+    } catch (error) {
+      setVersionScanError(error instanceof Error ? error.message : "Scan failed")
+    } finally {
+      setVersionScanLoading(false)
+    }
+  }, [bucket])
 
   async function handleSaveLifecycle() {
     if (!bucket) return
@@ -453,6 +487,61 @@ export function BucketSettingsSheet({
                       ) : null}
                       Save Versioning
                     </Button>
+
+                    {data.settings.versioning.status !== "unversioned" && (
+                      <>
+                        <Separator />
+                        <div className="space-y-2">
+                          <div className="flex items-center gap-2">
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              onClick={() => void handleScanVersions()}
+                              disabled={versionScanLoading}
+                            >
+                              {versionScanLoading ? (
+                                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                              ) : (
+                                <Search className="mr-2 h-4 w-4" />
+                              )}
+                              Scan Old Versions
+                            </Button>
+                            {versionSummary && (
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                onClick={() => setVersionDialogOpen(true)}
+                              >
+                                View Details
+                              </Button>
+                            )}
+                          </div>
+                          {versionScanError && (
+                            <p className="text-xs text-destructive">{versionScanError}</p>
+                          )}
+                          {versionSummary && (
+                            <div className="rounded-md border bg-muted/50 p-2.5 text-xs">
+                              <div className="flex flex-wrap gap-x-4 gap-y-1">
+                                <span>
+                                  <span className="font-medium">{versionSummary.noncurrentVersions.toLocaleString("en-US")}</span>{" "}
+                                  old version{versionSummary.noncurrentVersions !== 1 ? "s" : ""}
+                                </span>
+                                <span>
+                                  <span className="font-medium">{versionSummary.deleteMarkers.toLocaleString("en-US")}</span>{" "}
+                                  delete marker{versionSummary.deleteMarkers !== 1 ? "s" : ""}
+                                </span>
+                                <span>
+                                  <span className="font-medium">{formatSize(versionSummary.noncurrentSize)}</span>{" "}
+                                  total
+                                </span>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      </>
+                    )}
                   </div>
                 </SectionState>
 
@@ -536,6 +625,14 @@ export function BucketSettingsSheet({
         }
         actionLabel="Delete Bucket"
         onConfirm={handleDeleteBucket}
+      />
+
+      <NoncurrentVersionsDialog
+        open={versionDialogOpen}
+        onOpenChange={setVersionDialogOpen}
+        bucket={bucket}
+        initialSummary={versionSummary}
+        onSummaryUpdated={(updated) => setVersionSummary(updated)}
       />
     </>
   )

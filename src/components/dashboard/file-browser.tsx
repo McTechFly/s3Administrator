@@ -21,6 +21,7 @@ import { Button } from "@/components/ui/button"
 import { FileIcon } from "@/components/dashboard/file-icon"
 import { EmptyState } from "@/components/dashboard/empty-state"
 import { cn } from "@/lib/utils"
+import { Badge } from "@/components/ui/badge"
 import { formatSize, formatDate } from "@/lib/format"
 import { MoreHorizontal, Download, Pencil, Trash2 } from "lucide-react"
 import type { S3Object } from "@/types"
@@ -48,6 +49,8 @@ interface FileBrowserProps {
   sortBy?: SortColumn
   sortDir?: "asc" | "desc"
   onSort?: (column: SortColumn) => void
+  showVersions?: boolean
+  onDeleteVersion?: (key: string, versionId: string) => void
 }
 
 
@@ -77,8 +80,11 @@ export function FileBrowser({
   sortBy,
   sortDir,
   onSort,
+  showVersions,
+  onDeleteVersion,
 }: FileBrowserProps) {
-  const resolveRowId = (file: S3Object) => getRowId?.(file) ?? file.key
+  const resolveRowId = (file: S3Object) =>
+    getRowId?.(file) ?? (file.versionId ? `${file.key}:${file.versionId}` : file.key)
   const shiftPressedRef = useRef(false)
 
   const renderSortableHeader = (label: string, column: SortColumn) => {
@@ -159,12 +165,18 @@ export function FileBrowser({
             const pathLabel = getPathLabel?.(file)
             const isSelected = selectedKeys.has(rowId)
             const location = getLocationLabel?.(file)
+            const isVersionRow = Boolean(file.versionId && (file.isDeleteMarker || file.isLatest === false))
+            const isDeleteMarker = Boolean(file.isDeleteMarker)
 
             return (
               <TableRow
                 key={rowId}
-                className={isSelected ? "bg-accent/50" : ""}
+                className={cn(
+                  isSelected && "bg-accent/50",
+                  isVersionRow && "opacity-60"
+                )}
                 onDoubleClick={() => {
+                  if (isVersionRow) return
                   if (file.isFolder) {
                     onNavigate(file)
                   } else {
@@ -173,35 +185,59 @@ export function FileBrowser({
                 }}
               >
                 <TableCell>
-                  <Checkbox
-                    checked={isSelected}
-                    onPointerDown={(event) => {
-                      shiftPressedRef.current = event.shiftKey
-                    }}
-                    onKeyDown={(event) => {
-                      shiftPressedRef.current = event.shiftKey
-                    }}
-                    onCheckedChange={() => {
-                      onSelect(file, { shiftKey: shiftPressedRef.current })
-                      shiftPressedRef.current = false
-                    }}
-                  />
+                  {!isVersionRow && (
+                    <Checkbox
+                      checked={isSelected}
+                      onPointerDown={(event) => {
+                        shiftPressedRef.current = event.shiftKey
+                      }}
+                      onKeyDown={(event) => {
+                        shiftPressedRef.current = event.shiftKey
+                      }}
+                      onCheckedChange={() => {
+                        onSelect(file, { shiftKey: shiftPressedRef.current })
+                        shiftPressedRef.current = false
+                      }}
+                    />
+                  )}
                 </TableCell>
                 <TableCell className={compact ? "py-1.5" : undefined}>
-                  <button
-                    className="flex w-full min-w-0 items-center gap-2 text-left hover:underline"
-                    onClick={() => {
-                      if (file.isFolder) onNavigate(file)
-                    }}
-                  >
-                    <FileIcon filename={displayName} isFolder={file.isFolder} />
-                    <span className={compact ? "truncate text-sm" : "truncate"}>{displayName}</span>
-                    {file.isFolder && typeof file.fileCount === "number" && (
-                      <span className="shrink-0 text-xs text-muted-foreground">
-                        ({file.fileCount} {file.fileCount === 1 ? "file" : "files"})
+                  <div className="flex w-full min-w-0 items-center gap-2">
+                    {isVersionRow ? (
+                      <span className={cn("flex items-center gap-2", compact ? "text-sm" : "")}>
+                        <span className="ml-4 truncate text-muted-foreground">{displayName}</span>
+                        {isDeleteMarker ? (
+                          <Badge variant="destructive" className="shrink-0 text-[10px] leading-tight">
+                            Delete Marker
+                          </Badge>
+                        ) : (
+                          <Badge variant="secondary" className="shrink-0 text-[10px] leading-tight">
+                            Old Version
+                          </Badge>
+                        )}
                       </span>
+                    ) : (
+                      <button
+                        className="flex w-full min-w-0 items-center gap-2 text-left hover:underline"
+                        onClick={() => {
+                          if (file.isFolder) onNavigate(file)
+                        }}
+                      >
+                        <FileIcon filename={displayName} isFolder={file.isFolder} />
+                        <span className={compact ? "truncate text-sm" : "truncate"}>{displayName}</span>
+                        {file.isFolder && typeof file.fileCount === "number" && (
+                          <span className="shrink-0 text-xs text-muted-foreground">
+                            ({file.fileCount} {file.fileCount === 1 ? "file" : "files"})
+                          </span>
+                        )}
+                        {showVersions && file.isLatest === true && !file.isFolder && (
+                          <Badge variant="outline" className="shrink-0 text-[10px] leading-tight">
+                            Current
+                          </Badge>
+                        )}
+                      </button>
                     )}
-                  </button>
+                  </div>
                 </TableCell>
                 {getPathLabel && (
                   <TableCell
@@ -216,48 +252,73 @@ export function FileBrowser({
                   </TableCell>
                 )}
                 <TableCell className={cn("text-muted-foreground", compact && "py-1.5 text-xs")}>
-                  {file.isFolder
-                    ? typeof file.totalSize === "number"
-                      ? formatSize(file.totalSize)
-                      : "—"
-                    : formatSize(file.size)}
+                  {isDeleteMarker
+                    ? "—"
+                    : file.isFolder
+                      ? typeof file.totalSize === "number"
+                        ? formatSize(file.totalSize)
+                        : "—"
+                      : formatSize(file.size)}
                 </TableCell>
                 <TableCell className={cn("text-muted-foreground", compact && "py-1.5 text-xs")}>
                   {formatDate(file.lastModified)}
                 </TableCell>
                 <TableCell className={compact ? "py-1.5" : undefined}>
-                  <DropdownMenu>
-                    <DropdownMenuTrigger asChild>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        className={compact ? "h-7 w-7 p-0" : "h-8 w-8 p-0"}
-                      >
-                        <MoreHorizontal className="h-4 w-4" />
-                      </Button>
-                    </DropdownMenuTrigger>
-                    <DropdownMenuContent align="end">
-                      {!file.isFolder && (
-                        <DropdownMenuItem onClick={() => onDownload(file)}>
-                          <Download className="mr-2 h-4 w-4" />
-                          Download
+                  {isVersionRow && file.versionId && onDeleteVersion ? (
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className={compact ? "h-7 w-7 p-0" : "h-8 w-8 p-0"}
+                        >
+                          <MoreHorizontal className="h-4 w-4" />
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">
+                        <DropdownMenuItem
+                          className="text-destructive"
+                          onClick={() => onDeleteVersion(file.key, file.versionId!)}
+                        >
+                          <Trash2 className="mr-2 h-4 w-4" />
+                          Permanently Delete
                         </DropdownMenuItem>
-                      )}
-                      <DropdownMenuItem
-                        onClick={() => onRename(file)}
-                      >
-                        <Pencil className="mr-2 h-4 w-4" />
-                        Rename
-                      </DropdownMenuItem>
-                      <DropdownMenuItem
-                        className="text-destructive"
-                        onClick={() => onDelete(file)}
-                      >
-                        <Trash2 className="mr-2 h-4 w-4" />
-                        Delete
-                      </DropdownMenuItem>
-                    </DropdownMenuContent>
-                  </DropdownMenu>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  ) : !isVersionRow ? (
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className={compact ? "h-7 w-7 p-0" : "h-8 w-8 p-0"}
+                        >
+                          <MoreHorizontal className="h-4 w-4" />
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">
+                        {!file.isFolder && (
+                          <DropdownMenuItem onClick={() => onDownload(file)}>
+                            <Download className="mr-2 h-4 w-4" />
+                            Download
+                          </DropdownMenuItem>
+                        )}
+                        <DropdownMenuItem
+                          onClick={() => onRename(file)}
+                        >
+                          <Pencil className="mr-2 h-4 w-4" />
+                          Rename
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          className="text-destructive"
+                          onClick={() => onDelete(file)}
+                        >
+                          <Trash2 className="mr-2 h-4 w-4" />
+                          Delete
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  ) : null}
                 </TableCell>
               </TableRow>
             )

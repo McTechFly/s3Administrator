@@ -11,6 +11,7 @@ import {
   ArrowUpDown,
   LayoutGrid,
   List,
+  History,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -42,6 +43,8 @@ interface TopbarProps {
   sortDir?: string
   viewMode?: "list" | "gallery"
   onViewModeChange?: (mode: "list" | "gallery") => void
+  showVersions?: boolean
+  onShowVersionsChange?: (show: boolean) => void
 }
 
 function buildBreadcrumbSegments(bucket: string, prefix: string, credentialId?: string) {
@@ -85,6 +88,8 @@ export function Topbar({
   sortDir,
   viewMode = "list",
   onViewModeChange,
+  showVersions,
+  onShowVersionsChange,
 }: TopbarProps) {
   const [searchValue, setSearchValue] = useState("")
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -204,6 +209,16 @@ export function Topbar({
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
+          )}
+          {onShowVersionsChange && (
+            <Button
+              variant={showVersions ? "secondary" : "outline"}
+              size="sm"
+              onClick={() => onShowVersionsChange(!showVersions)}
+            >
+              <History className="mr-1.5 h-4 w-4" />
+              Versions
+            </Button>
           )}
           <Button variant="outline" size="sm" onClick={onSync}>
             <RefreshCw className="mr-1.5 h-4 w-4" />
