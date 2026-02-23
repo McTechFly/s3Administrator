@@ -7,8 +7,6 @@ import { getUserPlanEntitlements } from "@/lib/plan-entitlements"
 import { getBucketLimitViolation } from "@/lib/plan-limits"
 import { getRequestContext, logUserAuditAction } from "@/lib/audit-logger"
 import { ListObjectsV2Command } from "@aws-sdk/client-s3"
-import { THUMBNAIL_OBJECT_PREFIX } from "@/lib/thumbnail-storage"
-import { deleteMediaThumbnailsForKeys } from "@/lib/media-thumbnails"
 
 export async function POST(request: NextRequest) {
   let userId: string | undefined
@@ -92,8 +90,6 @@ export async function POST(request: NextRequest) {
 
       for (const obj of response.Contents ?? []) {
         if (!obj.Key) continue
-        if (obj.Key.startsWith(THUMBNAIL_OBJECT_PREFIX)) continue
-
         s3Objects.push({
           key: obj.Key,
           extension: getObjectExtension(
@@ -184,19 +180,10 @@ export async function POST(request: NextRequest) {
     const s3KeySet = new Set(s3Objects.map((o) => o.key))
     const staleEntries = cachedEntries.filter((entry) => !s3KeySet.has(entry.key))
     const staleIds = staleEntries.map((entry) => entry.id)
-    const staleKeys = staleEntries.map((entry) => entry.key)
 
     if (staleIds.length > 0) {
       await prisma.fileMetadata.deleteMany({
         where: { id: { in: staleIds } },
-      })
-
-      // Clean up thumbnails for deleted files
-      await deleteMediaThumbnailsForKeys({
-        userId: session.user.id,
-        credentialId: credential.id,
-        bucket,
-        keys: staleKeys,
       })
     }
 

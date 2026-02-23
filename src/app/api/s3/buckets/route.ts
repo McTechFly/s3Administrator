@@ -312,22 +312,12 @@ export async function DELETE(request: NextRequest) {
       })
     )
 
-    await prisma.$transaction(async (tx) => {
-      await tx.fileMetadata.deleteMany({
-        where: {
-          userId: session.user.id,
-          credentialId: credential.id,
-          bucket,
-        },
-      })
-
-      await tx.mediaThumbnail.deleteMany({
-        where: {
-          userId: session.user.id,
-          credentialId: credential.id,
-          bucket,
-        },
-      })
+    await prisma.fileMetadata.deleteMany({
+      where: {
+        userId: session.user.id,
+        credentialId: credential.id,
+        bucket,
+      },
     })
 
     await rebuildUserExtensionStats(session.user.id)

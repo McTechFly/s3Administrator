@@ -5,7 +5,7 @@ import { auth } from "@/lib/auth"
 import { getS3Client } from "@/lib/s3"
 import { previewSchema } from "@/lib/validations"
 import { rateLimitByUser, rateLimitResponse } from "@/lib/rate-limit"
-import { getThumbnailUrlTtlSeconds } from "@/lib/thumbnail-storage"
+const PREVIEW_URL_TTL_SECONDS = 86400 // 24 hours
 import { getRequestContext, logUserAuditAction } from "@/lib/audit-logger"
 
 export async function POST(request: NextRequest) {
@@ -39,7 +39,7 @@ export async function POST(request: NextRequest) {
     auditBucket = bucket
     auditKey = key
     const { client, credential } = await getS3Client(session.user.id, credentialId)
-    const ttlSeconds = getThumbnailUrlTtlSeconds()
+    const ttlSeconds = PREVIEW_URL_TTL_SECONDS
     const isStoradera = credential.provider.trim().toUpperCase() === "STORADERA"
 
     let url: string

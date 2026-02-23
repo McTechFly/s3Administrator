@@ -303,15 +303,14 @@ export default function TasksPage() {
     () =>
       (tasksData?.tasks ?? []).filter(
         (task) =>
-          task.type !== "thumbnail_generate" &&
-          (task.lifecycleState === "paused" ||
+          task.lifecycleState === "paused" ||
           task.status === "pending" ||
-          task.status === "in_progress")
+          task.status === "in_progress"
       ),
     [tasksData?.tasks]
   )
   const historyTasks = useMemo(
-    () => (tasksData?.tasks ?? []).filter((task) => task.type !== "thumbnail_generate" && (task.status === "completed" || task.status === "failed")),
+    () => (tasksData?.tasks ?? []).filter((task) => task.status === "completed" || task.status === "failed"),
     [tasksData?.tasks]
   )
 

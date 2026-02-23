@@ -23,7 +23,6 @@ export interface ListObjectsResponse {
 }
 
 export type MediaType = "image" | "video"
-export type ThumbnailStatus = "pending" | "processing" | "ready" | "failed" | null
 
 export interface GalleryItem {
   id: string
@@ -33,7 +32,6 @@ export interface GalleryItem {
   extension: string
   mediaType: MediaType | null
   previewUrl: string | null
-  thumbnailStatus: ThumbnailStatus
   isVideo: boolean
   isFolder: boolean
   fileCount?: number

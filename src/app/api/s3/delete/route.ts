@@ -6,7 +6,6 @@ import { rebuildUserExtensionStats } from "@/lib/file-stats"
 import { deleteObjectsSchema } from "@/lib/validations"
 import { rateLimitByUser, rateLimitResponse } from "@/lib/rate-limit"
 import { getRequestContext, logUserAuditAction } from "@/lib/audit-logger"
-import { deleteMediaThumbnailsForKeys } from "@/lib/media-thumbnails"
 import type { Prisma } from "@prisma/client"
 import {
   DeleteObjectsCommand,
@@ -202,8 +201,6 @@ export async function POST(request: NextRequest) {
 
     let totalDeleted = 0
     const allDeletedKeys: string[] = []
-    let thumbnailDeletedRows = 0
-    let thumbnailDeletedObjects = 0
 
     // Delete individual keys
     if (keys && keys.length > 0) {
@@ -237,14 +234,6 @@ export async function POST(request: NextRequest) {
         },
       })
 
-      const thumbnailDeletion = await deleteMediaThumbnailsForKeys({
-        userId: session.user.id,
-        credentialId: credential.id,
-        bucket,
-        keys: uniqueDeletedKeys,
-      })
-      thumbnailDeletedRows += thumbnailDeletion.deletedRows
-      thumbnailDeletedObjects += thumbnailDeletion.deletedObjects
     }
 
     // Also delete metadata for any prefix patterns
@@ -277,8 +266,6 @@ export async function POST(request: NextRequest) {
         uniqueDeletedKeys: uniqueDeletedKeys.length,
         keysRequested: keys?.length ?? 0,
         prefixesRequested: prefixes?.length ?? 0,
-        thumbnailRowsDeleted: thumbnailDeletedRows,
-        thumbnailObjectsDeleted: thumbnailDeletedObjects,
       },
       ...requestContext,
     })

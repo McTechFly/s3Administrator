@@ -74,7 +74,6 @@ function DashboardContent() {
   const [viewMode, setViewMode] = useState<"list" | "gallery">("list")
   const [showVersions, setShowVersions] = useState(false)
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null)
-  const requestedThumbnailKeysRef = useRef<Set<string>>(new Set())
   const selectionAnchorRef = useRef<string | null>(null)
 
   const [uploadOpen, setUploadOpen] = useState(false)
@@ -110,7 +109,6 @@ function DashboardContent() {
     isFetchingNextPage,
     fetchNextPage,
     hasNextPage,
-    refetch: refetchGallery,
   } = useInfiniteQuery<GalleryResponse>({
     queryKey: ["gallery", bucket, prefix, credentialId],
     initialPageParam: null as string | null,
@@ -130,7 +128,6 @@ function DashboardContent() {
     },
     getNextPageParam: (lastPage) => (lastPage.nextCursor ? lastPage.nextCursor : undefined),
     enabled: !!bucket && viewMode === "gallery",
-    refetchInterval: viewMode === "gallery" ? 15000 : false,
   })
 
   const { data: credentials = [], isLoading: credentialsLoading } = useQuery<Credential[]>({
@@ -294,52 +291,6 @@ function DashboardContent() {
     [sortedGalleryItems, sortedItems, viewMode]
   )
 
-  useEffect(() => {
-    if (viewMode !== "gallery") return
-    if (!bucket) return
-
-    const toRequest = sortedGalleryItems
-      .filter(
-        (item) =>
-          !item.isFolder &&
-          item.thumbnailStatus !== null &&
-          item.thumbnailStatus !== "ready" &&
-          !requestedThumbnailKeysRef.current.has(item.key)
-      )
-      .map((item) => item.key)
-
-    if (toRequest.length === 0) return
-
-    for (const key of toRequest) {
-      requestedThumbnailKeysRef.current.add(key)
-    }
-
-    const chunks: string[][] = []
-    for (let i = 0; i < toRequest.length; i += 200) {
-      chunks.push(toRequest.slice(i, i + 200))
-    }
-
-    void (async () => {
-      for (const keys of chunks) {
-        const res = await fetch("/api/s3/thumbnails/request", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            bucket,
-            credentialId,
-            keys,
-          }),
-        }).catch(() => null)
-
-        if (!res || !res.ok) {
-          for (const key of keys) {
-            requestedThumbnailKeysRef.current.delete(key)
-          }
-        }
-      }
-      void refetchGallery().catch(() => {})
-    })()
-  }, [bucket, credentialId, refetchGallery, sortedGalleryItems, viewMode])
 
   const previewableGalleryItems = useMemo(
     () => sortedGalleryItems.filter((item) => !item.isFolder),
@@ -414,9 +365,6 @@ function DashboardContent() {
     selectionAnchorRef.current = null
   }, [bucket, prefix, credentialId, viewMode])
 
-  useEffect(() => {
-    requestedThumbnailKeysRef.current.clear()
-  }, [bucket, prefix, credentialId])
 
   useEffect(() => {
     if (!selectionAnchorRef.current) return
@@ -852,6 +800,8 @@ function DashboardContent() {
       {viewMode === "gallery" ? (
         <GalleryBrowser
           items={sortedGalleryItems}
+          credentialId={credentialId ?? ""}
+          bucket={bucket}
           isLoading={galleryLoading}
           isFetchingNextPage={isFetchingNextPage}
           hasNextPage={Boolean(hasNextPage)}

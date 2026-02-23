@@ -5,16 +5,12 @@ import { auth } from "@/lib/auth"
 import { prisma } from "@/lib/db"
 import { getS3Client } from "@/lib/s3"
 import { getMediaTypeFromExtension, type MediaType } from "@/lib/media"
-import { isThumbnailSupportedExtension } from "@/lib/media"
 import { galleryListSchema } from "@/lib/validations"
 import { rateLimitByUser, rateLimitResponse } from "@/lib/rate-limit"
-import {
-  getThumbnailUrlTtlSeconds,
-  isThumbnailGenerationEnabled,
-  THUMBNAIL_OBJECT_PREFIX,
-} from "@/lib/thumbnail-storage"
 import { getRequestContext, logUserAuditAction } from "@/lib/audit-logger"
-import type { GalleryItem, ThumbnailStatus } from "@/types"
+import type { GalleryItem } from "@/types"
+
+const PREVIEW_URL_TTL_SECONDS = 86400 // 24 hours
 
 type CursorPayload = {
   offset: number
@@ -37,8 +33,6 @@ type FileCandidate = {
   extension: string
   mediaType: MediaType
   isVideo: boolean
-  thumbnailStatus: ThumbnailStatus
-  thumbnailKey: string | null
 }
 
 function encodeCursor(offset: number): string {
@@ -88,8 +82,6 @@ export async function GET(request: NextRequest) {
       return rateLimitResponse(limitResult.retryAfterSeconds)
     }
 
-    const thumbnailGenerationEnabled = isThumbnailGenerationEnabled()
-
     const { searchParams } = request.nextUrl
     const parsed = galleryListSchema.safeParse({
       bucket: searchParams.get("bucket") ?? undefined,
@@ -117,7 +109,6 @@ export async function GET(request: NextRequest) {
     }
 
     const { client, credential } = await getS3Client(session.user.id, credentialId)
-    const ttlSeconds = getThumbnailUrlTtlSeconds()
     const isStoradera = credential.provider.trim().toUpperCase() === "STORADERA"
 
     const allEntries = await prisma.fileMetadata.findMany({
@@ -149,9 +140,6 @@ export async function GET(request: NextRequest) {
     }> = []
 
     for (const entry of allEntries) {
-      // Filter out generated thumbnail objects
-      if (entry.key.startsWith(THUMBNAIL_OBJECT_PREFIX)) continue
-
       const remainder = entry.key.slice(resolvedPrefix.length)
       if (!remainder) continue
 
@@ -159,10 +147,6 @@ export async function GET(request: NextRequest) {
 
       if (slashIndex !== -1) {
         const folderKey = resolvedPrefix + remainder.slice(0, slashIndex + 1)
-
-        // Skip the thumbnail folder from appearing as a visible folder
-        if (folderKey === THUMBNAIL_OBJECT_PREFIX || folderKey.startsWith(THUMBNAIL_OBJECT_PREFIX)) continue
-
         const existing = folderMap.get(folderKey)
         const entrySize = entry.isFolder ? 0 : Number(entry.size)
         const entryCount = entry.isFolder ? 0 : 1
@@ -208,39 +192,6 @@ export async function GET(request: NextRequest) {
       })
     }
 
-    // Query thumbnail status for all media files that support thumbnails
-    // Query thumbnail status for all media files that support thumbnails (when generation is enabled)
-    const mediaKeysForThumbnails = thumbnailGenerationEnabled
-      ? directFiles
-          .filter((entry) => isThumbnailSupportedExtension(entry.extension))
-          .map((entry) => entry.key)
-      : []
-    const thumbnailRows = mediaKeysForThumbnails.length > 0
-      ? await prisma.mediaThumbnail.findMany({
-          where: {
-            userId: session.user.id,
-            credentialId: credential.id,
-            bucket,
-            key: { in: mediaKeysForThumbnails },
-          },
-          select: {
-            key: true,
-            status: true,
-            thumbnailKey: true,
-          },
-        })
-      : []
-
-    const thumbnailByKey = new Map(
-      thumbnailRows.map((row) => [
-        row.key,
-        {
-          status: row.status as ThumbnailStatus,
-          thumbnailKey: row.thumbnailKey,
-        },
-      ])
-    )
-
     const folderCandidates: FolderCandidate[] = Array.from(folderMap.entries()).map(([key, meta]) => ({
       kind: "folder",
       key,
@@ -249,23 +200,16 @@ export async function GET(request: NextRequest) {
       totalSize: meta.totalSize,
     }))
 
-    const fileCandidates: FileCandidate[] = directFiles.map((entry) => {
-      const thumbnail = thumbnailByKey.get(entry.key)
-      const hasThumbnailSupport = isThumbnailSupportedExtension(entry.extension)
-      return {
-        kind: "file",
-        id: entry.id,
-        key: entry.key,
-        size: Number(entry.size),
-        lastModified: entry.lastModified,
-        extension: entry.extension,
-        mediaType: entry.mediaType,
-        isVideo: entry.isVideo,
-        thumbnailStatus:
-          thumbnailGenerationEnabled && hasThumbnailSupport ? (thumbnail?.status ?? "pending") : null,
-        thumbnailKey: thumbnail?.thumbnailKey ?? null,
-      }
-    })
+    const fileCandidates: FileCandidate[] = directFiles.map((entry) => ({
+      kind: "file",
+      id: entry.id,
+      key: entry.key,
+      size: Number(entry.size),
+      lastModified: entry.lastModified,
+      extension: entry.extension,
+      mediaType: entry.mediaType,
+      isVideo: entry.isVideo,
+    }))
 
     const merged = [...folderCandidates, ...fileCandidates].sort(compareCandidates)
 
@@ -286,7 +230,6 @@ export async function GET(request: NextRequest) {
             extension: "",
             mediaType: null,
             previewUrl: null,
-            thumbnailStatus: null,
             isVideo: false,
             isFolder: true,
             fileCount: candidate.fileCount,
@@ -297,55 +240,27 @@ export async function GET(request: NextRequest) {
         let previewUrl: string | null = null
 
         if (isStoradera) {
-          // Storadera does not support presigned URLs; use the preview proxy
-          const proxyKey = (candidate.thumbnailStatus === "ready" && candidate.thumbnailKey)
-            ? candidate.thumbnailKey
-            : (!candidate.isVideo ? candidate.key : null)
-          if (proxyKey) {
-            const params = new URLSearchParams({ bucket, key: proxyKey })
-            if (credentialId) {
-              params.set("credentialId", credentialId)
-            }
-            previewUrl = `/api/s3/preview/proxy?${params.toString()}`
+          // Storadera does not support presigned URLs; use the preview proxy with the original file
+          const params = new URLSearchParams({ bucket, key: candidate.key })
+          if (credentialId) {
+            params.set("credentialId", credentialId)
           }
+          previewUrl = `/api/s3/preview/proxy?${params.toString()}`
         } else {
-          if (
-            candidate.thumbnailStatus === "ready" &&
-            candidate.thumbnailKey
-          ) {
-            // Use the generated thumbnail (same bucket) for both images and videos
-            try {
-              previewUrl = await getSignedUrl(
-                client,
-                new GetObjectCommand({
-                  Bucket: bucket,
-                  Key: candidate.thumbnailKey,
-                  ResponseContentDisposition: "inline",
-                  ResponseCacheControl: `public, max-age=${ttlSeconds}`,
-                }),
-                { expiresIn: ttlSeconds }
-              )
-            } catch {
-              previewUrl = null
-            }
-          }
-
-          // For images without a ready thumbnail, always fall back to the original
-          if (!previewUrl && !candidate.isVideo) {
-            try {
-              previewUrl = await getSignedUrl(
-                client,
-                new GetObjectCommand({
-                  Bucket: bucket,
-                  Key: candidate.key,
-                  ResponseContentDisposition: "inline",
-                  ResponseCacheControl: `public, max-age=${ttlSeconds}`,
-                }),
-                { expiresIn: ttlSeconds }
-              )
-            } catch {
-              previewUrl = null
-            }
+          // Generate presigned URL to the original file — client uses this for thumbnail generation
+          try {
+            previewUrl = await getSignedUrl(
+              client,
+              new GetObjectCommand({
+                Bucket: bucket,
+                Key: candidate.key,
+                ResponseContentDisposition: "inline",
+                ResponseCacheControl: `public, max-age=${PREVIEW_URL_TTL_SECONDS}`,
+              }),
+              { expiresIn: PREVIEW_URL_TTL_SECONDS }
+            )
+          } catch {
+            previewUrl = null
           }
         }
 
@@ -357,7 +272,6 @@ export async function GET(request: NextRequest) {
           extension: candidate.extension,
           mediaType: candidate.mediaType,
           previewUrl,
-          thumbnailStatus: candidate.thumbnailStatus,
           isVideo: candidate.isVideo,
           isFolder: false,
           fileCount: undefined,
@@ -377,12 +291,11 @@ export async function GET(request: NextRequest) {
         bucket,
         credentialId: credential.id,
         prefix: resolvedPrefix,
-          mediaType,
-          limit,
-          thumbnailGenerationEnabled,
-          returned: items.length,
-          hasMore,
-          offset: start,
+        mediaType,
+        limit,
+        returned: items.length,
+        hasMore,
+        offset: start,
       },
       ...requestContext,
     })

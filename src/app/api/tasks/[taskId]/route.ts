@@ -326,13 +326,6 @@ export async function PATCH(
     }
 
     if (parsed.data.action === "update_schedule") {
-      if (task.type === "thumbnail_generate") {
-        return NextResponse.json(
-          { error: "Scheduling is not supported for thumbnail tasks" },
-          { status: 400 }
-        )
-      }
-
       let scheduleCron: string | null = null
       if (parsed.data.schedule?.cron) {
         scheduleCron = assertValidTaskScheduleCron(parsed.data.schedule.cron)
@@ -532,34 +525,6 @@ export async function PATCH(
           lifecycleState: true,
           nextRunAt: true,
           progress: true,
-        },
-      })
-
-      return NextResponse.json({ task: updated })
-    }
-
-    if (task.type === "thumbnail_generate") {
-      const updated = await prisma.backgroundTask.update({
-        where: { id: task.id },
-        data: {
-          status: "pending",
-          lifecycleState: "active",
-          pausedAt: null,
-          attempts: 0,
-          lastError: null,
-          startedAt: null,
-          completedAt: null,
-          nextRunAt: now,
-          isRecurring: false,
-          scheduleCron: null,
-          scheduleIntervalSeconds: null,
-          executionHistory: pushHistory(task.executionHistory, "restarted", "Task restarted by user"),
-        },
-        select: {
-          id: true,
-          status: true,
-          lifecycleState: true,
-          nextRunAt: true,
         },
       })
 

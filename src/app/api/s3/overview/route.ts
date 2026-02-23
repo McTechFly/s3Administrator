@@ -2,14 +2,8 @@ import { NextResponse } from "next/server"
 import { auth } from "@/lib/auth"
 import { prisma } from "@/lib/db"
 import { FILE_TYPE_EXTENSIONS } from "@/lib/file-search"
-import { IMAGE_EXTENSIONS, VIDEO_EXTENSIONS } from "@/lib/media"
 import { getS3Client } from "@/lib/s3"
 import { scanIncompleteMultipart } from "@/lib/s3-multipart-incomplete"
-
-const THUMBNAIL_SUPPORTED_EXTENSIONS = [
-  ...IMAGE_EXTENSIONS.filter((ext) => ext !== "svg"),
-  ...VIDEO_EXTENSIONS,
-]
 
 const TYPE_KEYS = ["image", "video", "audio", "document", "archive", "code", "other"] as const
 const MULTIPART_SCAN_CONCURRENCY = 3
@@ -54,7 +48,7 @@ export async function GET() {
 
     const userId = session.user.id
 
-    const [bucketGroups, extensionStats, fileAggregate, readyThumbnails, pendingThumbnails, failedThumbnails, totalMediaFiles] = await Promise.all([
+    const [bucketGroups, extensionStats, fileAggregate] = await Promise.all([
       prisma.fileMetadata.groupBy({
         by: ["bucket", "credentialId"],
         where: {
@@ -93,22 +87,6 @@ export async function GET() {
         },
         _max: {
           lastModified: true,
-        },
-      }),
-      prisma.mediaThumbnail.count({
-        where: { userId, status: "ready" },
-      }),
-      prisma.mediaThumbnail.count({
-        where: { userId, status: { in: ["pending", "processing"] } },
-      }),
-      prisma.mediaThumbnail.count({
-        where: { userId, status: "failed" },
-      }),
-      prisma.fileMetadata.count({
-        where: {
-          userId,
-          isFolder: false,
-          extension: { in: [...THUMBNAIL_SUPPORTED_EXTENSIONS] },
         },
       }),
     ])
@@ -270,12 +248,6 @@ export async function GET() {
         indexedTotalSize: toNumber(fileAggregate._sum.size),
         distinctExtensionCount: extensionStats.length,
         lastIndexedAt: fileAggregate._max.lastModified?.toISOString() ?? null,
-        thumbnails: {
-          ready: readyThumbnails,
-          pending: pendingThumbnails,
-          failed: failedThumbnails,
-          total: totalMediaFiles,
-        },
         multipartIncomplete: {
           uploads: multipartUploads,
           parts: multipartParts,

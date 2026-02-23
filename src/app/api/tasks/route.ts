@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from "next/server"
 import { auth } from "@/lib/auth"
 import { prisma } from "@/lib/db"
-import { VIDEO_EXTENSIONS } from "@/lib/media"
 import { getTaskMissedScheduleGraceSeconds } from "@/lib/task-engine-config"
 import { getUpcomingRunDates, normalizeExecutionHistory } from "@/lib/task-plans"
 import {
@@ -33,12 +32,12 @@ export async function GET(request: NextRequest) {
           ? ["pending", "in_progress", "completed", "failed"]
           : ["pending", "in_progress", "failed"]
 
-    const ALLOWED_TYPES = new Set(["thumbnail_generate", "bulk_delete", "object_transfer"])
+    const ALLOWED_TYPES = new Set(["bulk_delete", "object_transfer"])
     const typeFilter = typeParam
       ? typeParam.split(",").filter((t) => ALLOWED_TYPES.has(t))
       : undefined
 
-    const [tasks, cachedFiles, totalVideoFiles, readyThumbnails, pendingThumbnails, failedThumbnails] = await Promise.all([
+    const [tasks, cachedFiles] = await Promise.all([
       prisma.backgroundTask.findMany({
         where: {
           userId: session.user.id,
@@ -47,7 +46,7 @@ export async function GET(request: NextRequest) {
           },
           ...(typeFilter && typeFilter.length > 0
             ? { type: { in: typeFilter } }
-            : { type: { not: "thumbnail_generate" } }),
+            : undefined),
         },
         orderBy: [
           {
@@ -82,35 +81,6 @@ export async function GET(request: NextRequest) {
         where: {
           userId: session.user.id,
           isFolder: false,
-        },
-      }),
-      prisma.fileMetadata.count({
-        where: {
-          userId: session.user.id,
-          isFolder: false,
-          extension: {
-            in: [...VIDEO_EXTENSIONS],
-          },
-        },
-      }),
-      prisma.mediaThumbnail.count({
-        where: {
-          userId: session.user.id,
-          status: "ready",
-        },
-      }),
-      prisma.mediaThumbnail.count({
-        where: {
-          userId: session.user.id,
-          status: {
-            in: ["pending", "processing"],
-          },
-        },
-      }),
-      prisma.mediaThumbnail.count({
-        where: {
-          userId: session.user.id,
-          status: "failed",
         },
       }),
     ])
@@ -270,12 +240,6 @@ export async function GET(request: NextRequest) {
       tasks: mappedTasks,
       summary: {
         cachedFiles,
-        thumbnails: {
-          ready: readyThumbnails,
-          total: totalVideoFiles,
-          pending: pendingThumbnails,
-          failed: failedThumbnails,
-        },
       },
     })
   } catch (error) {

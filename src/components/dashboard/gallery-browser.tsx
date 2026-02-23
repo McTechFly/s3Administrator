@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button"
 import { EmptyState } from "@/components/dashboard/empty-state"
 import { formatSize, formatDate } from "@/lib/format"
 import type { GalleryItem } from "@/types"
+import { useThumbnail } from "@/hooks/use-thumbnail"
 
 interface GalleryBrowserProps {
   items: GalleryItem[]
@@ -14,6 +15,8 @@ interface GalleryBrowserProps {
   isFetchingNextPage: boolean
   hasNextPage: boolean
   selectedKeys: Set<string>
+  credentialId: string
+  bucket: string
   onSelect: (item: GalleryItem, options?: { shiftKey?: boolean }) => void
   onSelectAllVisible: () => void
   onNavigate: (item: GalleryItem) => void
@@ -23,11 +26,130 @@ interface GalleryBrowserProps {
   onLoadMore: () => void
 }
 
-
 function getDisplayName(key: string): string {
   const normalized = key.endsWith("/") ? key.slice(0, -1) : key
   const parts = normalized.split("/")
   return parts[parts.length - 1] || key
+}
+
+interface GalleryItemCardProps {
+  item: GalleryItem
+  selected: boolean
+  credentialId: string
+  bucket: string
+  shiftPressedRef: React.MutableRefObject<boolean>
+  onSelect: (item: GalleryItem, options?: { shiftKey?: boolean }) => void
+  onNavigate: (item: GalleryItem) => void
+  onOpenPreview: (item: GalleryItem) => void
+  onDownload: (item: GalleryItem) => void
+  onDelete: (item: GalleryItem) => void
+}
+
+function GalleryItemCard({
+  item,
+  selected,
+  credentialId,
+  bucket,
+  shiftPressedRef,
+  onSelect,
+  onNavigate,
+  onOpenPreview,
+  onDownload,
+  onDelete,
+}: GalleryItemCardProps) {
+  const { objectUrl, isGenerating } = useThumbnail(item, credentialId, bucket)
+
+  return (
+    <div
+      className={`group rounded-lg border transition ${selected ? "border-primary ring-1 ring-primary/40" : "border-border"}`}
+    >
+      <div className="relative">
+        <button
+          type="button"
+          onClick={() => {
+            if (item.isFolder) {
+              onNavigate(item)
+            } else {
+              onOpenPreview(item)
+            }
+          }}
+          className="block h-40 w-full overflow-hidden rounded-t-lg bg-muted"
+        >
+          {item.isFolder ? (
+            <div className="flex h-full flex-col items-center justify-center gap-2 bg-amber-50/70 text-amber-700 dark:bg-amber-950/30 dark:text-amber-300">
+              <FolderOpen className="h-10 w-10 fill-current/20" />
+              <span className="text-xs">
+                {typeof item.fileCount === "number"
+                  ? `${item.fileCount} ${item.fileCount === 1 ? "file" : "files"}`
+                  : "Folder"}
+              </span>
+            </div>
+          ) : objectUrl ? (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              src={objectUrl}
+              alt={item.key}
+              className="h-full w-full object-cover"
+              loading="lazy"
+            />
+          ) : isGenerating ? (
+            <div className="flex h-full flex-col items-center justify-center gap-2 text-muted-foreground">
+              {item.isVideo ? <Video className="h-7 w-7" /> : <ImageIcon className="h-7 w-7" />}
+              <Loader2 className="h-4 w-4 animate-spin" />
+            </div>
+          ) : (
+            <div className="flex h-full items-center justify-center text-muted-foreground">
+              {item.isVideo ? (
+                <Video className="h-7 w-7" />
+              ) : (
+                <ImageIcon className="h-7 w-7" />
+              )}
+            </div>
+          )}
+        </button>
+        <div className="absolute left-2 top-2">
+          <Checkbox
+            checked={selected}
+            onPointerDown={(event) => {
+              shiftPressedRef.current = event.shiftKey
+            }}
+            onKeyDown={(event) => {
+              shiftPressedRef.current = event.shiftKey
+            }}
+            onCheckedChange={() => {
+              onSelect(item, { shiftKey: shiftPressedRef.current })
+              shiftPressedRef.current = false
+            }}
+          />
+        </div>
+      </div>
+
+      <div className="space-y-1 p-3">
+        <p className="truncate text-sm font-medium" title={item.key}>
+          {getDisplayName(item.key)}
+        </p>
+        <p className="text-xs text-muted-foreground">
+          {item.isFolder
+            ? `${typeof item.fileCount === "number" ? item.fileCount : 0} ${item.fileCount === 1 ? "file" : "files"} • ${formatDate(item.lastModified)}`
+            : `${formatSize(item.size)} • ${formatDate(item.lastModified)}`}
+        </p>
+        <div className="flex items-center gap-1 pt-1">
+          {item.isFolder ? (
+            <Button size="sm" variant="outline" className="h-7 px-2" onClick={() => onNavigate(item)}>
+              <FolderOpen className="h-3.5 w-3.5" />
+            </Button>
+          ) : (
+            <Button size="sm" variant="outline" className="h-7 px-2" onClick={() => onDownload(item)}>
+              <Download className="h-3.5 w-3.5" />
+            </Button>
+          )}
+          <Button size="sm" variant="outline" className="h-7 px-2" onClick={() => onDelete(item)}>
+            <Trash2 className="h-3.5 w-3.5" />
+          </Button>
+        </div>
+      </div>
+    </div>
+  )
 }
 
 export function GalleryBrowser({
@@ -36,6 +158,8 @@ export function GalleryBrowser({
   isFetchingNextPage,
   hasNextPage,
   selectedKeys,
+  credentialId,
+  bucket,
   onSelect,
   onSelectAllVisible,
   onNavigate,
@@ -99,104 +223,21 @@ export function GalleryBrowser({
       </div>
 
       <div className="grid grid-cols-2 gap-4 md:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-6">
-        {items.map((item) => {
-          const selected = selectedKeys.has(item.key)
-
-          return (
-            <div
-              key={item.id}
-              className={`group rounded-lg border transition ${selected ? "border-primary ring-1 ring-primary/40" : "border-border"}`}
-            >
-              <div className="relative">
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (item.isFolder) {
-                      onNavigate(item)
-                    } else {
-                      onOpenPreview(item)
-                    }
-                  }}
-                  className="block h-40 w-full overflow-hidden rounded-t-lg bg-muted"
-                >
-                  {item.isFolder ? (
-                    <div className="flex h-full flex-col items-center justify-center gap-2 bg-amber-50/70 text-amber-700 dark:bg-amber-950/30 dark:text-amber-300">
-                      <FolderOpen className="h-10 w-10 fill-current/20" />
-                      <span className="text-xs">
-                        {typeof item.fileCount === "number"
-                          ? `${item.fileCount} ${item.fileCount === 1 ? "file" : "files"}`
-                          : "Folder"}
-                      </span>
-                    </div>
-                  ) : item.previewUrl ? (
-                    // eslint-disable-next-line @next/next/no-img-element
-                    <img
-                      src={item.previewUrl}
-                      alt={item.key}
-                      className="h-full w-full object-cover"
-                      loading="lazy"
-                    />
-                  ) : (
-                    <div className="flex h-full items-center justify-center text-muted-foreground">
-                      {item.thumbnailStatus !== null ? (
-                        <div className="flex flex-col items-center gap-2">
-                          {item.isVideo ? <Video className="h-7 w-7" /> : <ImageIcon className="h-7 w-7" />}
-                          <span className="text-xs">
-                            {item.thumbnailStatus === "failed"
-                              ? "Thumbnail failed"
-                              : "Generating..."}
-                          </span>
-                        </div>
-                      ) : (
-                        <span className="text-xs">Preview unavailable</span>
-                      )}
-                    </div>
-                  )}
-                </button>
-                <div className="absolute left-2 top-2">
-                  <Checkbox
-                    checked={selected}
-                    onPointerDown={(event) => {
-                      shiftPressedRef.current = event.shiftKey
-                    }}
-                    onKeyDown={(event) => {
-                      shiftPressedRef.current = event.shiftKey
-                    }}
-                    onCheckedChange={() => {
-                      onSelect(item, { shiftKey: shiftPressedRef.current })
-                      shiftPressedRef.current = false
-                    }}
-                  />
-                </div>
-              </div>
-
-              <div className="space-y-1 p-3">
-                <p className="truncate text-sm font-medium" title={item.key}>
-                  {getDisplayName(item.key)}
-                </p>
-                <p className="text-xs text-muted-foreground">
-                  {item.isFolder
-                    ? `${typeof item.fileCount === "number" ? item.fileCount : 0} ${item.fileCount === 1 ? "file" : "files"} • ${formatDate(item.lastModified)}`
-                    : `${formatSize(item.size)} • ${formatDate(item.lastModified)}`}
-                </p>
-                <div className="flex items-center gap-1 pt-1">
-                  {item.isFolder ? (
-                    <Button size="sm" variant="outline" className="h-7 px-2" onClick={() => onNavigate(item)}>
-                      <FolderOpen className="h-3.5 w-3.5" />
-                    </Button>
-                  ) : (
-                    <Button size="sm" variant="outline" className="h-7 px-2" onClick={() => onDownload(item)}>
-                      <Download className="h-3.5 w-3.5" />
-                    </Button>
-                  )}
-                  <Button size="sm" variant="outline" className="h-7 px-2" onClick={() => onDelete(item)}>
-                    <Trash2 className="h-3.5 w-3.5" />
-                  </Button>
-                </div>
-              </div>
-            </div>
-          )
-        })}
+        {items.map((item) => (
+          <GalleryItemCard
+            key={item.id}
+            item={item}
+            selected={selectedKeys.has(item.key)}
+            credentialId={credentialId}
+            bucket={bucket}
+            shiftPressedRef={shiftPressedRef}
+            onSelect={onSelect}
+            onNavigate={onNavigate}
+            onOpenPreview={onOpenPreview}
+            onDownload={onDownload}
+            onDelete={onDelete}
+          />
+        ))}
       </div>
 
       <div ref={sentinelRef} className="flex h-16 items-center justify-center">

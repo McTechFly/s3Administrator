@@ -3,7 +3,7 @@ import { prisma } from "@/lib/db"
 import { getTaskMaxActivePerUser, getTaskWorkerScanIntervalSeconds } from "@/lib/task-engine-config"
 const PORT = process.env.PORT || "3000"
 
-const TASK_TYPES = ["bulk_delete", "object_transfer", "thumbnail_generate"] as const
+const TASK_TYPES = ["bulk_delete", "object_transfer"] as const
 
 interface DueUserType {
   userId: string
@@ -16,7 +16,7 @@ async function findDueUserTypes(): Promise<DueUserType[]> {
     FROM "BackgroundTask" t
     WHERE t."lifecycleState" = 'active'
       AND t."status" IN ('pending', 'in_progress')
-      AND t."type" IN ('bulk_delete', 'thumbnail_generate', 'object_transfer')
+      AND t."type" IN ('bulk_delete', 'object_transfer')
       AND t."nextRunAt" <= NOW()
     ORDER BY t."userId"
     LIMIT 32

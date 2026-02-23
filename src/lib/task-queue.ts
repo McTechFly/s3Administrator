@@ -43,7 +43,7 @@ export interface TaskQueueWorkerOptions {
   enabled: boolean
 }
 
-const TASK_TYPES = ["bulk_delete", "object_transfer", "thumbnail_generate"] as const
+const TASK_TYPES = ["bulk_delete", "object_transfer"] as const
 
 interface DueUserType {
   userId: string
@@ -116,7 +116,7 @@ async function findDueUserTypes(limit: number): Promise<DueUserType[]> {
     FROM "BackgroundTask" t
     WHERE t."lifecycleState" = 'active'
       AND t."status" IN ('pending', 'in_progress')
-      AND t."type" IN ('bulk_delete', 'thumbnail_generate', 'object_transfer')
+      AND t."type" IN ('bulk_delete', 'object_transfer')
       AND t."nextRunAt" <= NOW()
     ORDER BY t."userId"
     LIMIT ${limit}

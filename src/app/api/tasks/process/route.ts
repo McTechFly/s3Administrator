@@ -15,22 +15,8 @@ import { prisma } from "@/lib/db"
 import { getS3Client } from "@/lib/s3"
 import { rebuildUserExtensionStats } from "@/lib/file-stats"
 import { buildFileSearchSqlWhereClause, parseScopes } from "@/lib/file-search"
-import { getMediaTypeFromExtension } from "@/lib/media"
 import { getUserPlanEntitlements } from "@/lib/plan-entitlements"
 import { getBucketLimitViolation } from "@/lib/plan-limits"
-import { generateThumbnail } from "@/lib/thumbnail-worker"
-import {
-  buildLegacyThumbnailObjectKey,
-  buildThumbnailObjectKey,
-  buildThumbnailSourceMetadata,
-  doesThumbnailMetadataMatchSource,
-  getThumbnailMaxWidth,
-  THUMBNAIL_SOURCE_LAST_MODIFIED_META_KEY,
-  THUMBNAIL_SOURCE_SIZE_META_KEY,
-  uploadThumbnailToSameBucket,
-} from "@/lib/thumbnail-storage"
-import { deleteMediaThumbnailsForKeys } from "@/lib/media-thumbnails"
-import { isThumbnailCacheEnabledForUser } from "@/lib/thumbnail-cache-policy"
 import { logUserAuditAction } from "@/lib/audit-logger"
 import {
   getTaskEngineInternalToken,
@@ -56,7 +42,6 @@ export const maxDuration = 60
 const CHUNK_SIZE = 500
 const TRANSFER_CHUNK_SIZE = 50
 const LOCK_SECONDS = 45
-const THUMBNAIL_TIMEOUT_MS = 5_000
 const SYNC_POLL_INTERVAL_SECONDS = 60
 const MAX_STALE_SCHEDULE_SKIPS_PER_CALL = 32
 
@@ -65,12 +50,6 @@ interface BulkDeleteTaskPayload {
   selectedType: string
   selectedCredentialIds: string[]
   selectedBucketScopes: string[]
-}
-
-interface ThumbnailTaskPayload {
-  bucket: string
-  key: string
-  credentialId: string
 }
 
 interface BulkDeleteTaskProgress {
@@ -135,26 +114,6 @@ function parsePayload(raw: unknown): BulkDeleteTaskPayload | null {
     selectedBucketScopes: Array.isArray(payload.selectedBucketScopes)
       ? payload.selectedBucketScopes.filter((value): value is string => typeof value === "string")
       : [],
-  }
-}
-
-function parseThumbnailPayload(raw: unknown): ThumbnailTaskPayload | null {
-  if (!raw || typeof raw !== "object") return null
-
-  const payload = raw as {
-    bucket?: unknown
-    key?: unknown
-    credentialId?: unknown
-  }
-
-  if (typeof payload.bucket !== "string" || !payload.bucket.trim()) return null
-  if (typeof payload.key !== "string" || !payload.key.trim()) return null
-  if (typeof payload.credentialId !== "string" || !payload.credentialId.trim()) return null
-
-  return {
-    bucket: payload.bucket.trim(),
-    key: payload.key.trim(),
-    credentialId: payload.credentialId.trim(),
   }
 }
 
@@ -519,7 +478,7 @@ async function realignFutureRecurringRun(params: {
       status: "pending",
       isRecurring: true,
       type: {
-        in: ["bulk_delete", "thumbnail_generate", "object_transfer"],
+        in: ["bulk_delete", "object_transfer"],
       },
       nextRunAt: {
         gt: now,
@@ -801,13 +760,6 @@ async function cleanupSyncDestinationDrift(params: {
         key: { in: deletedKeyList },
       },
     })
-    await deleteMediaThumbnailsForKeys({
-      userId,
-      credentialId: payload.destinationCredentialId,
-      bucket: payload.destinationBucket,
-      keys: deletedKeyList,
-    })
-
     deleted += deletedKeyList.length
     failed += Math.max(0, driftKeys.length - deletedKeys.size)
   }
@@ -825,7 +777,6 @@ export async function POST(request: Request) {
     }
     | null = null
   let userId: string | null = null
-  let thumbnailPayload: ThumbnailTaskPayload | null = null
   let transferPayload: ObjectTransferTaskPayload | null = null
   let taskExecutionHistory: TaskExecutionHistoryEntry[] = []
   let claimedTaskSchedule: ResolvedTaskSchedule | null = null
@@ -850,7 +801,7 @@ export async function POST(request: Request) {
     }
     const actorUserId = userId
 
-    const TASK_TYPES = ["bulk_delete", "thumbnail_generate", "object_transfer"] as const
+    const TASK_TYPES = ["bulk_delete", "object_transfer"] as const
     const requestedType = (new URL(request.url).searchParams.get("type") ?? "").trim()
     const typeFilter = requestedType && TASK_TYPES.includes(requestedType as typeof TASK_TYPES[number])
       ? [requestedType]
@@ -860,7 +811,7 @@ export async function POST(request: Request) {
     const maxActive = getTaskMaxActivePerUser()
 
     // Per-type concurrency: each type gets a reserved share of the total slots
-    // so one type (e.g. thumbnail_generate) can never starve another (e.g. object_transfer).
+    // so one type (e.g. bulk_delete) can never starve another (e.g. object_transfer).
     // Reserved slots = floor(maxActive / number_of_types), minimum 1.
     // Remaining slots are available to any type on a first-come basis.
     const typeCount = TASK_TYPES.length
@@ -1021,433 +972,6 @@ export async function POST(request: Request) {
     }
     claimedTaskSchedule = resolveTaskSchedule(candidate)
     taskExecutionHistory = normalizeExecutionHistory(candidate.executionHistory)
-
-    if (candidate.type === "thumbnail_generate") {
-      const planPayload = resolveTaskPlanPayload(candidate.executionPlan, candidate.payload)
-      thumbnailPayload = parseThumbnailPayload(planPayload)
-      if (!thumbnailPayload) {
-        await prisma.backgroundTask.update({
-          where: { id: candidate.id },
-          data: {
-            status: "failed",
-            attempts: candidate.attempts + 1,
-            lastError: "Invalid thumbnail payload",
-            completedAt: new Date(),
-            nextRunAt: new Date(),
-            executionHistory: addTaskHistoryEntry(taskExecutionHistory, {
-              status: "failed",
-              message: "Invalid thumbnail payload",
-            }),
-          },
-        })
-        return NextResponse.json({ processed: false, message: "Invalid thumbnail payload" })
-      }
-
-      const thumbnailCacheEnabled = await isThumbnailCacheEnabledForUser(actorUserId)
-      if (!thumbnailCacheEnabled) {
-        await deleteMediaThumbnailsForKeys({
-          userId: actorUserId,
-          credentialId: thumbnailPayload.credentialId,
-          bucket: thumbnailPayload.bucket,
-          keys: [thumbnailPayload.key],
-        })
-
-        await prisma.backgroundTask.update({
-          where: { id: candidate.id },
-          data: {
-            status: "completed",
-            attempts: 0,
-            completedAt: new Date(),
-            nextRunAt: new Date(),
-            lastError: null,
-            executionHistory: addTaskHistoryEntry(taskExecutionHistory, {
-              status: "skipped",
-              message: "Thumbnail task skipped because thumbnail cache is disabled",
-            }),
-          },
-        })
-
-        await logUserAuditAction({
-          userId: actorUserId,
-          eventType: "s3_action",
-          eventName: "thumbnail_generate_skipped",
-          path: "/api/tasks/process",
-          method: "POST",
-          target: thumbnailPayload.key,
-          metadata: {
-            bucket: thumbnailPayload.bucket,
-            credentialId: thumbnailPayload.credentialId,
-            reason: "thumbnail_cache_disabled_for_plan",
-          },
-        })
-
-        return NextResponse.json({
-          processed: true,
-          taskId: candidate.id,
-          done: true,
-          skipped: "thumbnail_cache_disabled",
-        })
-      }
-
-      const { client } = await getS3Client(actorUserId, thumbnailPayload.credentialId)
-      const sourceFile = await prisma.fileMetadata.findFirst({
-        where: {
-          userId: actorUserId,
-          credentialId: thumbnailPayload.credentialId,
-          bucket: thumbnailPayload.bucket,
-          key: thumbnailPayload.key,
-          isFolder: false,
-        },
-        select: {
-          extension: true,
-          size: true,
-          lastModified: true,
-        },
-      })
-
-      if (!sourceFile) {
-        await prisma.mediaThumbnail.updateMany({
-          where: {
-            userId: actorUserId,
-            credentialId: thumbnailPayload.credentialId,
-            bucket: thumbnailPayload.bucket,
-            key: thumbnailPayload.key,
-          },
-          data: {
-            status: "failed",
-            lastError: "Source file is missing",
-          },
-        })
-        await prisma.backgroundTask.update({
-          where: { id: candidate.id },
-          data: {
-            status: "completed",
-            attempts: 0,
-            completedAt: new Date(),
-            nextRunAt: new Date(),
-            lastError: null,
-            executionHistory: addTaskHistoryEntry(taskExecutionHistory, {
-              status: "skipped",
-              message: "Thumbnail source file is missing",
-            }),
-          },
-        })
-        return NextResponse.json({
-          processed: true,
-          taskId: candidate.id,
-          done: true,
-          skipped: "source_missing",
-        })
-      }
-
-      const mediaType = getMediaTypeFromExtension(sourceFile.extension)
-      if (mediaType !== "video" && mediaType !== "image") {
-        await prisma.mediaThumbnail.updateMany({
-          where: {
-            userId: actorUserId,
-            credentialId: thumbnailPayload.credentialId,
-            bucket: thumbnailPayload.bucket,
-            key: thumbnailPayload.key,
-          },
-          data: {
-            status: "failed",
-            lastError: "Unsupported media type for thumbnail generation",
-          },
-        })
-        await prisma.backgroundTask.update({
-          where: { id: candidate.id },
-          data: {
-            status: "completed",
-            attempts: 0,
-            completedAt: new Date(),
-            nextRunAt: new Date(),
-            lastError: null,
-            executionHistory: addTaskHistoryEntry(taskExecutionHistory, {
-              status: "skipped",
-              message: "Unsupported media type for thumbnail generation",
-            }),
-          },
-        })
-        return NextResponse.json({
-          processed: true,
-          taskId: candidate.id,
-          done: true,
-          skipped: "unsupported_type",
-        })
-      }
-
-      const sourceLastModified = sourceFile.lastModified
-      const sourceSize = sourceFile.size
-      const sourceMetadata = buildThumbnailSourceMetadata({
-        sourceLastModified,
-        sourceSize,
-      })
-      const thumbnailKey = buildThumbnailObjectKey({
-        bucket: thumbnailPayload.bucket,
-        key: thumbnailPayload.key,
-        sourceLastModified,
-        sourceSize,
-      })
-      const legacyThumbnailKey = buildLegacyThumbnailObjectKey({
-        bucket: thumbnailPayload.bucket,
-        key: thumbnailPayload.key,
-        sourceLastModified,
-        sourceSize,
-      })
-      const thumbnailBucket = thumbnailPayload.bucket
-
-      await prisma.mediaThumbnail.upsert({
-        where: {
-          userId_credentialId_bucket_key: {
-            userId: actorUserId,
-            credentialId: thumbnailPayload.credentialId,
-            bucket: thumbnailPayload.bucket,
-            key: thumbnailPayload.key,
-          },
-        },
-        create: {
-          userId: actorUserId,
-          credentialId: thumbnailPayload.credentialId,
-          bucket: thumbnailPayload.bucket,
-          key: thumbnailPayload.key,
-          status: "processing",
-          thumbnailBucket,
-          thumbnailKey,
-          mimeType: "image/webp",
-          sourceLastModified,
-          sourceSize,
-          lastError: null,
-        },
-        update: {
-          status: "processing",
-          thumbnailBucket,
-          thumbnailKey,
-          mimeType: "image/webp",
-          sourceLastModified,
-          sourceSize,
-          lastError: null,
-        },
-      })
-
-      const queueLagMs = Math.max(0, Date.now() - candidate.createdAt.getTime())
-
-      // Reuse existing thumbnails by deterministic object key, including legacy-key fallback.
-      let reusableThumbnailFound = false
-      let reusableThumbnailKey = thumbnailKey
-      let requiresLegacyCopy = false
-      try {
-        const head = await client.send(new HeadObjectCommand({
-          Bucket: thumbnailPayload.bucket,
-          Key: thumbnailKey,
-        }))
-        reusableThumbnailFound = doesThumbnailMetadataMatchSource(head.Metadata, {
-          sourceLastModified,
-          sourceSize,
-        })
-      } catch {
-        reusableThumbnailFound = false
-      }
-
-      if (!reusableThumbnailFound && legacyThumbnailKey !== thumbnailKey) {
-        try {
-          const legacyHead = await client.send(new HeadObjectCommand({
-            Bucket: thumbnailPayload.bucket,
-            Key: legacyThumbnailKey,
-          }))
-          const legacyHasSourceMetadata =
-            Boolean(legacyHead.Metadata?.[THUMBNAIL_SOURCE_LAST_MODIFIED_META_KEY]) &&
-            Boolean(legacyHead.Metadata?.[THUMBNAIL_SOURCE_SIZE_META_KEY])
-          const legacyMatches = legacyHasSourceMetadata
-            ? doesThumbnailMetadataMatchSource(legacyHead.Metadata, {
-                sourceLastModified,
-                sourceSize,
-              })
-            : true
-          if (legacyMatches) {
-            reusableThumbnailFound = true
-            reusableThumbnailKey = legacyThumbnailKey
-            requiresLegacyCopy = true
-          }
-        } catch {
-          reusableThumbnailFound = false
-        }
-      }
-
-      if (reusableThumbnailFound) {
-        if (requiresLegacyCopy) {
-          try {
-            await client.send(
-              new CopyObjectCommand({
-                Bucket: thumbnailPayload.bucket,
-                Key: thumbnailKey,
-                CopySource: encodeURIComponent(`${thumbnailPayload.bucket}/${reusableThumbnailKey}`),
-                CacheControl: "public, max-age=31536000, immutable",
-                ContentType: "image/webp",
-                MetadataDirective: "REPLACE",
-                Metadata: sourceMetadata,
-              })
-            )
-          } catch {
-            // Best effort copy; keep using legacy object key when copy is denied.
-            reusableThumbnailKey = legacyThumbnailKey
-          }
-        }
-
-        await prisma.mediaThumbnail.update({
-          where: {
-            userId_credentialId_bucket_key: {
-              userId: actorUserId,
-              credentialId: thumbnailPayload.credentialId,
-              bucket: thumbnailPayload.bucket,
-              key: thumbnailPayload.key,
-            },
-          },
-          data: {
-            status: "ready",
-            thumbnailBucket,
-            thumbnailKey: reusableThumbnailKey,
-            mimeType: "image/webp",
-            sourceLastModified,
-            sourceSize,
-            lastError: null,
-          },
-        })
-
-        await prisma.backgroundTask.update({
-          where: { id: candidate.id },
-          data: {
-            status: "completed",
-            attempts: 0,
-            completedAt: new Date(),
-            nextRunAt: new Date(),
-            lastError: null,
-            executionHistory: addTaskHistoryEntry(taskExecutionHistory, {
-              status: "succeeded",
-              message: "Thumbnail already exists in S3; reused existing object",
-              metadata: { queueLagMs },
-            }),
-          },
-        })
-
-        return NextResponse.json({
-          processed: true,
-          taskId: candidate.id,
-          done: true,
-        })
-      }
-
-      const generated = await generateThumbnail({
-        client,
-        bucket: thumbnailPayload.bucket,
-        key: thumbnailPayload.key,
-        mediaType,
-        maxWidth: getThumbnailMaxWidth(),
-        timeoutMs: THUMBNAIL_TIMEOUT_MS,
-        sourceSize,
-      })
-
-      const stillEnabled = await isThumbnailCacheEnabledForUser(actorUserId)
-      if (!stillEnabled) {
-        await deleteMediaThumbnailsForKeys({
-          userId: actorUserId,
-          credentialId: thumbnailPayload.credentialId,
-          bucket: thumbnailPayload.bucket,
-          keys: [thumbnailPayload.key],
-        })
-
-        await prisma.backgroundTask.update({
-          where: { id: candidate.id },
-          data: {
-            status: "completed",
-            attempts: 0,
-            completedAt: new Date(),
-            nextRunAt: new Date(),
-            lastError: null,
-            executionHistory: addTaskHistoryEntry(taskExecutionHistory, {
-              status: "skipped",
-              message: "Thumbnail task skipped because thumbnail cache was disabled during run",
-            }),
-          },
-        })
-
-        return NextResponse.json({
-          processed: true,
-          taskId: candidate.id,
-          done: true,
-          skipped: "thumbnail_cache_disabled",
-        })
-      }
-
-      await uploadThumbnailToSameBucket({
-        client,
-        bucket: thumbnailPayload.bucket,
-        key: thumbnailKey,
-        body: generated.buffer,
-        contentType: generated.mimeType,
-        metadata: sourceMetadata,
-      })
-
-      await prisma.mediaThumbnail.update({
-        where: {
-          userId_credentialId_bucket_key: {
-            userId: actorUserId,
-            credentialId: thumbnailPayload.credentialId,
-            bucket: thumbnailPayload.bucket,
-            key: thumbnailPayload.key,
-          },
-        },
-        data: {
-          status: "ready",
-          thumbnailBucket,
-          thumbnailKey,
-          mimeType: generated.mimeType,
-          sourceLastModified,
-          sourceSize,
-          lastError: null,
-        },
-      })
-
-      await prisma.backgroundTask.update({
-        where: { id: candidate.id },
-        data: {
-          status: "completed",
-          attempts: 0,
-          completedAt: new Date(),
-          nextRunAt: new Date(),
-          lastError: null,
-          executionHistory: addTaskHistoryEntry(taskExecutionHistory, {
-            status: "succeeded",
-            message: "Thumbnail generated successfully",
-            metadata: {
-              durationMs: generated.durationMs,
-              queueLagMs,
-            },
-          }),
-        },
-      })
-
-      await logUserAuditAction({
-        userId: actorUserId,
-        eventType: "s3_action",
-        eventName: "thumbnail_generate",
-        path: "/api/tasks/process",
-        method: "POST",
-        target: thumbnailPayload.key,
-        metadata: {
-          bucket: thumbnailPayload.bucket,
-          credentialId: thumbnailPayload.credentialId,
-          durationMs: generated.durationMs,
-          queueLagMs,
-        },
-      })
-
-      return NextResponse.json({
-        processed: true,
-        taskId: candidate.id,
-        done: true,
-        type: "thumbnail_generate",
-      })
-    }
 
     if (candidate.type === "object_transfer") {
       const planPayload = resolveTaskPlanPayload(candidate.executionPlan, candidate.payload)
@@ -1977,12 +1501,6 @@ export async function POST(request: Request) {
                 userId: actorUserId,
               },
             })
-            await deleteMediaThumbnailsForKeys({
-              userId: actorUserId,
-              credentialId: transferPayload.sourceCredentialId,
-              bucket: transferPayload.sourceBucket,
-              keys: [sourceFile.key],
-            })
             skippedInBatch++
           } else {
             failedInBatch++
@@ -1993,14 +1511,6 @@ export async function POST(request: Request) {
         }
       }
 
-      if (movedSourceKeys.length > 0) {
-        await deleteMediaThumbnailsForKeys({
-          userId: actorUserId,
-          credentialId: transferPayload.sourceCredentialId,
-          bucket: transferPayload.sourceBucket,
-          keys: movedSourceKeys,
-        })
-      }
 
       const total = progress.total > 0 ? progress.total : sourceBatch.length
       const nextProcessed = progress.processed + processedInBatch
@@ -2193,14 +1703,6 @@ export async function POST(request: Request) {
 
       const keys = group.rows.map((row) => row.key)
       const deletedKeys = await deleteKeysFromBucket(client, group.bucket, keys)
-      if (deletedKeys.size > 0) {
-        await deleteMediaThumbnailsForKeys({
-          userId: actorUserId,
-          credentialId: group.credentialId,
-          bucket: group.bucket,
-          keys: Array.from(deletedKeys),
-        })
-      }
 
       for (const row of group.rows) {
         if (deletedKeys.has(row.key)) {
@@ -2334,35 +1836,6 @@ export async function POST(request: Request) {
             ? nextRunAtForTaskSchedule(claimedTaskSchedule, now) ??
               new Date(now.getTime() + SYNC_POLL_INTERVAL_SECONDS * 1000)
             : null
-
-        if (claimedTask.type === "thumbnail_generate" && thumbnailPayload) {
-          await prisma.mediaThumbnail.updateMany({
-            where: {
-              userId,
-              credentialId: thumbnailPayload.credentialId,
-              bucket: thumbnailPayload.bucket,
-              key: thumbnailPayload.key,
-            },
-            data: {
-              status: "failed",
-              lastError: message,
-            },
-          })
-
-          await logUserAuditAction({
-            userId,
-            eventType: "s3_action",
-            eventName: "thumbnail_generate_failed",
-            path: "/api/tasks/process",
-            method: "POST",
-            target: thumbnailPayload.key,
-            metadata: {
-              bucket: thumbnailPayload.bucket,
-              credentialId: thumbnailPayload.credentialId,
-              error: message,
-            },
-          })
-        }
 
         if (claimedTask.type === "object_transfer" && transferPayload) {
           await logUserAuditAction({
