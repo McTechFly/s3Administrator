@@ -22,10 +22,10 @@ RUN --mount=type=cache,target=/root/.npm set -e; \
       fi; \
       echo "@s3administrator:registry=https://npm.pkg.github.com" >> .npmrc; \
       npm install --no-save --no-package-lock \
-        "@s3administrator/admin@^1.1.2" \
+        "@s3administrator/admin@^1.1.3" \
         "@s3administrator/audit@^1.1.0" \
         "@s3administrator/auth@^1.1.0" \
-        "@s3administrator/billing@^1.1.1" \
+        "@s3administrator/billing@^1.1.2" \
         "@s3administrator/marketing@^1.1.0" \
         "@s3administrator/setup@^1.0.2"; \
     fi; \
