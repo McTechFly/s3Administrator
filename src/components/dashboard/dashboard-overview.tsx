@@ -23,6 +23,7 @@ import {
 } from "@/components/ui/table"
 import { Skeleton } from "@/components/ui/skeleton"
 import { formatSize, formatDate } from "@/lib/format"
+import { QuotaUsageBar } from "@/components/dashboard/quota-usage-bar"
 
 interface OverviewSummary {
   indexedBucketCount: number
@@ -68,6 +69,16 @@ interface OverviewResponse {
   buckets: OverviewBucket[]
   extensions: OverviewExtension[]
   types: OverviewType[]
+}
+
+interface UsageResponse {
+  tier: string
+  fileCount: number
+  fileLimit: number | null
+  bucketCount: number
+  bucketLimit: number | null
+  storageBytes: number
+  storageLimitBytes: number | null
 }
 
 interface BucketRef {
@@ -116,6 +127,15 @@ export function DashboardOverview() {
         throw new Error("Failed to load overview")
       }
       return res.json() as Promise<OverviewResponse>
+    },
+  })
+
+  const { data: usageData } = useQuery<UsageResponse>({
+    queryKey: ["dashboard-usage"],
+    queryFn: async () => {
+      const res = await fetch("/api/s3/usage")
+      if (!res.ok) throw new Error(`Usage API error: ${res.status}`)
+      return res.json() as Promise<UsageResponse>
     },
   })
 
@@ -188,6 +208,7 @@ export function DashboardOverview() {
     }
 
     if (failureCount === 0) {
+      localStorage.setItem("s3admin:lastAutoSync", String(Date.now()))
       const prefix = trigger === "auto" ? "Auto refresh complete" : "Refresh complete"
       toast.success(`${prefix}: synced ${formatCount(syncedTotal)} file(s) across ${successCount} bucket(s)`)
       return
@@ -201,6 +222,15 @@ export function DashboardOverview() {
   useEffect(() => {
     if (autoRefreshStartedRef.current) return
     autoRefreshStartedRef.current = true
+
+    const AUTO_SYNC_KEY = "s3admin:lastAutoSync"
+    const MIN_INTERVAL_MS = 60 * 60 * 1000 // 1 hour
+
+    const lastSync = localStorage.getItem(AUTO_SYNC_KEY)
+    const elapsed = lastSync ? Date.now() - Number(lastSync) : Infinity
+    if (elapsed < MIN_INTERVAL_MS) return
+
+    localStorage.setItem(AUTO_SYNC_KEY, String(Date.now()))
     void runLiveRefresh("auto")
   }, [runLiveRefresh])
 
@@ -321,6 +351,39 @@ export function DashboardOverview() {
           </CardContent>
         </Card>
       </div>
+
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle className="text-base">Plan quota</CardTitle>
+          <CardDescription>
+            {usageData ? `Current usage on the ${usageData.tier} plan` : "Loading..."}
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {usageData ? (
+            <>
+              <QuotaUsageBar
+                label="Files"
+                current={usageData.fileCount}
+                limit={usageData.fileLimit}
+              />
+              <QuotaUsageBar
+                label="Indexed buckets"
+                current={usageData.bucketCount}
+                limit={usageData.bucketLimit}
+              />
+              <QuotaUsageBar
+                label="Storage"
+                current={usageData.storageBytes}
+                limit={usageData.storageLimitBytes}
+                format={formatSize}
+              />
+            </>
+          ) : (
+            <Skeleton className="h-12 w-full" />
+          )}
+        </CardContent>
+      </Card>
 
       <Card>
         <CardHeader>
