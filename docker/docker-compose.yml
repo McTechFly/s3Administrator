@@ -100,7 +100,7 @@ services:
         condition: service_healthy
 
   proxy:
-    image: caddy:2.10-alpine
+    image: caddy:2.11.1-alpine
     ports:
       - "80:80"
       - "443:443"
@@ -118,7 +118,7 @@ services:
     restart: unless-stopped
 
   node-exporter:
-    image: prom/node-exporter:v1.9.1
+    image: prom/node-exporter:v1.10.2
     command:
       - --path.rootfs=/host
       - --path.procfs=/host/proc
@@ -131,7 +131,7 @@ services:
     restart: unless-stopped
 
   db:
-    image: postgres:16
+    image: postgres:17
     ports:
       - "${POSTGRES_PORT:-5433}:5432"
     volumes:
