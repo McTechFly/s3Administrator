@@ -250,6 +250,7 @@ model Plan {
   stripePriceId      String?  @unique
   bucketLimit        Int      @default(1)
   fileLimit          Int      @default(1000)
+  storageLimitBytes  BigInt   @default(0)
   features           String[] @default([])
   thumbnailCache     Boolean  @default(false)
   auditLogs          Boolean  @default(false)

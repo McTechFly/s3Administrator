@@ -1,0 +1,2 @@
+-- AlterTable
+ALTER TABLE "Plan" ADD COLUMN IF NOT EXISTS "storageLimitBytes" BIGINT NOT NULL DEFAULT 0;

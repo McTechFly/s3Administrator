@@ -19,12 +19,15 @@ function getStripe(): Stripe | null {
   return new Stripe(key, { apiVersion: "2026-01-28.clover" })
 }
 
+const GB = BigInt(1024 ** 3)
+
 const communityPlan = {
   slug: "community",
   name: "Community",
   priceMonthly: 0,
   bucketLimit: 1000,
   fileLimit: 0,
+  storageLimitBytes: BigInt(0),
   auditLogs: true,
   thumbnailCache: true,
   features: [
@@ -42,11 +45,13 @@ const defaultPlans = [
     priceMonthly: 0,
     bucketLimit: 10,
     fileLimit: 10000,
+    storageLimitBytes: BigInt(5) * GB,
     auditLogs: false,
     thumbnailCache: false,
     features: [
       "Up to 10,000 cached files",
       "Up to 10 buckets",
+      "Up to 5 GB storage",
       "Recursive delete",
       "Multiple upload",
     ],
@@ -58,6 +63,7 @@ const defaultPlans = [
     priceMonthly: 300,
     bucketLimit: 50,
     fileLimit: 50000,
+    storageLimitBytes: BigInt(50) * GB,
     auditLogs: true,
     thumbnailCache: true,
     features: [
@@ -69,6 +75,7 @@ const defaultPlans = [
       "Search all files",
       "Up to 50,000 cached files",
       "Up to 50 buckets",
+      "Up to 50 GB storage",
     ],
     sortOrder: 1,
   },
@@ -78,6 +85,7 @@ const defaultPlans = [
     priceMonthly: 900,
     bucketLimit: 1000,
     fileLimit: 500000,
+    storageLimitBytes: BigInt(500) * GB,
     auditLogs: true,
     thumbnailCache: true,
     features: [
@@ -85,6 +93,7 @@ const defaultPlans = [
       "Sync tasks",
       "Up to 500,000 cached files",
       "Up to 1,000 buckets",
+      "Up to 500 GB storage",
     ],
     sortOrder: 2,
   },
@@ -94,11 +103,13 @@ const defaultPlans = [
     priceMonthly: 0,
     bucketLimit: 1000,
     fileLimit: 0,
+    storageLimitBytes: BigInt(0),
     auditLogs: true,
     thumbnailCache: true,
     features: [
       "Everything in Pro",
       "Unlimited cached files",
+      "Unlimited storage",
       "Dedicated support",
       "Custom integrations",
       "SLA",
@@ -143,6 +154,7 @@ async function main() {
         name: plan.name,
         bucketLimit: plan.bucketLimit,
         fileLimit: plan.fileLimit,
+        storageLimitBytes: plan.storageLimitBytes,
         auditLogs: plan.auditLogs,
         thumbnailCache: plan.thumbnailCache,
         features: plan.features,
