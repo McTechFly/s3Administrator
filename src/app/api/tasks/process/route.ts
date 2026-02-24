@@ -478,7 +478,7 @@ async function realignFutureRecurringRun(params: {
       status: "pending",
       isRecurring: true,
       type: {
-        in: ["bulk_delete", "object_transfer"],
+        in: ["bulk_delete", "object_transfer", "database_backup"],
       },
       nextRunAt: {
         gt: now,
@@ -801,7 +801,7 @@ export async function POST(request: Request) {
     }
     const actorUserId = userId
 
-    const TASK_TYPES = ["bulk_delete", "object_transfer"] as const
+    const TASK_TYPES = ["bulk_delete", "object_transfer", "database_backup"] as const
     const requestedType = (new URL(request.url).searchParams.get("type") ?? "").trim()
     const typeFilter = requestedType && TASK_TYPES.includes(requestedType as typeof TASK_TYPES[number])
       ? [requestedType]
@@ -972,6 +972,52 @@ export async function POST(request: Request) {
     }
     claimedTaskSchedule = resolveTaskSchedule(candidate)
     taskExecutionHistory = normalizeExecutionHistory(candidate.executionHistory)
+
+    if (candidate.type === "database_backup") {
+      try {
+        const { runBackup } = await import("@/lib/backup")
+        await runBackup()
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        const nextAttempts = candidate.attempts + 1
+        const willRetry = nextAttempts < candidate.maxAttempts
+        const nextRunAt = willRetry
+          ? new Date(Date.now() + Math.min(nextAttempts * 60_000, 30 * 60_000))
+          : nextRunAtForTaskSchedule(claimedTaskSchedule, new Date()) ?? new Date()
+        await prisma.backgroundTask.update({
+          where: { id: candidate.id },
+          data: {
+            status: willRetry ? "pending" : "failed",
+            attempts: nextAttempts,
+            lastError: message.slice(0, 500),
+            nextRunAt,
+            executionHistory: addTaskHistoryEntry(taskExecutionHistory, {
+              status: "failed",
+              message,
+            }),
+          },
+        })
+        return NextResponse.json({ processed: true, taskId: candidate.id, done: false, error: message })
+      }
+
+      const nextRunAt = nextRunAtForTaskSchedule(claimedTaskSchedule, new Date()) ?? new Date()
+      await prisma.backgroundTask.update({
+        where: { id: candidate.id },
+        data: {
+          status: "pending",
+          attempts: 0,
+          lastError: null,
+          lastRunAt: new Date(),
+          nextRunAt,
+          executionHistory: addTaskHistoryEntry(taskExecutionHistory, {
+            status: "succeeded",
+            message: "Backup completed",
+            metadata: { nextRunAt: nextRunAt.toISOString() },
+          }),
+        },
+      })
+      return NextResponse.json({ processed: true, taskId: candidate.id, done: true, type: "database_backup" })
+    }
 
     if (candidate.type === "object_transfer") {
       const planPayload = resolveTaskPlanPayload(candidate.executionPlan, candidate.payload)
