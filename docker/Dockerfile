@@ -10,22 +10,21 @@ RUN --mount=type=cache,target=/root/.npm set -e; \
     if [ -n "$NPM_TOKEN" ]; then \
       echo "//npm.pkg.github.com/:_authToken=${NPM_TOKEN}" >> .npmrc; \
     fi; \
-    npm ci; \
-    if [ "$env_upper" = "COMMUNITY" ]; then \
-      npm install --no-save --no-package-lock "@s3administrator/community-setup@^1.0.0" || \
-      npm install --no-save --no-package-lock "https://codeload.github.com/s3administrator/community-setup/tar.gz/refs/heads/main"; \
-    fi; \
     if [ "$env_upper" = "CLOUD" ]; then \
       if [ -z "$NPM_TOKEN" ]; then \
         echo "NPM_TOKEN is required for CLOUD builds."; \
         exit 1; \
       fi; \
       echo "@s3administrator:registry=https://npm.pkg.github.com" >> .npmrc; \
+    fi; \
+    npm ci; \
+    if [ "$env_upper" = "COMMUNITY" ]; then \
+      npm install --no-save --no-package-lock "@s3administrator/community-setup@^1.0.0" || \
+      npm install --no-save --no-package-lock "https://codeload.github.com/s3administrator/community-setup/tar.gz/refs/heads/main"; \
+    fi; \
+    if [ "$env_upper" = "CLOUD" ]; then \
       npm install --no-save --no-package-lock \
-        "@s3administrator/admin@^1.1.3" \
-        "@s3administrator/audit@^1.1.0" \
         "@s3administrator/auth@^1.1.0" \
-        "@s3administrator/billing@^1.1.2" \
         "@s3administrator/marketing@^1.1.0" \
         "@s3administrator/setup@^1.0.2"; \
     fi; \
