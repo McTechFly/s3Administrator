@@ -21,23 +21,6 @@ function getStripe(): Stripe | null {
 
 const GB = BigInt(1024 ** 3)
 
-const communityPlan = {
-  slug: "community",
-  name: "Community",
-  priceMonthly: 0,
-  bucketLimit: 1000,
-  fileLimit: 0,
-  storageLimitBytes: BigInt(0),
-  auditLogs: true,
-  thumbnailCache: true,
-  features: [
-    "Unlimited buckets",
-    "Unlimited cached files",
-    "All features enabled",
-  ],
-  sortOrder: 0,
-}
-
 const defaultPlans = [
   {
     slug: "free",
@@ -45,13 +28,13 @@ const defaultPlans = [
     priceMonthly: 0,
     bucketLimit: 10,
     fileLimit: 10000,
-    storageLimitBytes: BigInt(5) * GB,
+    storageLimitBytes: BigInt(50) * GB,
     auditLogs: false,
     thumbnailCache: false,
     features: [
       "Up to 10,000 cached files",
       "Up to 10 buckets",
-      "Up to 5 GB storage",
+      "Up to 50 GB storage",
       "Recursive delete",
       "Multiple upload",
     ],
@@ -119,7 +102,6 @@ const defaultPlans = [
 ]
 
 async function main() {
-  const plans = isCommunity ? [communityPlan] : defaultPlans
   const stripe = isCommunity ? null : getStripe()
 
   console.log(`Seeding plans for ${isCommunity ? "community" : "cloud"} edition...`)
@@ -127,7 +109,7 @@ async function main() {
     console.log("  STRIPE_SECRET_KEY not set — skipping Stripe price creation")
   }
 
-  for (const plan of plans) {
+  for (const plan of defaultPlans) {
     const existing = await prisma.plan.findUnique({ where: { slug: plan.slug } })
 
     // Create Stripe product+price for paid plans that don't have one yet
@@ -148,7 +130,8 @@ async function main() {
       stripePriceId = price.id
     }
 
-    await prisma.plan.upsert({
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (prisma.plan as any).upsert({
       where: { slug: plan.slug },
       update: {
         name: plan.name,
