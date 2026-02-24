@@ -13,6 +13,13 @@ export interface FileLimitViolation {
   availableSlots: number
 }
 
+export interface StorageLimitViolation {
+  storageLimitBytes: number
+  currentStorageBytes: number
+  requestedAdditionalBytes: number
+  availableBytes: number
+}
+
 export async function countIndexedBuckets(userId: string): Promise<number> {
   const buckets = await prisma.fileMetadata.groupBy({
     by: ["credentialId", "bucket"],
@@ -93,6 +100,35 @@ export async function getAdditionalFileLimitViolation(params: {
       currentFileCount,
       requestedAdditionalFiles,
       availableSlots,
+    }
+  }
+
+  return null
+}
+
+export async function getAdditionalStorageLimitViolation(params: {
+  userId: string
+  requestedAdditionalBytes: number
+  entitlements: PlanEntitlements
+}): Promise<StorageLimitViolation | null> {
+  const requestedAdditionalBytes = Math.max(0, Math.floor(params.requestedAdditionalBytes))
+  if (requestedAdditionalBytes <= 0 || !Number.isFinite(params.entitlements.storageLimitBytes)) {
+    return null
+  }
+
+  const aggregate = await prisma.fileMetadata.aggregate({
+    where: { userId: params.userId, isFolder: false },
+    _sum: { size: true },
+  })
+  const currentStorageBytes = Number(aggregate._sum.size ?? 0)
+
+  const availableBytes = Math.max(0, params.entitlements.storageLimitBytes - currentStorageBytes)
+  if (requestedAdditionalBytes > availableBytes) {
+    return {
+      storageLimitBytes: params.entitlements.storageLimitBytes,
+      currentStorageBytes,
+      requestedAdditionalBytes,
+      availableBytes,
     }
   }
 
