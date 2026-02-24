@@ -1,5 +1,5 @@
 .PHONY: help \
-cloud-setup cloud-start cloud-start-prod cloud-stop cloud-restart cloud-restart-full cloud-migrate cloud-local cloud-check-migrations \
+cloud-setup cloud-start cloud-start-prod cloud-stop cloud-restart cloud-restart-full cloud-migrate cloud-local cloud-check-migrations cloud-reset \
 community-setup community-start community-stop community-restart community-restart-full community-migrate community-local community-reset \
 log log-worker stripe-listen
 
@@ -81,6 +81,15 @@ cloud-restart-full: ## Rebuild app + tools, validate migrations, then restart ap
 	$(MAKE) cloud-check-migrations
 	$(DC_CLOUD) up -d app worker
 	@echo "✓ Cloud app + worker restarted."
+
+cloud-reset: ## Reset cloud: destroy DB volume and restart fresh
+	$(DC_CLOUD) down -v
+	$(DC_CLOUD) up db -d
+	@echo "Waiting for PostgreSQL to be ready..."
+	@until $(DC_CLOUD) exec -T db pg_isready -U s3admin -d s3_admin -q 2>/dev/null; do sleep 1; done
+	$(DC_CLOUD) run --rm -T tools npx --no-install prisma migrate deploy
+	$(DC_CLOUD) run --rm -T tools npx --no-install prisma db seed
+	@echo "✓ Cloud environment reset."
 
 cloud-migrate: ## Run migrations & seed on cloud database
 	$(DC_CLOUD) up db -d
