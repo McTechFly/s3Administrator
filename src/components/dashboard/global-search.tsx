@@ -6,17 +6,23 @@ import { useQuery, useQueryClient } from "@tanstack/react-query"
 import { Loader2 } from "lucide-react"
 import { toast } from "sonner"
 import { FileBrowser } from "@/components/dashboard/file-browser"
+import { GalleryBrowser } from "@/components/dashboard/gallery-browser"
+import { GalleryLightbox } from "@/components/dashboard/gallery-lightbox"
 import { MultiSelectToolbar } from "@/components/dashboard/multi-select-toolbar"
 import { DeleteConfirmDialog } from "@/components/dashboard/delete-confirm-dialog"
 import { RenameDialog } from "@/components/dashboard/rename-dialog"
 import { SearchFilters } from "@/components/dashboard/search-filters"
-import type { S3Object } from "@/types"
+import type { MediaType, S3Object } from "@/types"
 
 interface SearchResult {
   id: string
   key: string
   bucket: string
   credentialId: string
+  extension: string
+  mediaType: MediaType | null
+  previewUrl: string | null
+  isVideo: boolean
   size: number
   lastModified: string
 }
@@ -30,6 +36,10 @@ interface SearchItem extends S3Object {
   id: string
   bucket: string
   credentialId: string
+  extension: string
+  mediaType: MediaType | null
+  previewUrl: string | null
+  isVideo: boolean
 }
 
 interface Bucket {
@@ -44,6 +54,7 @@ interface Credential {
 
 const PAGE_SIZE = 100
 const MIN_QUERY_LENGTH = 2
+const GLOBAL_SEARCH_VIEW_MODE_STORAGE_KEY = "global-search-view-mode"
 
 function rowId(item: SearchItem): string {
   return item.id
@@ -58,6 +69,10 @@ function toSearchItem(result: SearchResult): SearchItem {
     isFolder: false,
     bucket: result.bucket,
     credentialId: result.credentialId,
+    extension: result.extension,
+    mediaType: result.mediaType,
+    previewUrl: result.previewUrl,
+    isVideo: result.isVideo,
   }
 }
 
@@ -89,9 +104,15 @@ export function GlobalSearch() {
   const [selectedType, setSelectedType] = useState<string>("all")
   const [sortBy, setSortBy] = useState<"name" | "size" | "lastModified">("name")
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc")
+  const [viewMode, setViewMode] = useState<"list" | "gallery">(() => {
+    if (typeof window === "undefined") return "list"
+    const saved = window.localStorage.getItem(GLOBAL_SEARCH_VIEW_MODE_STORAGE_KEY)
+    return saved === "gallery" ? "gallery" : "list"
+  })
 
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set())
   const [isBulkRunning, setIsBulkRunning] = useState(false)
+  const [lightboxIndex, setLightboxIndex] = useState<number | null>(null)
 
   const [deleteOpen, setDeleteOpen] = useState(false)
   const [deleteItems, setDeleteItems] = useState<SearchItem[]>([])
@@ -219,6 +240,21 @@ export function GlobalSearch() {
 
   const selectedItems = items.filter((item) => selectedKeys.has(rowId(item)))
   const selectedCount = selectedKeys.size
+  const previewableGalleryItems = useMemo(
+    () => items.filter((item) => !item.isFolder && Boolean(item.mediaType)),
+    [items]
+  )
+
+  useEffect(() => {
+    window.localStorage.setItem(GLOBAL_SEARCH_VIEW_MODE_STORAGE_KEY, viewMode)
+  }, [viewMode])
+
+  useEffect(() => {
+    if (lightboxIndex === null) return
+    if (lightboxIndex < 0 || lightboxIndex >= previewableGalleryItems.length) {
+      setLightboxIndex(null)
+    }
+  }, [lightboxIndex, previewableGalleryItems.length])
 
   useEffect(() => {
     if (!selectionAnchorRef.current) return
@@ -466,6 +502,11 @@ export function GlobalSearch() {
           setSelectedType(type)
           resetSelection()
         }}
+        viewMode={viewMode}
+        onViewModeChange={(mode) => {
+          setViewMode(mode)
+          resetSelection()
+        }}
       />
 
       {selectedCount > 0 && (
@@ -494,6 +535,32 @@ export function GlobalSearch() {
         <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
           No files found for {`"${queryValue}"`}
         </div>
+      ) : viewMode === "gallery" ? (
+        <GalleryBrowser
+          items={items}
+          isLoading={false}
+          isFetchingNextPage={false}
+          hasNextPage={false}
+          selectedKeys={selectedKeys}
+          getItemSelectionKey={(item) => rowId(item as SearchItem)}
+          getItemBucket={(item) => (item as SearchItem).bucket}
+          getItemCredentialId={(item) => (item as SearchItem).credentialId}
+          onSelect={(item, options) => handleSelect(item as SearchItem, options)}
+          onSelectAllVisible={handleSelectAll}
+          onNavigate={(item) => handleOpenInBucket(item as SearchItem)}
+          onOpenPreview={(item) => {
+            const searchItem = item as SearchItem
+            const index = previewableGalleryItems.findIndex((entry) => entry.id === searchItem.id)
+            if (index >= 0) {
+              setLightboxIndex(index)
+              return
+            }
+            void handleDownload(searchItem)
+          }}
+          onDownload={(item) => void handleDownload(item as SearchItem)}
+          onDelete={(item) => openDeleteDialog([item as SearchItem])}
+          onLoadMore={() => {}}
+        />
       ) : (
         <FileBrowser
           prefix=""
@@ -535,6 +602,18 @@ export function GlobalSearch() {
           }}
         />
       )}
+
+      <GalleryLightbox
+        open={lightboxIndex !== null}
+        onOpenChange={(open) => {
+          if (!open) setLightboxIndex(null)
+        }}
+        items={previewableGalleryItems}
+        currentIndex={lightboxIndex ?? 0}
+        getItemBucket={(item) => (item as SearchItem).bucket}
+        getItemCredentialId={(item) => (item as SearchItem).credentialId}
+        onNavigate={(index) => setLightboxIndex(index)}
+      />
 
       {deleteContext && (
         <DeleteConfirmDialog

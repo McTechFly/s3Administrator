@@ -15,8 +15,11 @@ interface GalleryBrowserProps {
   isFetchingNextPage: boolean
   hasNextPage: boolean
   selectedKeys: Set<string>
-  credentialId: string
-  bucket: string
+  credentialId?: string
+  bucket?: string
+  getItemSelectionKey?: (item: GalleryItem) => string
+  getItemCredentialId?: (item: GalleryItem) => string | undefined
+  getItemBucket?: (item: GalleryItem) => string | undefined
   onSelect: (item: GalleryItem, options?: { shiftKey?: boolean }) => void
   onSelectAllVisible: () => void
   onNavigate: (item: GalleryItem) => void
@@ -35,8 +38,10 @@ function getDisplayName(key: string): string {
 interface GalleryItemCardProps {
   item: GalleryItem
   selected: boolean
-  credentialId: string
-  bucket: string
+  credentialId?: string
+  bucket?: string
+  getItemCredentialId?: (item: GalleryItem) => string | undefined
+  getItemBucket?: (item: GalleryItem) => string | undefined
   shiftPressedRef: React.MutableRefObject<boolean>
   onSelect: (item: GalleryItem, options?: { shiftKey?: boolean }) => void
   onNavigate: (item: GalleryItem) => void
@@ -50,6 +55,8 @@ function GalleryItemCard({
   selected,
   credentialId,
   bucket,
+  getItemCredentialId,
+  getItemBucket,
   shiftPressedRef,
   onSelect,
   onNavigate,
@@ -57,7 +64,9 @@ function GalleryItemCard({
   onDownload,
   onDelete,
 }: GalleryItemCardProps) {
-  const { objectUrl, isGenerating } = useThumbnail(item, credentialId, bucket)
+  const resolvedCredentialId = getItemCredentialId?.(item) ?? credentialId ?? ""
+  const resolvedBucket = getItemBucket?.(item) ?? bucket ?? ""
+  const { objectUrl, isGenerating } = useThumbnail(item, resolvedCredentialId, resolvedBucket)
 
   return (
     <div
@@ -160,6 +169,9 @@ export function GalleryBrowser({
   selectedKeys,
   credentialId,
   bucket,
+  getItemSelectionKey,
+  getItemCredentialId,
+  getItemBucket,
   onSelect,
   onSelectAllVisible,
   onNavigate,
@@ -191,8 +203,10 @@ export function GalleryBrowser({
   }, [hasNextPage, isFetchingNextPage, onLoadMore])
 
   const allVisibleSelected = useMemo(
-    () => items.length > 0 && items.every((item) => selectedKeys.has(item.key)),
-    [items, selectedKeys]
+    () =>
+      items.length > 0 &&
+      items.every((item) => selectedKeys.has(getItemSelectionKey?.(item) ?? item.key)),
+    [items, selectedKeys, getItemSelectionKey]
   )
 
   if (isLoading) {
@@ -227,9 +241,11 @@ export function GalleryBrowser({
           <GalleryItemCard
             key={item.id}
             item={item}
-            selected={selectedKeys.has(item.key)}
+            selected={selectedKeys.has(getItemSelectionKey?.(item) ?? item.key)}
             credentialId={credentialId}
             bucket={bucket}
+            getItemCredentialId={getItemCredentialId}
+            getItemBucket={getItemBucket}
             shiftPressedRef={shiftPressedRef}
             onSelect={onSelect}
             onNavigate={onNavigate}

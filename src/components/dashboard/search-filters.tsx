@@ -11,7 +11,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
-import { Search } from "lucide-react"
+import { LayoutGrid, List, Search } from "lucide-react"
 
 interface Credential {
   id: string
@@ -39,6 +39,8 @@ interface SearchFiltersProps {
   onClearBucketScopes: () => void
   selectedType: string
   onTypeChange: (type: string) => void
+  viewMode?: "list" | "gallery"
+  onViewModeChange?: (mode: "list" | "gallery") => void
 }
 
 export function SearchFilters({
@@ -55,6 +57,8 @@ export function SearchFilters({
   onClearBucketScopes,
   selectedType,
   onTypeChange,
+  viewMode = "list",
+  onViewModeChange,
 }: SearchFiltersProps) {
   return (
     <div className="space-y-3 border-b px-4 py-3">
@@ -167,8 +171,32 @@ export function SearchFilters({
             ))}
           </DropdownMenuContent>
         </DropdownMenu>
-      </div>
 
+        {onViewModeChange && (
+          <div className="ml-auto flex items-center overflow-hidden rounded-md border">
+            <Button
+              type="button"
+              variant={viewMode === "list" ? "secondary" : "ghost"}
+              size="sm"
+              className="h-9 rounded-none border-0"
+              onClick={() => onViewModeChange("list")}
+            >
+              <List className="mr-1.5 h-4 w-4" />
+              List
+            </Button>
+            <Button
+              type="button"
+              variant={viewMode === "gallery" ? "secondary" : "ghost"}
+              size="sm"
+              className="h-9 rounded-none border-0"
+              onClick={() => onViewModeChange("gallery")}
+            >
+              <LayoutGrid className="mr-1.5 h-4 w-4" />
+              Gallery
+            </Button>
+          </div>
+        )}
+      </div>
     </div>
   )
 }

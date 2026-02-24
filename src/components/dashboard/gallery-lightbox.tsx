@@ -16,8 +16,10 @@ interface GalleryLightboxProps {
   onOpenChange: (open: boolean) => void
   items: GalleryItem[]
   currentIndex: number
-  bucket: string
+  bucket?: string
   credentialId?: string
+  getItemBucket?: (item: GalleryItem) => string | undefined
+  getItemCredentialId?: (item: GalleryItem) => string | undefined
   onNavigate: (index: number) => void
 }
 
@@ -28,6 +30,8 @@ export function GalleryLightbox({
   currentIndex,
   bucket,
   credentialId,
+  getItemBucket,
+  getItemCredentialId,
   onNavigate,
 }: GalleryLightboxProps) {
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
@@ -38,6 +42,16 @@ export function GalleryLightbox({
 
   const fetchPreviewUrl = useCallback(async () => {
     if (!open || !activeItem) return
+    const resolvedBucket = getItemBucket?.(activeItem) ?? bucket
+    if (!resolvedBucket) {
+      setError("Missing preview bucket")
+      setPreviewUrl(null)
+      setLoading(false)
+      return
+    }
+
+    const resolvedCredentialId = getItemCredentialId?.(activeItem) ?? credentialId
+
     setLoading(true)
     setError(null)
     setPreviewUrl(null)
@@ -47,8 +61,8 @@ export function GalleryLightbox({
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          bucket,
-          credentialId,
+          bucket: resolvedBucket,
+          credentialId: resolvedCredentialId,
           key: activeItem.key,
         }),
       })
@@ -66,7 +80,7 @@ export function GalleryLightbox({
     } finally {
       setLoading(false)
     }
-  }, [activeItem, bucket, credentialId, open])
+  }, [activeItem, bucket, credentialId, getItemBucket, getItemCredentialId, open])
 
   useEffect(() => {
     void fetchPreviewUrl()

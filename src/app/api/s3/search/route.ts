@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server"
 import { Prisma } from "@prisma/client"
 import { auth } from "@/lib/auth"
 import { prisma } from "@/lib/db"
+import { getMediaTypeFromExtension } from "@/lib/media"
 import {
   buildFileSearchOrderBySql,
   buildFileSearchSqlWhereClause,
@@ -17,6 +18,7 @@ interface SearchResultRow {
   key: string
   bucket: string
   credentialId: string
+  extension: string | null
   size: bigint
   lastModified: Date
 }
@@ -79,6 +81,7 @@ export async function GET(request: NextRequest) {
         fm."key",
         fm."bucket",
         fm."credentialId",
+        fm."extension",
         fm."size",
         fm."lastModified"
       FROM "FileMetadata" fm
@@ -89,14 +92,30 @@ export async function GET(request: NextRequest) {
     `)
 
     // Map response
-    const data = results.map((r) => ({
-      id: r.id,
-      key: r.key,
-      bucket: r.bucket,
-      credentialId: r.credentialId,
-      size: Number(r.size),
-      lastModified: r.lastModified.toISOString(),
-    }))
+    const data = results.map((r) => {
+      const mediaType = getMediaTypeFromExtension(r.extension)
+      const extension = (r.extension ?? "").toLowerCase()
+      const previewUrl = mediaType
+        ? `/api/s3/preview/proxy?${new URLSearchParams({
+          bucket: r.bucket,
+          key: r.key,
+          credentialId: r.credentialId,
+        }).toString()}`
+        : null
+
+      return {
+        extension,
+        mediaType,
+        previewUrl,
+        isVideo: mediaType === "video",
+        id: r.id,
+        key: r.key,
+        bucket: r.bucket,
+        credentialId: r.credentialId,
+        size: Number(r.size),
+        lastModified: r.lastModified.toISOString(),
+      }
+    })
 
     return NextResponse.json({ results: data, total })
   } catch (error) {
