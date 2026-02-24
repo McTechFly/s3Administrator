@@ -7,6 +7,34 @@ import {
 const THUMBNAIL_MAX_WIDTH = 480;
 const THUMBNAIL_QUALITY = 0.8;
 
+// ---------------------------------------------------------------------------
+// Concurrency-limited queue – prevents dozens of <video> / fetch operations
+// from running at the same time which would starve the main thread and cause
+// scroll jank.
+// ---------------------------------------------------------------------------
+const MAX_CONCURRENT = 5;
+let running = 0;
+const queue: Array<() => void> = [];
+
+function enqueue<T>(fn: () => Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const run = () => {
+      running++;
+      fn().then(resolve, reject).finally(() => {
+        running--;
+        const next = queue.shift();
+        if (next) next();
+      });
+    };
+
+    if (running < MAX_CONCURRENT) {
+      run();
+    } else {
+      queue.push(run);
+    }
+  });
+}
+
 // Prevents duplicate concurrent generation for the same key
 const inFlight = new Map<string, Promise<Blob | null>>();
 
@@ -42,57 +70,55 @@ async function generateImageThumbnail(url: string): Promise<Blob> {
 }
 
 async function generateVideoThumbnail(url: string): Promise<Blob> {
-  // Lazy-load FFmpeg WASM — only downloaded when first video is processed
-  const [{ FFmpeg }, { fetchFile }] = await Promise.all([
-    import("@ffmpeg/ffmpeg"),
-    import("@ffmpeg/util"),
-  ]);
+  const video = document.createElement("video");
+  video.crossOrigin = "anonymous";
+  video.preload = "metadata";
+  video.muted = true;
 
-  const ffmpeg = new FFmpeg();
-  await ffmpeg.load();
+  const loaded = new Promise<void>((resolve, reject) => {
+    video.onloadeddata = () => resolve();
+    video.onerror = () =>
+      reject(new Error("Failed to load video for thumbnail"));
+  });
 
-  const videoData = await fetchFile(url);
-  await ffmpeg.writeFile("input", videoData);
+  video.src = url;
+  await loaded;
 
-  // Try to grab a frame at 1 second; if the video is shorter, fall back to frame 0
-  let exitCode = await ffmpeg.exec([
-    "-ss", "1",
-    "-i", "input",
-    "-frames:v", "1",
-    "-vf", `scale=${THUMBNAIL_MAX_WIDTH}:-1`,
-    "-f", "image2",
-    "out.webp",
-  ]);
+  // Seek to 1 s (or mid-point if the clip is shorter than 2 s).
+  // The browser fetches only the bytes it needs via Range requests.
+  const seekTarget = Math.min(1, video.duration * 0.5);
+  await new Promise<void>((resolve, reject) => {
+    video.onseeked = () => resolve();
+    video.onerror = () => reject(new Error("Failed to seek video"));
+    video.currentTime = seekTarget;
+  });
 
-  if (exitCode !== 0) {
-    exitCode = await ffmpeg.exec([
-      "-i", "input",
-      "-frames:v", "1",
-      "-vf", `scale=${THUMBNAIL_MAX_WIDTH}:-1`,
-      "-f", "image2",
-      "out.webp",
-    ]);
-    if (exitCode !== 0) {
-      throw new Error("FFmpeg failed to extract video frame");
-    }
+  // Capture the current frame to a canvas
+  const scale = Math.min(1, THUMBNAIL_MAX_WIDTH / video.videoWidth);
+  const width = Math.round(video.videoWidth * scale);
+  const height = Math.round(video.videoHeight * scale);
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) {
+    throw new Error("Failed to get 2D context");
   }
+  ctx.drawImage(video, 0, 0, width, height);
 
-  const data = await ffmpeg.readFile("out.webp");
-  const binaryData =
-    data instanceof Uint8Array
-      ? data
-      : new TextEncoder().encode(String(data));
+  // Release the video element so the browser can free network / decoder resources
+  video.src = "";
+  video.load();
 
-  // Copy into a plain ArrayBuffer so BlobPart typing does not depend on
-  // the source buffer implementation (ArrayBufferLike vs SharedArrayBuffer).
-  const imageBuffer = new ArrayBuffer(binaryData.byteLength);
-  new Uint8Array(imageBuffer).set(binaryData);
-
-  // Clean up virtual FS
-  await ffmpeg.deleteFile("input");
-  await ffmpeg.deleteFile("out.webp");
-
-  return new Blob([imageBuffer], { type: "image/webp" });
+  return new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob(
+      (blob) =>
+        blob ? resolve(blob) : reject(new Error("Canvas toBlob failed")),
+      "image/webp",
+      THUMBNAIL_QUALITY,
+    );
+  });
 }
 
 /**
@@ -111,26 +137,29 @@ export async function getOrGenerateThumbnail(
 
   const ck = cacheKey(credentialId, bucket, item.key);
 
-  // Check IndexedDB first
-  try {
-    const cached = await getCachedThumbnail(
-      credentialId,
-      bucket,
-      item.key,
-      item.lastModified,
-      item.size
-    );
-    if (cached) return cached;
-  } catch {
-    // IndexedDB unavailable — proceed to generate without caching
-  }
-
   // Deduplicate in-flight requests
   const existing = inFlight.get(ck);
   if (existing) return existing;
 
-  const promise = (async (): Promise<Blob | null> => {
+  // Everything goes through the queue so items are processed in the order
+  // they were requested (top-to-bottom in the gallery). The IndexedDB cache
+  // check is inside the queue so that awaiting it doesn't shuffle the order.
+  const promise = enqueue(async (): Promise<Blob | null> => {
     try {
+      // Check IndexedDB cache first
+      try {
+        const cached = await getCachedThumbnail(
+          credentialId,
+          bucket,
+          item.key,
+          item.lastModified,
+          item.size,
+        );
+        if (cached) return cached;
+      } catch {
+        // IndexedDB unavailable — proceed to generate
+      }
+
       const blob = item.isVideo
         ? await generateVideoThumbnail(item.previewUrl!)
         : await generateImageThumbnail(item.previewUrl!);
@@ -154,7 +183,7 @@ export async function getOrGenerateThumbnail(
     } finally {
       inFlight.delete(ck);
     }
-  })();
+  });
 
   inFlight.set(ck, promise);
   return promise;

@@ -69,9 +69,27 @@ function DashboardContent() {
 
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set())
   const [searchQuery, setSearchQuery] = useState("")
-  const [sortBy, setSortBy] = useState<"name" | "size" | "lastModified">("name")
-  const [sortDir, setSortDir] = useState<"asc" | "desc">("asc")
-  const [viewMode, setViewMode] = useState<"list" | "gallery">("list")
+  const [sortBy, setSortBy] = useState<"name" | "size" | "lastModified">(() => {
+    if (typeof window !== "undefined") {
+      const saved = localStorage.getItem("s3admin:sortBy")
+      if (saved === "name" || saved === "size" || saved === "lastModified") return saved
+    }
+    return "name"
+  })
+  const [sortDir, setSortDir] = useState<"asc" | "desc">(() => {
+    if (typeof window !== "undefined") {
+      const saved = localStorage.getItem("s3admin:sortDir")
+      if (saved === "asc" || saved === "desc") return saved
+    }
+    return "asc"
+  })
+  const [viewMode, setViewMode] = useState<"list" | "gallery">(() => {
+    if (typeof window !== "undefined") {
+      const saved = localStorage.getItem("s3admin:viewMode")
+      if (saved === "list" || saved === "gallery") return saved
+    }
+    return "list"
+  })
   const [showVersions, setShowVersions] = useState(false)
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null)
   const selectionAnchorRef = useRef<string | null>(null)
@@ -116,7 +134,7 @@ function DashboardContent() {
       const cursor = typeof pageParam === "string" ? pageParam : null
       const params = new URLSearchParams({
         bucket,
-        limit: "60",
+        limit: "25",
         mediaType: "all",
       })
       if (prefix) params.set("prefix", prefix)
@@ -358,6 +376,18 @@ function DashboardContent() {
       toast.error("Operation completed, but bucket sync failed")
     }
   }, [syncCurrentBucket, invalidateBucketQueries])
+
+  useEffect(() => {
+    localStorage.setItem("s3admin:viewMode", viewMode)
+  }, [viewMode])
+
+  useEffect(() => {
+    localStorage.setItem("s3admin:sortBy", sortBy)
+  }, [sortBy])
+
+  useEffect(() => {
+    localStorage.setItem("s3admin:sortDir", sortDir)
+  }, [sortDir])
 
   useEffect(() => {
     setSelectedKeys(new Set())
