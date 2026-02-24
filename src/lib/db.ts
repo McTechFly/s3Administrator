@@ -1,4 +1,5 @@
 import { Prisma, PrismaClient } from "@prisma/client"
+import { PrismaPg } from "@prisma/adapter-pg"
 import { logSystemEvent } from "@/lib/system-logger"
 
 const globalForPrisma = globalThis as unknown as {
@@ -6,7 +7,9 @@ const globalForPrisma = globalThis as unknown as {
 }
 
 function createPrismaClient() {
+  const adapter = new PrismaPg(process.env.DATABASE_URL!)
   const client = new PrismaClient({
+    adapter,
     log: [
       { emit: "event", level: "warn" },
       { emit: "event", level: "error" },
