@@ -263,6 +263,17 @@ model Plan {
   updatedAt DateTime @updatedAt
 }
 
+model Backup {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  sizeBytes BigInt   @default(0)
+  status    String   @default("ok")
+  error     String?
+  createdAt DateTime @default(now())
+
+  @@index([createdAt(sort: Desc)])
+}
+
 model Subscription {
   id                   String    @id @default(cuid())
   userId               String
