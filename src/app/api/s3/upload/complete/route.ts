@@ -6,6 +6,7 @@ import { getObjectExtension, rebuildUserExtensionStats } from "@/lib/file-stats"
 import { getUserPlanEntitlements } from "@/lib/plan-entitlements"
 import {
   getAdditionalFileLimitViolation,
+  getAdditionalStorageLimitViolation,
   getBucketLimitViolation,
 } from "@/lib/plan-limits"
 import { getRequestContext, logUserAuditAction } from "@/lib/audit-logger"
@@ -96,6 +97,24 @@ export async function POST(request: NextRequest) {
         {
           error: "Cached file limit reached for current plan",
           details: fileLimitViolation,
+        },
+        { status: 400 }
+      )
+    }
+
+    const newFilesBytes = normalizedItems
+      .filter((item) => !existingKeys.has(item.key))
+      .reduce((sum, item) => sum + (Number.isFinite(item.size) && item.size >= 0 ? item.size : 0), 0)
+    const storageLimitViolation = await getAdditionalStorageLimitViolation({
+      userId: session.user.id,
+      requestedAdditionalBytes: newFilesBytes,
+      entitlements,
+    })
+    if (storageLimitViolation) {
+      return NextResponse.json(
+        {
+          error: "Storage limit reached for current plan",
+          details: storageLimitViolation,
         },
         { status: 400 }
       )

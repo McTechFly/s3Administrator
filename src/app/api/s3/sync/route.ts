@@ -36,6 +36,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Failed to resolve plan entitlements" }, { status: 403 })
     }
     const fileLimit = entitlements.fileLimit
+    const storageLimit = entitlements.storageLimitBytes
 
     const { client, credential } = await getS3Client(session.user.id, credentialId)
     const bucketLimitViolation = await getBucketLimitViolation({
@@ -54,20 +55,29 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    // Count files in other buckets (to know how many slots are left for this bucket)
+    // Count files and storage in other buckets (to know how many slots/bytes are left for this bucket)
     const otherBucketCount = await prisma.fileMetadata.count({
       where: {
         userId: session.user.id,
         isFolder: false,
-        NOT: {
-          credentialId: credential.id,
-          bucket,
-        },
+        NOT: { credentialId: credential.id, bucket },
       },
     })
+    const otherBucketStorageAgg = await prisma.fileMetadata.aggregate({
+      where: {
+        userId: session.user.id,
+        isFolder: false,
+        NOT: { credentialId: credential.id, bucket },
+      },
+      _sum: { size: true },
+    })
+    const otherBucketStorageBytes = Number(otherBucketStorageAgg._sum.size ?? 0)
 
     const availableSlots = Number.isFinite(fileLimit)
       ? Math.max(0, fileLimit - otherBucketCount)
+      : Number.POSITIVE_INFINITY
+    const availableStorageBytes = Number.isFinite(storageLimit)
+      ? Math.max(0, storageLimit - otherBucketStorageBytes)
       : Number.POSITIVE_INFINITY
 
     // Paginate through all objects in the bucket
@@ -125,9 +135,10 @@ export async function POST(request: NextRequest) {
       cachedEntries.filter((entry) => !entry.isFolder).map((entry) => entry.key)
     )
 
-    // Limit entries to tier allowance
+    // Limit entries to tier allowance (file count + storage)
     const objectsToSync: typeof s3Objects = []
     let remainingSlots = availableSlots
+    let remainingStorageBytes = availableStorageBytes
     for (const object of s3Objects) {
       if (object.isFolder) {
         objectsToSync.push(object)
@@ -135,10 +146,13 @@ export async function POST(request: NextRequest) {
       }
 
       const alreadyCached = cachedFileKeys.has(object.key)
-      if (alreadyCached || !Number.isFinite(remainingSlots) || remainingSlots > 0) {
+      const fitsSlots = alreadyCached || !Number.isFinite(remainingSlots) || remainingSlots > 0
+      const fitsStorage = alreadyCached || !Number.isFinite(remainingStorageBytes) || remainingStorageBytes >= object.size
+      if (fitsSlots && fitsStorage) {
         objectsToSync.push(object)
-        if (!alreadyCached && Number.isFinite(remainingSlots)) {
-          remainingSlots--
+        if (!alreadyCached) {
+          if (Number.isFinite(remainingSlots)) remainingSlots--
+          if (Number.isFinite(remainingStorageBytes)) remainingStorageBytes -= object.size
         }
       }
     }
