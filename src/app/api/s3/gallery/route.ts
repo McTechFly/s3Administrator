@@ -4,7 +4,7 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner"
 import { auth } from "@/lib/auth"
 import { prisma } from "@/lib/db"
 import { getS3Client } from "@/lib/s3"
-import { getMediaTypeFromExtension, type MediaType } from "@/lib/media"
+import { getMediaTypeFromExtension, getPreviewType, type MediaType } from "@/lib/media"
 import { galleryListSchema } from "@/lib/validations"
 import { rateLimitByUser, rateLimitResponse } from "@/lib/rate-limit"
 import { getRequestContext, logUserAuditAction } from "@/lib/audit-logger"
@@ -31,7 +31,7 @@ type FileCandidate = {
   size: number
   lastModified: Date
   extension: string
-  mediaType: MediaType
+  mediaType: MediaType | null
   isVideo: boolean
 }
 
@@ -135,7 +135,7 @@ export async function GET(request: NextRequest) {
       size: bigint
       lastModified: Date
       extension: string
-      mediaType: MediaType
+      mediaType: MediaType | null
       isVideo: boolean
     }> = []
 
@@ -173,10 +173,13 @@ export async function GET(request: NextRequest) {
       }
 
       const entryMediaType = getMediaTypeFromExtension(entry.extension)
-      if (!entryMediaType) {
+      const entryPreviewType = getPreviewType(entry.extension)
+
+      if (!entryMediaType && !entryPreviewType) {
         continue
       }
 
+      // When filtering by image/video, only include media files
       if (mediaType !== "all" && entryMediaType !== mediaType) {
         continue
       }
@@ -239,28 +242,32 @@ export async function GET(request: NextRequest) {
 
         let previewUrl: string | null = null
 
-        if (isStoradera) {
-          // Storadera does not support presigned URLs; use the preview proxy with the original file
-          const params = new URLSearchParams({ bucket, key: candidate.key })
-          if (credentialId) {
-            params.set("credentialId", credentialId)
-          }
-          previewUrl = `/api/s3/preview/proxy?${params.toString()}`
-        } else {
-          // Generate presigned URL to the original file — client uses this for thumbnail generation
-          try {
-            previewUrl = await getSignedUrl(
-              client,
-              new GetObjectCommand({
-                Bucket: bucket,
-                Key: candidate.key,
-                ResponseContentDisposition: "inline",
-                ResponseCacheControl: `public, max-age=${PREVIEW_URL_TTL_SECONDS}`,
-              }),
-              { expiresIn: PREVIEW_URL_TTL_SECONDS }
-            )
-          } catch {
-            previewUrl = null
+        // Only generate preview URLs for media files (used for thumbnails)
+        // Document files (pdf, txt, csv, office) don't need thumbnails
+        if (candidate.mediaType) {
+          if (isStoradera) {
+            // Storadera does not support presigned URLs; use the preview proxy with the original file
+            const params = new URLSearchParams({ bucket, key: candidate.key })
+            if (credentialId) {
+              params.set("credentialId", credentialId)
+            }
+            previewUrl = `/api/s3/preview/proxy?${params.toString()}`
+          } else {
+            // Generate presigned URL to the original file — client uses this for thumbnail generation
+            try {
+              previewUrl = await getSignedUrl(
+                client,
+                new GetObjectCommand({
+                  Bucket: bucket,
+                  Key: candidate.key,
+                  ResponseContentDisposition: "inline",
+                  ResponseCacheControl: `public, max-age=${PREVIEW_URL_TTL_SECONDS}`,
+                }),
+                { expiresIn: PREVIEW_URL_TTL_SECONDS }
+              )
+            } catch {
+              previewUrl = null
+            }
           }
         }
 

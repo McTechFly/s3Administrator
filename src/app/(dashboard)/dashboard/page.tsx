@@ -7,6 +7,8 @@ import { Topbar } from "@/components/dashboard/topbar"
 import { FileBrowser } from "@/components/dashboard/file-browser"
 import { GalleryBrowser } from "@/components/dashboard/gallery-browser"
 import { GalleryLightbox } from "@/components/dashboard/gallery-lightbox"
+import { FilePreviewDialog } from "@/components/dashboard/file-preview-dialog"
+import { getPreviewType } from "@/lib/media"
 import { MultiSelectToolbar } from "@/components/dashboard/multi-select-toolbar"
 import { UploadDialog } from "@/components/dashboard/upload-dialog"
 import { DeleteConfirmDialog } from "@/components/dashboard/delete-confirm-dialog"
@@ -102,6 +104,7 @@ function DashboardContent() {
   const [moveProgress, setMoveProgress] = useState<MoveProgressState | null>(null)
   const [moveConfirmOpen, setMoveConfirmOpen] = useState(false)
   const [pendingMoveAction, setPendingMoveAction] = useState<(() => Promise<void>) | null>(null)
+  const [previewFile, setPreviewFile] = useState<S3Object | null>(null)
   const [renameTarget, setRenameTarget] = useState<{
     key: string
     isFolder: boolean
@@ -392,6 +395,7 @@ function DashboardContent() {
   useEffect(() => {
     setSelectedKeys(new Set())
     setLightboxIndex(null)
+    setPreviewFile(null)
     selectionAnchorRef.current = null
   }, [bucket, prefix, credentialId, viewMode])
 
@@ -414,7 +418,8 @@ function DashboardContent() {
         renameOpen ||
         newFolderOpen ||
         moveConfirmOpen ||
-        lightboxIndex !== null
+        lightboxIndex !== null ||
+        previewFile !== null
       ) {
         return
       }
@@ -442,6 +447,7 @@ function DashboardContent() {
     newFolderOpen,
     moveConfirmOpen,
     lightboxIndex,
+    previewFile,
   ])
 
   function handleNavigate(folderKey: string) {
@@ -555,6 +561,27 @@ function DashboardContent() {
         toast.error(`Failed to download ${key}`)
       }
     }
+  }
+
+  function handlePreview(file: S3Object) {
+    if (file.isFolder) return
+
+    const ext = file.key.includes(".")
+      ? file.key.slice(file.key.lastIndexOf(".") + 1)
+      : ""
+    const type = getPreviewType(ext)
+
+    if (!type) {
+      void handleDownload([file.key])
+      return
+    }
+
+    if (type === "image" || type === "video") {
+      void handleDownload([file.key])
+      return
+    }
+
+    setPreviewFile(file)
   }
 
   if (!bucket) {
@@ -848,6 +875,22 @@ function DashboardContent() {
               return
             }
 
+            // Document files → open FilePreviewDialog
+            const ext = item.key.includes(".")
+              ? item.key.slice(item.key.lastIndexOf(".") + 1)
+              : ""
+            const pType = getPreviewType(ext)
+            if (pType && pType !== "image" && pType !== "video") {
+              setPreviewFile({
+                key: item.key,
+                size: item.size,
+                lastModified: item.lastModified,
+                isFolder: false,
+              })
+              return
+            }
+
+            // Image/video files → open lightbox
             const index = previewableGalleryItems.findIndex((entry) => entry.key === item.key)
             if (index >= 0) setLightboxIndex(index)
           }}
@@ -879,6 +922,7 @@ function DashboardContent() {
             setDeleteOpen(true)
           }}
           onDownload={(file) => handleDownload([file.key])}
+          onPreview={handlePreview}
           showVersions={showVersions}
           onDeleteVersion={handleDeleteVersion}
         />
@@ -913,6 +957,23 @@ function DashboardContent() {
         credentialId={credentialId}
         onNavigate={(index) => setLightboxIndex(index)}
       />
+
+      {previewFile && (
+        <FilePreviewDialog
+          open={previewFile !== null}
+          onOpenChange={(open) => {
+            if (!open) setPreviewFile(null)
+          }}
+          fileKey={previewFile.key}
+          fileName={getBaseNameFromKey(previewFile.key, false)}
+          fileSize={previewFile.size}
+          bucket={bucket}
+          credentialId={credentialId}
+          onDownload={() => {
+            void handleDownload([previewFile.key])
+          }}
+        />
+      )}
 
       {renameTarget && (
         <RenameDialog

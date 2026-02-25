@@ -23,7 +23,8 @@ import { EmptyState } from "@/components/dashboard/empty-state"
 import { cn } from "@/lib/utils"
 import { Badge } from "@/components/ui/badge"
 import { formatSize, formatDate } from "@/lib/format"
-import { MoreHorizontal, Download, Pencil, Trash2 } from "lucide-react"
+import { MoreHorizontal, Download, Eye, Pencil, Trash2 } from "lucide-react"
+import { isPreviewableExtension } from "@/lib/media"
 import type { S3Object } from "@/types"
 
 type SortColumn = "name" | "size" | "lastModified"
@@ -49,6 +50,7 @@ interface FileBrowserProps {
   sortBy?: SortColumn
   sortDir?: "asc" | "desc"
   onSort?: (column: SortColumn) => void
+  onPreview?: (file: S3Object) => void
   showVersions?: boolean
   onDeleteVersion?: (key: string, versionId: string) => void
 }
@@ -77,6 +79,7 @@ export function FileBrowser({
   compact = false,
   locationHeader,
   getLocationLabel,
+  onPreview,
   sortBy,
   sortDir,
   onSort,
@@ -179,6 +182,8 @@ export function FileBrowser({
                   if (isVersionRow) return
                   if (file.isFolder) {
                     onNavigate(file)
+                  } else if (onPreview) {
+                    onPreview(file)
                   } else {
                     onDownload(file)
                   }
@@ -220,7 +225,11 @@ export function FileBrowser({
                       <button
                         className="flex w-full min-w-0 items-center gap-2 text-left hover:underline"
                         onClick={() => {
-                          if (file.isFolder) onNavigate(file)
+                          if (file.isFolder) {
+                            onNavigate(file)
+                          } else if (onPreview) {
+                            onPreview(file)
+                          }
                         }}
                       >
                         <FileIcon filename={displayName} isFolder={file.isFolder} />
@@ -297,6 +306,14 @@ export function FileBrowser({
                         </Button>
                       </DropdownMenuTrigger>
                       <DropdownMenuContent align="end">
+                        {!file.isFolder && onPreview && isPreviewableExtension(
+                          displayName.includes(".") ? displayName.slice(displayName.lastIndexOf(".") + 1) : ""
+                        ) && (
+                          <DropdownMenuItem onClick={() => onPreview(file)}>
+                            <Eye className="mr-2 h-4 w-4" />
+                            Preview
+                          </DropdownMenuItem>
+                        )}
                         {!file.isFolder && (
                           <DropdownMenuItem onClick={() => onDownload(file)}>
                             <Download className="mr-2 h-4 w-4" />

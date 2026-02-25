@@ -5,6 +5,7 @@ import { Download, FolderOpen, ImageIcon, Loader2, Trash2, Video } from "lucide-
 import { Checkbox } from "@/components/ui/checkbox"
 import { Button } from "@/components/ui/button"
 import { EmptyState } from "@/components/dashboard/empty-state"
+import { FileIcon } from "@/components/dashboard/file-icon"
 import { formatSize, formatDate } from "@/lib/format"
 import type { GalleryItem } from "@/types"
 import { useThumbnail } from "@/hooks/use-thumbnail"
@@ -92,6 +93,11 @@ function GalleryItemCard({
                   ? `${item.fileCount} ${item.fileCount === 1 ? "file" : "files"}`
                   : "Folder"}
               </span>
+            </div>
+          ) : !item.mediaType ? (
+            <div className="flex h-full flex-col items-center justify-center gap-2 text-muted-foreground">
+              <FileIcon filename={getDisplayName(item.key)} isFolder={false} className="h-10 w-10" />
+              <span className="max-w-[80%] truncate text-xs uppercase">{item.extension || ""}</span>
             </div>
           ) : objectUrl ? (
             // eslint-disable-next-line @next/next/no-img-element
