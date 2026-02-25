@@ -78,7 +78,7 @@ function enforceCloudPricingPageRoute(projectRoot) {
   console.log("✓ Forced runtime rendering for /pricing in cloud mode")
 }
 
-export function ensureEditionStubs(explicitEnvironment) {
+export async function ensureEditionStubs(explicitEnvironment) {
   const environment = parseEnvironment(explicitEnvironment)
   const root = process.cwd()
   const communitySetupPath = findFirstExisting([
@@ -98,17 +98,29 @@ export function ensureEditionStubs(explicitEnvironment) {
     runSetupScript(cloudSetupPath, "Cloud setup")
     enforceCloudPricingPageRoute(root)
     disableDevLoginRoute(root)
-    return
+  } else {
+    if (!communitySetupPath) {
+      throw new Error(
+        "Community setup package not found. Install @s3administrator/community-setup (public package) or add packages/community-setup locally.",
+      )
+    }
+
+    runSetupScript(communitySetupPath, "Community setup")
+    disableDevLoginRoute(root)
   }
 
-  if (!communitySetupPath) {
-    throw new Error(
-      "Community setup package not found. Install @s3administrator/community-setup (public package) or add packages/community-setup locally.",
-    )
+  // Run edition sync validation (non-blocking in dev, strict in CI)
+  try {
+    const { validateEditionSync } = await import("./validate-edition-sync.mjs")
+    const passed = await validateEditionSync()
+    if (!passed && (process.env.CI === "true" || process.env.EDITION_SYNC_STRICT === "true")) {
+      throw new Error("Edition sync validation failed")
+    }
+  } catch (e) {
+    if (e.message === "Edition sync validation failed") throw e
+    // Validation skipped (missing data sources) — not an error
+    console.warn("⚠ Edition sync validation skipped:", e.message)
   }
-
-  runSetupScript(communitySetupPath, "Community setup")
-  disableDevLoginRoute(root)
 }
 
 const isDirectRun = process.argv[1]
@@ -117,7 +129,7 @@ const isDirectRun = process.argv[1]
 
 if (isDirectRun) {
   try {
-    ensureEditionStubs(process.argv[2])
+    await ensureEditionStubs(process.argv[2])
   } catch (error) {
     console.error("Edition stub setup failed.", error)
     process.exit(1)

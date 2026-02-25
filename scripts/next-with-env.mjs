@@ -31,7 +31,7 @@ if (environment !== "COMMUNITY" && environment !== "CLOUD") {
 }
 
 try {
-  ensureEditionStubs(environment)
+  await ensureEditionStubs(environment)
 } catch (error) {
   console.error("Failed to prepare edition stubs.", error)
   process.exit(1)

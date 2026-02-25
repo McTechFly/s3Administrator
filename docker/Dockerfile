@@ -24,6 +24,9 @@ RUN --mount=type=cache,target=/root/.npm set -e; \
     fi; \
     if [ "$env_upper" = "CLOUD" ]; then \
       npm install --no-save --no-package-lock \
+        "@s3administrator/admin@^1.1.10" \
+        "@s3administrator/audit@^1.1.3" \
+        "@s3administrator/billing@^1.1.11" \
         "@s3administrator/auth@^1.1.0" \
         "@s3administrator/marketing@^1.1.0" \
         "@s3administrator/setup@^1.0.2"; \
