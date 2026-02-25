@@ -17,7 +17,7 @@ function getStripe(): Stripe | null {
 
   const key = process.env[`STRIPE_SECRET_KEY_${environment}`] || process.env.STRIPE_SECRET_KEY
   if (!key) return null
-  return new Stripe(key, { apiVersion: "2026-01-28.clover" })
+  return new Stripe(key, { apiVersion: "2026-02-25.clover" })
 }
 
 const GB = BigInt(1024 ** 3)
