@@ -20,6 +20,7 @@
     "@aws-sdk/s3-request-presigner": "^3.997.0",
     "@prisma/adapter-pg": "^7.4.0",
     "@prisma/client": "^7.4.0",
+    "@s3administrator/billing": "^1.1.14",
     "@tanstack/react-query": "^5.90.20",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
