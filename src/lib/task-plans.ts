@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto"
 
-export type TaskLifecycleState = "active" | "paused"
+export type TaskLifecycleState = "active" | "paused" | "canceled"
 
 export type TaskPlanJsonPrimitive = string | number | boolean | null
 export type TaskPlanJsonValue = TaskPlanJsonPrimitive | TaskPlanJsonObject | TaskPlanJsonValue[]

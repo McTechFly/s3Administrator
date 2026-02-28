@@ -22,7 +22,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { Input } from "@/components/ui/input"
 import { FolderPickerDialog } from "@/components/dashboard/folder-picker-dialog"
 import { DestructiveConfirmDialog } from "@/components/shared/destructive-confirm-dialog"
 import {
@@ -47,9 +46,9 @@ interface TaskRow {
   id: string
   type: string
   title: string
-  status: "pending" | "in_progress" | "completed" | "failed"
+  status: "pending" | "in_progress" | "completed" | "failed" | "canceled"
   progress: unknown
-  lifecycleState: "active" | "paused"
+  lifecycleState: "active" | "paused" | "canceled"
   lastError: string | null
   runCount: number
   isRecurring: boolean
@@ -81,10 +80,6 @@ interface TransferTaskCreateBody {
   destinationBucket: string
   destinationCredentialId: string
   destinationPrefix?: string
-  schedule?: {
-    cron: string
-  } | null
-  confirmDestructiveSchedule?: boolean
 }
 
 interface TransferTaskPreview {
@@ -198,24 +193,25 @@ function canRetryFailed(task: TaskRow): boolean {
 function getStatusVariant(status: TaskRow["status"]): "default" | "secondary" | "destructive" | "outline" {
   if (status === "completed") return "default"
   if (status === "failed") return "destructive"
+  if (status === "canceled") return "outline"
   if (status === "in_progress") return "secondary"
   return "outline"
 }
 
-function getDisplayState(task: TaskRow): string {
-  if (task.lifecycleState === "paused") return "paused"
-  return task.status.replace("_", " ")
+function isPauseTransition(task: TaskRow): boolean {
+  return task.lifecycleState === "paused" && task.status === "in_progress"
 }
 
-function getTaskScheduleLabel(task: TaskRow): string {
-  if (!task.isRecurring) return "One-time"
-  if (task.scheduleCron && task.scheduleCron.trim()) {
-    return `CRON (${task.scheduleCron}) UTC`
-  }
-  if (task.scheduleIntervalSeconds && task.scheduleIntervalSeconds > 0) {
-    return `Every ${task.scheduleIntervalSeconds}s`
-  }
-  return "Scheduled"
+function isCancelTransition(task: TaskRow): boolean {
+  return task.lifecycleState === "canceled" && task.status === "in_progress"
+}
+
+function getDisplayState(task: TaskRow): string {
+  if (isPauseTransition(task)) return "pausing"
+  if (task.lifecycleState === "paused") return "paused"
+  if (isCancelTransition(task)) return "canceling"
+  if (task.status === "canceled" || task.lifecycleState === "canceled") return "canceled"
+  return task.status.replace("_", " ")
 }
 
 const FOLDER_OPERATIONS: Array<{ value: TaskOperation; label: string }> = [
@@ -240,8 +236,6 @@ export default function TasksPage() {
   const [destinationBucket, setDestinationBucket] = useState("")
   const [sourcePrefix, setSourcePrefix] = useState("")
   const [destinationPrefix, setDestinationPrefix] = useState("")
-  const [scheduleMode, setScheduleMode] = useState<"once" | "cron">("once")
-  const [scheduleCron, setScheduleCron] = useState("0 * * * *")
   const [submitting, setSubmitting] = useState(false)
   const [controllingTaskId, setControllingTaskId] = useState<string | null>(null)
   const [transferPreviewOpen, setTransferPreviewOpen] = useState(false)
@@ -303,14 +297,24 @@ export default function TasksPage() {
     () =>
       (tasksData?.tasks ?? []).filter(
         (task) =>
-          task.lifecycleState === "paused" ||
-          task.status === "pending" ||
-          task.status === "in_progress"
+          task.lifecycleState !== "canceled" &&
+          (
+            task.lifecycleState === "paused" ||
+            task.status === "pending" ||
+            task.status === "in_progress"
+          )
       ),
     [tasksData?.tasks]
   )
   const historyTasks = useMemo(
-    () => (tasksData?.tasks ?? []).filter((task) => task.status === "completed" || task.status === "failed"),
+    () =>
+      (tasksData?.tasks ?? []).filter(
+        (task) =>
+          task.status === "completed" ||
+          task.status === "failed" ||
+          task.status === "canceled" ||
+          task.lifecycleState === "canceled"
+      ),
     [tasksData?.tasks]
   )
 
@@ -380,16 +384,6 @@ export default function TasksPage() {
       body.destinationPrefix = destinationPrefix.trim()
     }
 
-    if (scheduleMode === "cron") {
-      if (!scheduleCron.trim()) {
-        toast.error("Cron schedule is required")
-        return null
-      }
-      body.schedule = { cron: scheduleCron.trim() }
-    } else {
-      body.schedule = null
-    }
-
     return body
   }
 
@@ -438,16 +432,10 @@ export default function TasksPage() {
   async function createTransferTask(body: TransferTaskCreateBody) {
     setSubmitting(true)
     try {
-      const requestBody: TransferTaskCreateBody = {
-        ...body,
-        ...(body.schedule && destructiveTask
-          ? { confirmDestructiveSchedule: true }
-          : {}),
-      }
       const res = await fetch("/api/tasks/transfer", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(requestBody),
+        body: JSON.stringify(body),
       })
 
       const data = await res.json()
@@ -553,10 +541,7 @@ export default function TasksPage() {
 
   async function handleTaskControl(
     taskId: string,
-    action: "pause" | "resume" | "restart" | "retry_failed" | "cancel",
-    options?: {
-      cancelLabel?: "task" | "schedule"
-    }
+    action: "pause" | "resume" | "restart" | "retry_failed" | "cancel"
   ) {
     setControllingTaskId(taskId)
     try {
@@ -578,9 +563,7 @@ export default function TasksPage() {
           : action === "resume"
             ? "Task resumed"
             : action === "cancel"
-              ? options?.cancelLabel === "schedule"
-                ? "Task schedule canceled"
-                : "Task canceled"
+              ? "Task canceled"
               : action === "retry_failed"
                 ? "Retry for failed items started"
                 : "Task restarted"
@@ -661,8 +644,8 @@ export default function TasksPage() {
           <div className="space-y-1">
             <CardTitle>Start New Task</CardTitle>
             <CardDescription>
-              Transfers run on cached files only and follow plan limits. Scheduling is optional for every
-              transfer operation. Sync mirrors destination scope and deletes destination-only files.
+              Transfers run on cached files only and follow plan limits. Sync mirrors destination
+              scope and deletes destination-only files.
             </CardDescription>
           </div>
         </CardHeader>
@@ -695,34 +678,6 @@ export default function TasksPage() {
                 </SelectContent>
               </Select>
             </div>
-          </div>
-
-          <div className="grid gap-4 md:grid-cols-2">
-            <div className="space-y-2">
-              <Label>Schedule</Label>
-              <Select value={scheduleMode} onValueChange={(value) => setScheduleMode(value as "once" | "cron")}>
-                <SelectTrigger className="w-full">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="once">One-time run</SelectItem>
-                  <SelectItem value="cron">Cron schedule (UTC)</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-            {scheduleMode === "cron" ? (
-              <div className="space-y-2">
-                <Label>Cron expression (UTC)</Label>
-                <Input
-                  value={scheduleCron}
-                  onChange={(event) => setScheduleCron(event.target.value)}
-                  placeholder="0 * * * *"
-                />
-                <p className="text-xs text-muted-foreground">
-                  Minimum supported frequency is once per hour.
-                </p>
-              </div>
-            ) : null}
           </div>
 
           <div className="grid gap-4 md:grid-cols-2">
@@ -856,9 +811,6 @@ export default function TasksPage() {
                       <p className="mt-1 text-xs text-muted-foreground">
                         Updated {new Date(task.updatedAt).toLocaleString()} • Runs {task.runCount}
                       </p>
-                      <p className="mt-1 text-xs text-muted-foreground">
-                        Schedule: {getTaskScheduleLabel(task)}
-                      </p>
                       {(task.successRuns > 0 || task.failedRuns > 0) ? (
                         <p className="mt-1 text-xs text-muted-foreground">
                           Run summary: {task.successRuns} succeeded • {task.failedRuns} failed
@@ -869,14 +821,6 @@ export default function TasksPage() {
                           Latest result: {getTaskResultSummary(task)}
                         </p>
                       ) : null}
-                      {task.isRecurring && task.upcomingRuns.length > 0 ? (
-                        <p className="mt-1 text-xs text-muted-foreground">
-                          Next 3 scheduled runs:{" "}
-                          {task.upcomingRuns
-                            .map((item) => new Date(item).toLocaleString())
-                            .join(" • ")}
-                        </p>
-                      ) : null}
                       {task.lastError ? (
                         <p className="mt-1 text-xs text-destructive">{task.lastError}</p>
                       ) : null}
@@ -884,7 +828,7 @@ export default function TasksPage() {
                     <div className="flex items-center gap-2">
                       <Badge
                         variant={
-                          task.lifecycleState === "paused"
+                          task.lifecycleState !== "active"
                             ? "outline"
                             : getStatusVariant(task.status)
                         }
@@ -896,7 +840,7 @@ export default function TasksPage() {
                         <Button
                           size="sm"
                           variant="outline"
-                          disabled={controllingTaskId === task.id}
+                          disabled={controllingTaskId === task.id || isPauseTransition(task)}
                           onClick={() => void handleTaskControl(task.id, "resume")}
                         >
                           <Play className="mr-1 h-3.5 w-3.5" />
@@ -906,7 +850,11 @@ export default function TasksPage() {
                         <Button
                           size="sm"
                           variant="outline"
-                          disabled={controllingTaskId === task.id || task.status === "completed"}
+                          disabled={
+                            controllingTaskId === task.id ||
+                            task.status === "completed" ||
+                            task.status === "canceled"
+                          }
                           onClick={() => void handleTaskControl(task.id, "pause")}
                         >
                           <Pause className="mr-1 h-3.5 w-3.5" />
@@ -925,14 +873,10 @@ export default function TasksPage() {
                       <Button
                         size="sm"
                         variant="outline"
-                        disabled={controllingTaskId === task.id || task.status === "in_progress"}
-                        onClick={() =>
-                          void handleTaskControl(task.id, "cancel", {
-                            cancelLabel: task.isRecurring ? "schedule" : "task",
-                          })
-                        }
+                        disabled={controllingTaskId === task.id || isPauseTransition(task)}
+                        onClick={() => void handleTaskControl(task.id, "cancel")}
                       >
-                        {task.isRecurring ? "Cancel Schedule" : "Cancel Task"}
+                        Cancel Task
                       </Button>
                     </div>
                   </div>
@@ -947,7 +891,7 @@ export default function TasksPage() {
         <CardHeader>
           <CardTitle>History</CardTitle>
           <CardDescription>
-            Completed/failed tasks, latest execution note, and history cleanup controls.
+            Completed, failed, and canceled tasks, with latest execution note and cleanup controls.
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -965,9 +909,6 @@ export default function TasksPage() {
                         {task.completedAt
                           ? ` • Completed ${new Date(task.completedAt).toLocaleString()}`
                           : ""}
-                      </p>
-                      <p className="mt-1 text-xs text-muted-foreground">
-                        Schedule: {getTaskScheduleLabel(task)}
                       </p>
                       {(task.successRuns > 0 || task.failedRuns > 0) ? (
                         <p className="mt-1 text-xs text-muted-foreground">
@@ -989,13 +930,16 @@ export default function TasksPage() {
                       ) : null}
                     </div>
                     <div className="flex items-center gap-2">
-                      <Badge variant={getStatusVariant(task.status)} className="h-6 px-2 text-xs capitalize">
-                        {task.status.replace("_", " ")}
+                      <Badge
+                        variant={task.lifecycleState !== "active" ? "outline" : getStatusVariant(task.status)}
+                        className="h-6 px-2 text-xs capitalize"
+                      >
+                        {getDisplayState(task)}
                       </Badge>
                       <Button
                         size="sm"
                         variant="outline"
-                        disabled={controllingTaskId === task.id}
+                        disabled={controllingTaskId === task.id || task.status === "in_progress"}
                         onClick={() => void handleTaskControl(task.id, "restart")}
                       >
                         <RotateCcw className="mr-1 h-3.5 w-3.5" />
@@ -1015,7 +959,7 @@ export default function TasksPage() {
                         size="sm"
                         variant="ghost"
                         className="text-muted-foreground hover:text-destructive"
-                        disabled={controllingTaskId === task.id}
+                        disabled={controllingTaskId === task.id || task.status === "in_progress"}
                         onClick={() => void handleDeleteTask(task.id)}
                       >
                         <Trash2 className="mr-1 h-3.5 w-3.5" />

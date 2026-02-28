@@ -10,7 +10,7 @@ import {
   getUpcomingRunDatesFromCron,
 } from "@/lib/task-schedule"
 
-type TaskStatus = "pending" | "in_progress" | "completed" | "failed"
+type TaskStatus = "pending" | "in_progress" | "completed" | "failed" | "canceled"
 
 export async function GET(request: NextRequest) {
   try {
@@ -27,9 +27,9 @@ export async function GET(request: NextRequest) {
 
     const statuses: TaskStatus[] =
       scope === "history"
-        ? ["completed", "failed"]
+        ? ["completed", "failed", "canceled"]
         : scope === "all"
-          ? ["pending", "in_progress", "completed", "failed"]
+          ? ["pending", "in_progress", "completed", "failed", "canceled"]
           : ["pending", "in_progress", "failed"]
 
     const ALLOWED_TYPES = new Set(["bulk_delete", "object_transfer"])

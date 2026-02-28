@@ -19,6 +19,7 @@ export interface TaskRunSnapshot {
 }
 
 export function deriveRunStatus(taskStatus: string, lastError: string | null): TaskRunStatus {
+  if (taskStatus === "canceled") return "skipped"
   if (taskStatus === "completed") {
     return lastError ? "failed" : "succeeded"
   }
@@ -96,6 +97,8 @@ export async function recordTaskRunFromSnapshot(params: {
               ? "Task run failed"
               : run.status === "retrying"
                 ? "Task run scheduled for retry"
+                : run.status === "skipped"
+                  ? "Task run canceled"
                 : "Task run updated",
         metadata: {
           workerId,

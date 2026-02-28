@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server"
 import {
   CopyObjectCommand,
-  DeleteObjectCommand,
   DeleteObjectsCommand,
   GetObjectCommand,
   HeadObjectCommand,
@@ -13,15 +12,18 @@ import { Prisma } from "@prisma/client"
 import { auth } from "@/lib/auth"
 import { prisma } from "@/lib/db"
 import { getS3Client } from "@/lib/s3"
-import { rebuildUserExtensionStats } from "@/lib/file-stats"
+import { applyUserExtensionStatsDelta, rebuildUserExtensionStats } from "@/lib/file-stats"
 import { buildFileSearchSqlWhereClause, parseScopes } from "@/lib/file-search"
 import { getUserPlanEntitlements } from "@/lib/plan-entitlements"
 import { getBucketLimitViolation } from "@/lib/plan-limits"
 import { logUserAuditAction } from "@/lib/audit-logger"
 import {
+  getTaskBulkDeleteBatchSize,
   getTaskEngineInternalToken,
   getTaskMaxActivePerUser,
   getTaskMissedScheduleGraceSeconds,
+  getTaskTransferBatchSize,
+  getTaskTransferItemConcurrency,
   getTaskWorkerUserBudgetMs,
 } from "@/lib/task-engine-config"
 import {
@@ -39,11 +41,10 @@ import { isDestinationUpToDateForSync } from "@/lib/transfer-delta"
 export const runtime = "nodejs"
 export const maxDuration = 60
 
-const CHUNK_SIZE = 500
-const TRANSFER_CHUNK_SIZE = 50
 const LOCK_SECONDS = 45
 const SYNC_POLL_INTERVAL_SECONDS = 60
 const MAX_STALE_SCHEDULE_SKIPS_PER_CALL = 32
+const PAUSE_HOLD_MS = 365 * 24 * 60 * 60 * 1000
 
 interface BulkDeleteTaskPayload {
   query: string
@@ -57,10 +58,6 @@ interface BulkDeleteTaskProgress {
   deleted: number
   remaining: number
   cursorId: string | null
-}
-
-interface CountRow {
-  total: bigint
 }
 
 type TransferScope = "folder" | "bucket"
@@ -89,6 +86,81 @@ interface ObjectTransferTaskProgress {
   failed: number
   remaining: number
   cursorKey: string | null
+}
+
+interface WorkerTaskSnapshot {
+  taskId: string
+  taskType: string
+  taskStatus: string
+  runCount: number
+  attempts: number
+  lastError: string | null
+  taskUserId: string
+}
+
+interface TransferSourceRow {
+  id: string
+  key: string
+  extension: string
+  size: bigint
+  lastModified: Date
+}
+
+interface TransferDestinationSnapshot {
+  size: bigint
+  lastModified: Date
+}
+
+interface TransferMetadataUpsertRow {
+  userId: string
+  credentialId: string
+  bucket: string
+  key: string
+  extension: string
+  size: bigint
+  lastModified: Date
+}
+
+interface PreparedTransferItem {
+  sourceFile: TransferSourceRow
+  destinationKey: string
+  createsNewDestination: boolean
+  skip: boolean
+}
+
+interface TransferItemResult {
+  status: "copied" | "moved" | "skipped" | "failed" | "missing_source"
+  sourceId: string
+  sourceKey: string
+  destinationKey: string
+  extension: string
+  size: bigint
+  lastModified: Date
+  createsNewDestination: boolean
+  sourceDeleteRequired: boolean
+  errorMessage: string | null
+}
+
+interface ClaimedTaskControlState {
+  status: string
+  lifecycleState: string
+  pausedAt: Date | null
+}
+
+interface PersistClaimedTaskCheckpointParams {
+  taskId: string
+  userId: string
+  claimedRunCount: number
+  normalUpdate: Prisma.BackgroundTaskUpdateManyMutationInput
+  pauseUpdate?: Prisma.BackgroundTaskUpdateManyMutationInput
+  cancelUpdate?: Prisma.BackgroundTaskUpdateManyMutationInput
+  preferTerminal?: boolean
+}
+
+interface PersistClaimedTaskCheckpointResult {
+  applied: boolean
+  appliedMode: "normal" | "paused" | "canceled"
+  finalStatus: string
 }
 
 function parsePayload(raw: unknown): BulkDeleteTaskPayload | null {
@@ -465,6 +537,208 @@ function addTaskHistoryEntry(
   }) as unknown as Prisma.InputJsonValue
 }
 
+function buildProcessedResponse(
+  snapshot: WorkerTaskSnapshot,
+  body: Record<string, unknown> = {}
+) {
+  return NextResponse.json({
+    processed: true,
+    taskId: snapshot.taskId,
+    taskType: snapshot.taskType,
+    taskStatus: snapshot.taskStatus,
+    runCount: snapshot.runCount,
+    attempts: snapshot.attempts,
+    lastError: snapshot.lastError,
+    taskUserId: snapshot.taskUserId,
+    ...body,
+  })
+}
+
+function getBackgroundTaskStringFieldValue(
+  value: string | Prisma.StringFieldUpdateOperationsInput | undefined
+): string | null {
+  if (typeof value === "string") return value
+  if (
+    value &&
+    typeof value === "object" &&
+    "set" in value &&
+    typeof value.set === "string"
+  ) {
+    return value.set
+  }
+  return null
+}
+
+async function loadClaimedTaskControlState(taskId: string): Promise<ClaimedTaskControlState | null> {
+  return prisma.backgroundTask.findUnique({
+    where: { id: taskId },
+    select: {
+      status: true,
+      lifecycleState: true,
+      pausedAt: true,
+    },
+  })
+}
+
+function buildPauseCheckpointUpdate(
+  normalUpdate: Prisma.BackgroundTaskUpdateManyMutationInput,
+  now: Date,
+  pausedAt: Date | null
+): Prisma.BackgroundTaskUpdateManyMutationInput {
+  return {
+    ...normalUpdate,
+    status: "pending",
+    lifecycleState: "paused",
+    pausedAt: pausedAt ?? now,
+    nextRunAt: new Date(now.getTime() + PAUSE_HOLD_MS),
+    completedAt: null,
+  }
+}
+
+function buildCancelCheckpointUpdate(
+  normalUpdate: Prisma.BackgroundTaskUpdateManyMutationInput,
+  now: Date
+): Prisma.BackgroundTaskUpdateManyMutationInput {
+  return {
+    ...normalUpdate,
+    status: "canceled",
+    lifecycleState: "canceled",
+    pausedAt: null,
+    attempts: 0,
+    lastError: null,
+    completedAt: now,
+    nextRunAt: now,
+    isRecurring: false,
+    scheduleCron: null,
+    scheduleIntervalSeconds: null,
+  }
+}
+
+async function persistClaimedTaskCheckpoint(
+  params: PersistClaimedTaskCheckpointParams
+): Promise<PersistClaimedTaskCheckpointResult> {
+  const now = new Date()
+  const normalStatus = getBackgroundTaskStringFieldValue(params.normalUpdate.status) ?? "in_progress"
+  const normalIsTerminal = normalStatus === "completed" || normalStatus === "failed"
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const controlState = await loadClaimedTaskControlState(params.taskId)
+    if (controlState && controlState.status !== "in_progress") {
+      return {
+        applied: false,
+        appliedMode: "normal",
+        finalStatus: controlState.status,
+      }
+    }
+
+    let appliedMode: PersistClaimedTaskCheckpointResult["appliedMode"] = "normal"
+    let selectedUpdate = params.normalUpdate
+
+    if (!(params.preferTerminal && normalIsTerminal)) {
+      if (controlState?.lifecycleState === "canceled") {
+        appliedMode = "canceled"
+        selectedUpdate = params.cancelUpdate ?? buildCancelCheckpointUpdate(params.normalUpdate, now)
+      } else if (controlState?.lifecycleState === "paused") {
+        appliedMode = "paused"
+        selectedUpdate =
+          params.pauseUpdate ??
+          buildPauseCheckpointUpdate(params.normalUpdate, now, controlState.pausedAt)
+      }
+    }
+
+    const applied = await prisma.backgroundTask.updateMany({
+      where: {
+        id: params.taskId,
+        userId: params.userId,
+        runCount: params.claimedRunCount,
+        status: "in_progress",
+        ...(controlState ? { lifecycleState: controlState.lifecycleState } : {}),
+      },
+      data: selectedUpdate,
+    })
+
+    const selectedStatus =
+      getBackgroundTaskStringFieldValue(selectedUpdate.status) ?? normalStatus
+
+    if (applied.count > 0) {
+      return {
+        applied: true,
+        appliedMode,
+        finalStatus: selectedStatus,
+      }
+    }
+  }
+
+  const current = await prisma.backgroundTask.findFirst({
+    where: {
+      id: params.taskId,
+      userId: params.userId,
+    },
+    select: {
+      status: true,
+      lifecycleState: true,
+    },
+  })
+
+  return {
+    applied: false,
+    appliedMode: current?.lifecycleState === "canceled"
+      ? "canceled"
+      : current?.lifecycleState === "paused"
+        ? "paused"
+        : "normal",
+    finalStatus: current?.status ?? normalStatus,
+  }
+}
+
+async function upsertFileMetadataBatch(rows: TransferMetadataUpsertRow[]): Promise<void> {
+  if (rows.length === 0) return
+
+  const dedupedRows = Array.from(
+    rows.reduce((map, row) => {
+      map.set(`${row.credentialId}::${row.bucket}::${row.key}`, row)
+      return map
+    }, new Map<string, TransferMetadataUpsertRow>()).values()
+  )
+  if (dedupedRows.length === 0) return
+
+  const values = Prisma.join(
+    dedupedRows.map((row) => Prisma.sql`(
+      ${crypto.randomUUID()},
+      ${row.userId},
+      ${row.credentialId},
+      ${row.bucket},
+      ${row.key},
+      ${row.extension},
+      ${row.size},
+      ${row.lastModified},
+      false
+    )`)
+  )
+
+  await prisma.$executeRaw(Prisma.sql`
+    INSERT INTO "FileMetadata" (
+      "id",
+      "userId",
+      "credentialId",
+      "bucket",
+      "key",
+      "extension",
+      "size",
+      "lastModified",
+      "isFolder"
+    )
+    VALUES ${values}
+    ON CONFLICT ("credentialId", "bucket", "key")
+    DO UPDATE SET
+      "userId" = EXCLUDED."userId",
+      "extension" = EXCLUDED."extension",
+      "size" = EXCLUDED."size",
+      "lastModified" = EXCLUDED."lastModified",
+      "isFolder" = EXCLUDED."isFolder"
+  `)
+}
+
 async function realignFutureRecurringRun(params: {
   userId: string
   now: Date
@@ -675,6 +949,7 @@ async function findSyncDestinationDriftBatch(params: {
   payload: ObjectTransferTaskPayload
 }): Promise<SyncDestinationDriftRow[]> {
   const { userId, payload } = params
+  const limit = getTaskTransferBatchSize()
 
   if (payload.scope === "bucket") {
     return prisma.$queryRaw<SyncDestinationDriftRow[]>(Prisma.sql`
@@ -694,7 +969,7 @@ async function findSyncDestinationDriftBatch(params: {
             AND s."key" = d."key"
         )
       ORDER BY d."key" ASC
-      LIMIT ${TRANSFER_CHUNK_SIZE}
+      LIMIT ${limit}
     `)
   }
 
@@ -719,9 +994,9 @@ async function findSyncDestinationDriftBatch(params: {
           AND s."bucket" = ${payload.sourceBucket}
           AND s."isFolder" = false
           AND s."key" = ${sourcePrefix} || substring(d."key" from ${substringStart})
-      )
+        )
     ORDER BY d."key" ASC
-    LIMIT ${TRANSFER_CHUNK_SIZE}
+    LIMIT ${limit}
   `)
 }
 
@@ -772,6 +1047,7 @@ export async function POST(request: Request) {
     | {
       id: string
       type: string
+      runCount: number
       attempts: number
       maxAttempts: number
     }
@@ -875,6 +1151,44 @@ export async function POST(request: Request) {
       }
 
       const scheduled = resolveTaskSchedule(nextCandidate)
+      if (nextCandidate.status === "pending" && nextCandidate.isRecurring && !scheduled.enabled) {
+        const disabled = await prisma.backgroundTask.updateMany({
+          where: {
+            id: nextCandidate.id,
+            userId: actorUserId,
+            lifecycleState: "active",
+            status: "pending",
+            isRecurring: true,
+            nextRunAt: {
+              lte: now,
+            },
+          },
+          data: {
+            status: "completed",
+            completedAt: now,
+            nextRunAt: now,
+            isRecurring: false,
+            scheduleCron: null,
+            scheduleIntervalSeconds: null,
+            lastError: null,
+            executionHistory: addTaskHistoryEntry(
+              normalizeExecutionHistory(nextCandidate.executionHistory),
+              {
+                status: "skipped",
+                message: "Disabled scheduled task after cron support was removed",
+                metadata: {
+                  disabledAt: now.toISOString(),
+                },
+              }
+            ),
+          },
+        })
+        if (disabled.count > 0) {
+          skippedStaleSchedules += 1
+        }
+        continue
+      }
+
       const shouldSkipStaleRun =
         nextCandidate.status === "pending" &&
         scheduled.enabled &&
@@ -967,6 +1281,7 @@ export async function POST(request: Request) {
     claimedTask = {
       id: candidate.id,
       type: candidate.type,
+      runCount: candidate.runCount + 1,
       attempts: candidate.attempts,
       maxAttempts: candidate.maxAttempts,
     }
@@ -981,52 +1296,113 @@ export async function POST(request: Request) {
         const message = err instanceof Error ? err.message : String(err)
         const nextAttempts = candidate.attempts + 1
         const willRetry = nextAttempts < candidate.maxAttempts
+        const nextScheduledRunAt = claimedTaskSchedule?.enabled
+          ? nextRunAtForTaskSchedule(claimedTaskSchedule, new Date()) ?? new Date()
+          : null
         const nextRunAt = willRetry
           ? new Date(Date.now() + Math.min(nextAttempts * 60_000, 30 * 60_000))
-          : nextRunAtForTaskSchedule(claimedTaskSchedule, new Date()) ?? new Date()
-        await prisma.backgroundTask.update({
-          where: { id: candidate.id },
-          data: {
+          : nextScheduledRunAt ?? new Date()
+        const failureCheckpoint = await persistClaimedTaskCheckpoint({
+          taskId: candidate.id,
+          userId: actorUserId,
+          claimedRunCount: candidate.runCount + 1,
+          normalUpdate: {
             status: willRetry ? "pending" : "failed",
             attempts: nextAttempts,
             lastError: message.slice(0, 500),
             nextRunAt,
+            ...(willRetry || nextScheduledRunAt
+              ? {}
+              : {
+                  isRecurring: false,
+                  scheduleCron: null,
+                  scheduleIntervalSeconds: null,
+                }),
             executionHistory: addTaskHistoryEntry(taskExecutionHistory, {
               status: "failed",
               message,
             }),
           },
         })
-        return NextResponse.json({ processed: true, taskId: candidate.id, done: false, error: message })
+        return buildProcessedResponse(
+          {
+            taskId: candidate.id,
+            taskType: candidate.type,
+            taskStatus: failureCheckpoint.finalStatus,
+            runCount: candidate.runCount + 1,
+            attempts: failureCheckpoint.appliedMode === "canceled" ? 0 : nextAttempts,
+            lastError: failureCheckpoint.appliedMode === "canceled" ? null : message.slice(0, 500),
+            taskUserId: actorUserId,
+          },
+          {
+            done: failureCheckpoint.appliedMode === "canceled",
+            error: message,
+          }
+        )
       }
 
-      const nextRunAt = nextRunAtForTaskSchedule(claimedTaskSchedule, new Date()) ?? new Date()
-      await prisma.backgroundTask.update({
-        where: { id: candidate.id },
-        data: {
-          status: "pending",
+      const completedAt = new Date()
+      const nextScheduledRunAt = claimedTaskSchedule?.enabled
+        ? nextRunAtForTaskSchedule(claimedTaskSchedule, completedAt) ?? completedAt
+        : null
+      const successCheckpoint = await persistClaimedTaskCheckpoint({
+        taskId: candidate.id,
+        userId: actorUserId,
+        claimedRunCount: candidate.runCount + 1,
+        preferTerminal: true,
+        normalUpdate: {
+          status: nextScheduledRunAt ? "pending" : "completed",
+          lifecycleState: "active",
           attempts: 0,
           lastError: null,
-          lastRunAt: new Date(),
-          nextRunAt,
+          lastRunAt: completedAt,
+          completedAt: nextScheduledRunAt ? null : completedAt,
+          nextRunAt: nextScheduledRunAt ?? completedAt,
+          ...(nextScheduledRunAt
+            ? {}
+            : {
+                isRecurring: false,
+                scheduleCron: null,
+                scheduleIntervalSeconds: null,
+              }),
           executionHistory: addTaskHistoryEntry(taskExecutionHistory, {
             status: "succeeded",
             message: "Backup completed",
-            metadata: { nextRunAt: nextRunAt.toISOString() },
+            metadata: nextScheduledRunAt
+              ? { nextRunAt: nextScheduledRunAt.toISOString() }
+              : undefined,
           }),
         },
       })
-      return NextResponse.json({ processed: true, taskId: candidate.id, done: true, type: "database_backup" })
+      return buildProcessedResponse(
+        {
+          taskId: candidate.id,
+          taskType: candidate.type,
+          taskStatus: successCheckpoint.finalStatus,
+          runCount: candidate.runCount + 1,
+          attempts: 0,
+          lastError: null,
+          taskUserId: actorUserId,
+        },
+        {
+          done: !nextScheduledRunAt,
+          type: "database_backup",
+        }
+      )
     }
 
     if (candidate.type === "object_transfer") {
       const planPayload = resolveTaskPlanPayload(candidate.executionPlan, candidate.payload)
       transferPayload = parseObjectTransferPayload(planPayload)
       if (!transferPayload) {
-        await prisma.backgroundTask.update({
-          where: { id: candidate.id },
-          data: {
+        const invalidPayloadCheckpoint = await persistClaimedTaskCheckpoint({
+          taskId: candidate.id,
+          userId: actorUserId,
+          claimedRunCount: candidate.runCount + 1,
+          preferTerminal: true,
+          normalUpdate: {
             status: "failed",
+            lifecycleState: "active",
             attempts: candidate.attempts + 1,
             lastError: "Invalid object transfer payload",
             completedAt: new Date(),
@@ -1037,15 +1413,37 @@ export async function POST(request: Request) {
             }),
           },
         })
-        return NextResponse.json({ processed: false, message: "Invalid object transfer payload" })
+        return buildProcessedResponse(
+          {
+            taskId: candidate.id,
+            taskType: candidate.type,
+            taskStatus: invalidPayloadCheckpoint.finalStatus,
+            runCount: candidate.runCount + 1,
+            attempts: invalidPayloadCheckpoint.appliedMode === "canceled" ? 0 : candidate.attempts + 1,
+            lastError:
+              invalidPayloadCheckpoint.appliedMode === "canceled"
+                ? null
+                : "Invalid object transfer payload",
+            taskUserId: actorUserId,
+          },
+          {
+            done: true,
+            type: "object_transfer",
+            error: "Invalid object transfer payload",
+          }
+        )
       }
 
       const entitlements = await getUserPlanEntitlements(actorUserId)
       if (!entitlements) {
-        await prisma.backgroundTask.update({
-          where: { id: candidate.id },
-          data: {
+        const entitlementCheckpoint = await persistClaimedTaskCheckpoint({
+          taskId: candidate.id,
+          userId: actorUserId,
+          claimedRunCount: candidate.runCount + 1,
+          preferTerminal: true,
+          normalUpdate: {
             status: "failed",
+            lifecycleState: "active",
             attempts: candidate.attempts + 1,
             completedAt: new Date(),
             nextRunAt: new Date(),
@@ -1056,24 +1454,47 @@ export async function POST(request: Request) {
             }),
           },
         })
-        return NextResponse.json({ processed: false, message: "Failed to resolve plan entitlements" })
+        return buildProcessedResponse(
+          {
+            taskId: candidate.id,
+            taskType: candidate.type,
+            taskStatus: entitlementCheckpoint.finalStatus,
+            runCount: candidate.runCount + 1,
+            attempts: entitlementCheckpoint.appliedMode === "canceled" ? 0 : candidate.attempts + 1,
+            lastError:
+              entitlementCheckpoint.appliedMode === "canceled"
+                ? null
+                : "Failed to resolve plan entitlements",
+            taskUserId: actorUserId,
+          },
+          {
+            done: true,
+            type: "object_transfer",
+            error: "Failed to resolve plan entitlements",
+          }
+        )
       }
 
+      const activeTransferPayload = transferPayload
       const destinationContextChanged =
-        transferPayload.sourceCredentialId !== transferPayload.destinationCredentialId ||
-        transferPayload.sourceBucket !== transferPayload.destinationBucket
+        activeTransferPayload.sourceCredentialId !== activeTransferPayload.destinationCredentialId ||
+        activeTransferPayload.sourceBucket !== activeTransferPayload.destinationBucket
       if (destinationContextChanged) {
         const bucketLimitViolation = await getBucketLimitViolation({
           userId: actorUserId,
-          credentialId: transferPayload.destinationCredentialId,
-          bucket: transferPayload.destinationBucket,
+          credentialId: activeTransferPayload.destinationCredentialId,
+          bucket: activeTransferPayload.destinationBucket,
           entitlements,
         })
         if (bucketLimitViolation) {
-          await prisma.backgroundTask.update({
-            where: { id: candidate.id },
-            data: {
+          const bucketLimitCheckpoint = await persistClaimedTaskCheckpoint({
+            taskId: candidate.id,
+            userId: actorUserId,
+            claimedRunCount: candidate.runCount + 1,
+            preferTerminal: true,
+            normalUpdate: {
               status: "failed",
+              lifecycleState: "active",
               attempts: candidate.attempts + 1,
               completedAt: new Date(),
               nextRunAt: new Date(),
@@ -1085,21 +1506,33 @@ export async function POST(request: Request) {
             },
           })
 
-          return NextResponse.json({
-            processed: true,
-            taskId: candidate.id,
-            done: true,
-            type: "object_transfer",
-            skipped: "bucket_limit_reached",
-            details: bucketLimitViolation,
-          })
+          return buildProcessedResponse(
+            {
+              taskId: candidate.id,
+              taskType: candidate.type,
+              taskStatus: bucketLimitCheckpoint.finalStatus,
+              runCount: candidate.runCount + 1,
+              attempts: bucketLimitCheckpoint.appliedMode === "canceled" ? 0 : candidate.attempts + 1,
+              lastError:
+                bucketLimitCheckpoint.appliedMode === "canceled"
+                  ? null
+                  : "Bucket limit reached for current plan",
+              taskUserId: actorUserId,
+            },
+            {
+              done: true,
+              type: "object_transfer",
+              skipped: "bucket_limit_reached",
+              details: bucketLimitViolation,
+            }
+          )
         }
       }
 
       const progress = parseObjectTransferProgress(candidate.progress)
       const sourceKeyFilter: { startsWith?: string; gt?: string } = {}
-      if (transferPayload.scope === "folder" && transferPayload.sourcePrefix) {
-        sourceKeyFilter.startsWith = transferPayload.sourcePrefix
+      if (activeTransferPayload.scope === "folder" && activeTransferPayload.sourcePrefix) {
+        sourceKeyFilter.startsWith = activeTransferPayload.sourcePrefix
       }
       if (progress.cursorKey) {
         sourceKeyFilter.gt = progress.cursorKey
@@ -1108,13 +1541,13 @@ export async function POST(request: Request) {
       const sourceBatch = await prisma.fileMetadata.findMany({
         where: {
           userId: actorUserId,
-          credentialId: transferPayload.sourceCredentialId,
-          bucket: transferPayload.sourceBucket,
+          credentialId: activeTransferPayload.sourceCredentialId,
+          bucket: activeTransferPayload.sourceBucket,
           isFolder: false,
           ...(Object.keys(sourceKeyFilter).length > 0 ? { key: sourceKeyFilter } : {}),
         },
         orderBy: { key: "asc" },
-        take: TRANSFER_CHUNK_SIZE,
+        take: getTaskTransferBatchSize(),
         select: {
           id: true,
           key: true,
@@ -1124,19 +1557,32 @@ export async function POST(request: Request) {
         },
       })
 
+      const sourceTotal =
+        progress.total > 0
+          ? progress.total
+          : progress.processed + await prisma.fileMetadata.count({
+            where: {
+              userId: actorUserId,
+              credentialId: activeTransferPayload.sourceCredentialId,
+              bucket: activeTransferPayload.sourceBucket,
+              isFolder: false,
+              ...(Object.keys(sourceKeyFilter).length > 0 ? { key: sourceKeyFilter } : {}),
+            },
+          })
+
       if (sourceBatch.length === 0) {
-        const total = progress.total > 0 ? progress.total : progress.processed
+        const total = sourceTotal
         let syncCleanupDeleted = 0
         let syncCleanupFailed = 0
 
-        if (transferPayload.operation === "sync") {
+        if (activeTransferPayload.operation === "sync") {
           const { client: destinationClient } = await getS3Client(
             actorUserId,
-            transferPayload.destinationCredentialId
+            activeTransferPayload.destinationCredentialId
           )
           const cleanupResult = await cleanupSyncDestinationDrift({
             userId: actorUserId,
-            payload: transferPayload,
+            payload: activeTransferPayload,
             destinationClient,
           })
           syncCleanupDeleted = cleanupResult.deleted
@@ -1159,9 +1605,11 @@ export async function POST(request: Request) {
           const nextRunAt =
             nextRunAtForTaskSchedule(claimedTaskSchedule, new Date()) ??
             new Date(Date.now() + SYNC_POLL_INTERVAL_SECONDS * 1000)
-          await prisma.backgroundTask.update({
-            where: { id: candidate.id },
-            data: {
+          const scheduledCycleCheckpoint = await persistClaimedTaskCheckpoint({
+            taskId: candidate.id,
+            userId: actorUserId,
+            claimedRunCount: candidate.runCount + 1,
+            normalUpdate: {
               status: "pending",
               attempts: 0,
               completedAt: null,
@@ -1201,16 +1649,16 @@ export async function POST(request: Request) {
             eventName: "object_transfer_scheduled_cycle_completed",
             path: "/api/tasks/process",
             method: "POST",
-            target: `${transferPayload.sourceBucket} -> ${transferPayload.destinationBucket}`,
+            target: `${activeTransferPayload.sourceBucket} -> ${activeTransferPayload.destinationBucket}`,
             metadata: {
-              scope: transferPayload.scope,
-              operation: transferPayload.operation,
-              sourceCredentialId: transferPayload.sourceCredentialId,
-              sourceBucket: transferPayload.sourceBucket,
-              sourcePrefix: transferPayload.sourcePrefix,
-              destinationCredentialId: transferPayload.destinationCredentialId,
-              destinationBucket: transferPayload.destinationBucket,
-              destinationPrefix: transferPayload.destinationPrefix,
+              scope: activeTransferPayload.scope,
+              operation: activeTransferPayload.operation,
+              sourceCredentialId: activeTransferPayload.sourceCredentialId,
+              sourceBucket: activeTransferPayload.sourceBucket,
+              sourcePrefix: activeTransferPayload.sourcePrefix,
+              destinationCredentialId: activeTransferPayload.destinationCredentialId,
+              destinationBucket: activeTransferPayload.destinationBucket,
+              destinationPrefix: activeTransferPayload.destinationPrefix,
               nextRunAt: nextRunAt.toISOString(),
               schedule: claimedTaskSchedule.cron ?? claimedTaskSchedule.legacyIntervalSeconds,
               progress: cycleProgress,
@@ -1219,24 +1667,43 @@ export async function POST(request: Request) {
             },
           })
 
-          return NextResponse.json({
-            processed: true,
-            taskId: candidate.id,
-            done: false,
-            type: "object_transfer",
-            recurring: true,
-            nextRunAt: nextRunAt.toISOString(),
-            deletedInCleanup: syncCleanupDeleted,
-            failedInCleanup: syncCleanupFailed,
-          })
+          return buildProcessedResponse(
+            {
+              taskId: candidate.id,
+              taskType: candidate.type,
+              taskStatus: scheduledCycleCheckpoint.finalStatus,
+              runCount: candidate.runCount + 1,
+              attempts: scheduledCycleCheckpoint.appliedMode === "canceled" ? 0 : 0,
+              lastError: scheduledCycleCheckpoint.appliedMode === "canceled" ? null : null,
+              taskUserId: actorUserId,
+            },
+            {
+              done: scheduledCycleCheckpoint.appliedMode === "canceled",
+              type: "object_transfer",
+              recurring: scheduledCycleCheckpoint.appliedMode === "normal",
+              nextRunAt:
+                scheduledCycleCheckpoint.appliedMode === "normal"
+                  ? nextRunAt.toISOString()
+                  : undefined,
+              deletedInCleanup: syncCleanupDeleted,
+              failedInCleanup: syncCleanupFailed,
+            }
+          )
         }
 
         const hasTransferFailures = cycleProgress.failed > 0
+        const finalTransferError = hasTransferFailures
+          ? candidate.lastError ?? "One or more objects failed during transfer"
+          : null
 
-        await prisma.backgroundTask.update({
-          where: { id: candidate.id },
-          data: {
+        const finalTransferCheckpoint = await persistClaimedTaskCheckpoint({
+          taskId: candidate.id,
+          userId: actorUserId,
+          claimedRunCount: candidate.runCount + 1,
+          preferTerminal: true,
+          normalUpdate: {
             status: hasTransferFailures ? "failed" : "completed",
+            lifecycleState: "active",
             attempts: 0,
             completedAt: new Date(),
             nextRunAt: new Date(),
@@ -1245,9 +1712,7 @@ export async function POST(request: Request) {
               total,
               remaining: 0,
             } as Prisma.InputJsonObject,
-            lastError: hasTransferFailures
-              ? candidate.lastError ?? "One or more objects failed during transfer"
-              : null,
+            lastError: finalTransferError,
             executionHistory: addTaskHistoryEntry(taskExecutionHistory, {
               status: hasTransferFailures ? "failed" : "succeeded",
               message: hasTransferFailures
@@ -1274,16 +1739,16 @@ export async function POST(request: Request) {
             : "object_transfer_completed",
           path: "/api/tasks/process",
           method: "POST",
-          target: `${transferPayload.sourceBucket} -> ${transferPayload.destinationBucket}`,
+          target: `${activeTransferPayload.sourceBucket} -> ${activeTransferPayload.destinationBucket}`,
           metadata: {
-            scope: transferPayload.scope,
-            operation: transferPayload.operation,
-            sourceCredentialId: transferPayload.sourceCredentialId,
-            sourceBucket: transferPayload.sourceBucket,
-            sourcePrefix: transferPayload.sourcePrefix,
-            destinationCredentialId: transferPayload.destinationCredentialId,
-            destinationBucket: transferPayload.destinationBucket,
-            destinationPrefix: transferPayload.destinationPrefix,
+            scope: activeTransferPayload.scope,
+            operation: activeTransferPayload.operation,
+            sourceCredentialId: activeTransferPayload.sourceCredentialId,
+            sourceBucket: activeTransferPayload.sourceBucket,
+            sourcePrefix: activeTransferPayload.sourcePrefix,
+            destinationCredentialId: activeTransferPayload.destinationCredentialId,
+            destinationBucket: activeTransferPayload.destinationBucket,
+            destinationPrefix: activeTransferPayload.destinationPrefix,
             progress: {
               total,
               processed: progress.processed,
@@ -1296,39 +1761,48 @@ export async function POST(request: Request) {
           },
         })
 
-        return NextResponse.json({
-          processed: true,
-          taskId: candidate.id,
-          done: true,
-          type: "object_transfer",
-          failed: hasTransferFailures,
-        })
+        return buildProcessedResponse(
+          {
+            taskId: candidate.id,
+            taskType: candidate.type,
+            taskStatus: finalTransferCheckpoint.finalStatus,
+            runCount: candidate.runCount + 1,
+            attempts: 0,
+            lastError: finalTransferError,
+            taskUserId: actorUserId,
+          },
+          {
+            done: true,
+            type: "object_transfer",
+            failed: hasTransferFailures,
+          }
+        )
       }
 
       const [{ client: sourceClient }, { client: destinationClient }] = await Promise.all([
-        getS3Client(actorUserId, transferPayload.sourceCredentialId),
-        getS3Client(actorUserId, transferPayload.destinationCredentialId),
+        getS3Client(actorUserId, activeTransferPayload.sourceCredentialId),
+        getS3Client(actorUserId, activeTransferPayload.destinationCredentialId),
       ])
 
       const sameCredential =
-        transferPayload.sourceCredentialId === transferPayload.destinationCredentialId
+        activeTransferPayload.sourceCredentialId === activeTransferPayload.destinationCredentialId
       const requiresDestinationComparison =
-        transferPayload.operation === "copy" || transferPayload.operation === "sync"
+        activeTransferPayload.operation === "copy" || activeTransferPayload.operation === "sync"
       const mappedBatch = sourceBatch.map((sourceFile) => ({
         sourceFile,
         destinationKey: mapTransferDestinationKey(
-          transferPayload as ObjectTransferTaskPayload,
+          activeTransferPayload,
           sourceFile.key
         ),
       }))
 
-      let destinationByKey = new Map<string, { size: bigint; lastModified: Date }>()
+      let destinationByKey = new Map<string, TransferDestinationSnapshot>()
       if (requiresDestinationComparison) {
         const destinationRows = await prisma.fileMetadata.findMany({
           where: {
             userId: actorUserId,
-            credentialId: transferPayload.destinationCredentialId,
-            bucket: transferPayload.destinationBucket,
+            credentialId: activeTransferPayload.destinationCredentialId,
+            bucket: activeTransferPayload.destinationBucket,
             isFolder: false,
             key: { in: mappedBatch.map((item) => item.destinationKey) },
           },
@@ -1352,8 +1826,8 @@ export async function POST(request: Request) {
 
       let remainingCacheSlots: number | null = null
       if (
-        transferPayload.operation === "copy" ||
-        transferPayload.operation === "sync"
+        activeTransferPayload.operation === "copy" ||
+        activeTransferPayload.operation === "sync"
       ) {
         if (Number.isFinite(entitlements.fileLimit)) {
           const currentCachedFileCount = await prisma.fileMetadata.count({
@@ -1375,12 +1849,10 @@ export async function POST(request: Request) {
       let lastProcessedCursorKey = progress.cursorKey
       let timeBudgetReached = false
       let batchLastError: string | null = null
-      const movedSourceKeys: string[] = []
       const batchStartedAt = Date.now()
+      const transferItemConcurrency = getTaskTransferItemConcurrency()
 
-      for (const { sourceFile, destinationKey } of mappedBatch) {
-        // Keep each processing run bounded so long transfers continue across calls
-        // instead of hitting function/request time limits.
+      for (let index = 0; index < mappedBatch.length; index += transferItemConcurrency) {
         if (
           processedInBatch > 0 &&
           Date.now() - batchStartedAt >= getTaskWorkerUserBudgetMs()
@@ -1389,176 +1861,259 @@ export async function POST(request: Request) {
           break
         }
 
-        if (
-          sameCredential &&
-          transferPayload.sourceBucket === transferPayload.destinationBucket &&
-          sourceFile.key === destinationKey
-        ) {
-          skippedInBatch++
-          processedInBatch++
-          lastProcessedCursorKey = sourceFile.key
-          continue
-        }
-
-        let destinationExisting = requiresDestinationComparison
-          ? destinationByKey.get(destinationKey)
-          : undefined
-        let destinationExistsRemotely = false
-
-        if (requiresDestinationComparison && !destinationExisting) {
-          try {
-            const remoteSnapshot = await readRemoteObjectSnapshot({
-              client: destinationClient,
-              bucket: transferPayload.destinationBucket,
-              key: destinationKey,
-            })
-            if (remoteSnapshot) {
-              destinationExistsRemotely = true
-              if (remoteSnapshot.size !== null && remoteSnapshot.lastModified) {
-                destinationExisting = {
-                  size: remoteSnapshot.size,
-                  lastModified: remoteSnapshot.lastModified,
-                }
-                destinationByKey.set(destinationKey, destinationExisting)
+        const slice = mappedBatch.slice(index, index + transferItemConcurrency)
+        const prepared = await Promise.all(
+          slice.map(async ({ sourceFile, destinationKey }): Promise<PreparedTransferItem> => {
+            if (
+              sameCredential &&
+              activeTransferPayload.sourceBucket === activeTransferPayload.destinationBucket &&
+              sourceFile.key === destinationKey
+            ) {
+              return {
+                sourceFile,
+                destinationKey,
+                createsNewDestination: false,
+                skip: true,
               }
             }
-          } catch {
-            // If destination verification fails, continue with normal transfer flow.
-          }
-        }
 
-        const createsNewDestination = !destinationExisting && !destinationExistsRemotely
+            let destinationExisting = requiresDestinationComparison
+              ? destinationByKey.get(destinationKey)
+              : undefined
+            let destinationExistsRemotely = false
 
-        if (createsNewDestination && remainingCacheSlots !== null && remainingCacheSlots <= 0) {
-          skippedInBatch++
-          processedInBatch++
-          lastProcessedCursorKey = sourceFile.key
-          continue
-        }
+            if (requiresDestinationComparison && !destinationExisting) {
+              try {
+                const remoteSnapshot = await readRemoteObjectSnapshot({
+                  client: destinationClient,
+                  bucket: activeTransferPayload.destinationBucket,
+                  key: destinationKey,
+                })
+                if (remoteSnapshot) {
+                  destinationExistsRemotely = true
+                  if (remoteSnapshot.size !== null && remoteSnapshot.lastModified) {
+                    destinationExisting = {
+                      size: remoteSnapshot.size,
+                      lastModified: remoteSnapshot.lastModified,
+                    }
+                    destinationByKey.set(destinationKey, destinationExisting)
+                  }
+                }
+              } catch {
+                // If destination verification fails, continue with normal transfer flow.
+              }
+            }
 
-        if (
-          transferPayload.operation === "copy" &&
-          (destinationExisting || destinationExistsRemotely)
-        ) {
-          skippedInBatch++
-          processedInBatch++
-          lastProcessedCursorKey = sourceFile.key
-          continue
-        }
+            const createsNewDestination = !destinationExisting && !destinationExistsRemotely
+            const shouldSkipForExistingDestination =
+              activeTransferPayload.operation === "copy" &&
+              (destinationExisting || destinationExistsRemotely)
+            const shouldSkipForUpToDateSync =
+              activeTransferPayload.operation === "sync" &&
+              destinationExisting &&
+              isDestinationUpToDateForSync(
+                {
+                  size: sourceFile.size,
+                  lastModified: sourceFile.lastModified,
+                },
+                destinationExisting
+              )
 
-        if (
-          transferPayload.operation === "sync" &&
-          destinationExisting &&
-          isDestinationUpToDateForSync(
-            {
-              size: sourceFile.size,
-              lastModified: sourceFile.lastModified,
-            },
-            destinationExisting
-          )
-        ) {
-          skippedInBatch++
-          processedInBatch++
-          lastProcessedCursorKey = sourceFile.key
-          continue
-        }
-
-        try {
-          await copyObjectAcrossLocations({
-            sourceClient,
-            destinationClient,
-            sameCredential,
-            sourceBucket: transferPayload.sourceBucket,
-            sourceKey: sourceFile.key,
-            destinationBucket: transferPayload.destinationBucket,
-            destinationKey,
-            expectedContentLength: sourceFile.size,
+            return {
+              sourceFile,
+              destinationKey,
+              createsNewDestination,
+              skip: Boolean(shouldSkipForExistingDestination || shouldSkipForUpToDateSync),
+            }
           })
+        )
 
-          await prisma.fileMetadata.upsert({
-            where: {
-              credentialId_bucket_key: {
-                credentialId: transferPayload.destinationCredentialId,
-                bucket: transferPayload.destinationBucket,
-                key: destinationKey,
-              },
-            },
-            create: {
-              userId: actorUserId,
-              credentialId: transferPayload.destinationCredentialId,
-              bucket: transferPayload.destinationBucket,
-              key: destinationKey,
-              extension: sourceFile.extension,
-              size: sourceFile.size,
-              lastModified: sourceFile.lastModified,
-              isFolder: false,
-            },
-            update: {
-              extension: sourceFile.extension,
-              size: sourceFile.size,
-              lastModified: sourceFile.lastModified,
-              isFolder: false,
-            },
-          })
-          if (createsNewDestination && remainingCacheSlots !== null) {
-            remainingCacheSlots = Math.max(0, remainingCacheSlots - 1)
+        const actionable: PreparedTransferItem[] = []
+        for (const item of prepared) {
+          if (item.skip) {
+            skippedInBatch++
+            processedInBatch++
+            continue
           }
 
-          if (
-            transferPayload.operation === "move" ||
-            transferPayload.operation === "migrate"
-          ) {
-            await sourceClient.send(
-              new DeleteObjectCommand({
-                Bucket: transferPayload.sourceBucket,
-                Key: sourceFile.key,
+          if (item.createsNewDestination && remainingCacheSlots !== null) {
+            if (remainingCacheSlots <= 0) {
+              skippedInBatch++
+              processedInBatch++
+              continue
+            }
+            remainingCacheSlots -= 1
+          }
+
+          actionable.push(item)
+        }
+
+        let results = await Promise.all(
+          actionable.map(async (item): Promise<TransferItemResult> => {
+            try {
+              await copyObjectAcrossLocations({
+                sourceClient,
+                destinationClient,
+                sameCredential,
+                sourceBucket: activeTransferPayload.sourceBucket,
+                sourceKey: item.sourceFile.key,
+                destinationBucket: activeTransferPayload.destinationBucket,
+                destinationKey: item.destinationKey,
+                expectedContentLength: item.sourceFile.size,
               })
-            )
 
+              return {
+                status: "copied",
+                sourceId: item.sourceFile.id,
+                sourceKey: item.sourceFile.key,
+                destinationKey: item.destinationKey,
+                extension: item.sourceFile.extension,
+                size: item.sourceFile.size,
+                lastModified: item.sourceFile.lastModified,
+                createsNewDestination: item.createsNewDestination,
+                sourceDeleteRequired:
+                  activeTransferPayload.operation === "move" ||
+                  activeTransferPayload.operation === "migrate",
+                errorMessage: null,
+              }
+            } catch (itemError) {
+              const errorCode = getS3ErrorCode(itemError)
+              const errorMessage = formatTaskProcessingError(itemError)
+              return {
+                status: errorCode === "NoSuchKey" ? "missing_source" : "failed",
+                sourceId: item.sourceFile.id,
+                sourceKey: item.sourceFile.key,
+                destinationKey: item.destinationKey,
+                extension: item.sourceFile.extension,
+                size: item.sourceFile.size,
+                lastModified: item.sourceFile.lastModified,
+                createsNewDestination: item.createsNewDestination,
+                sourceDeleteRequired: false,
+                errorMessage,
+              }
+            }
+          })
+        )
+
+        const missingSourceIds = results
+          .filter((result) => result.status === "missing_source")
+          .map((result) => result.sourceId)
+        if (missingSourceIds.length > 0) {
+          await prisma.fileMetadata.deleteMany({
+            where: {
+              id: {
+                in: missingSourceIds,
+              },
+              userId: actorUserId,
+            },
+          })
+        }
+
+        const copiedRows = results.filter((result) => result.status === "copied")
+        if (copiedRows.length > 0) {
+          await upsertFileMetadataBatch(
+            copiedRows.map((result) => ({
+              userId: actorUserId,
+              credentialId: activeTransferPayload.destinationCredentialId,
+              bucket: activeTransferPayload.destinationBucket,
+              key: result.destinationKey,
+              extension: result.extension,
+              size: result.size,
+              lastModified: result.lastModified,
+            }))
+          )
+
+          for (const result of copiedRows) {
+            destinationByKey.set(result.destinationKey, {
+              size: result.size,
+              lastModified: result.lastModified,
+            })
+          }
+        }
+
+        if (
+          (activeTransferPayload.operation === "move" || activeTransferPayload.operation === "migrate") &&
+          copiedRows.length > 0
+        ) {
+          const deletedSourceKeys = await deleteKeysFromBucket(
+            sourceClient,
+            activeTransferPayload.sourceBucket,
+            copiedRows.map((result) => result.sourceKey)
+          )
+          const movedSourceIds: string[] = []
+
+          results = results.map((result) => {
+            if (result.status !== "copied" || !result.sourceDeleteRequired) {
+              return result
+            }
+
+            if (deletedSourceKeys.has(result.sourceKey)) {
+              movedSourceIds.push(result.sourceId)
+              return {
+                ...result,
+                status: "moved",
+              }
+            }
+
+            return {
+              ...result,
+              status: "failed",
+              errorMessage:
+                result.errorMessage ??
+                `Failed to delete source object '${result.sourceKey}' after transfer`,
+            }
+          })
+
+          if (movedSourceIds.length > 0) {
             await prisma.fileMetadata.deleteMany({
               where: {
-                id: sourceFile.id,
+                id: {
+                  in: movedSourceIds,
+                },
                 userId: actorUserId,
               },
             })
+          }
+        }
 
-            movedSourceKeys.push(sourceFile.key)
+        for (const result of results) {
+          const destinationPersisted =
+            result.status === "copied" ||
+            result.status === "moved" ||
+            (result.status === "failed" && result.sourceDeleteRequired)
+          if (
+            result.createsNewDestination &&
+            remainingCacheSlots !== null &&
+            !destinationPersisted
+          ) {
+            remainingCacheSlots += 1
+          }
+
+          if (!batchLastError && result.errorMessage) {
+            batchLastError = result.errorMessage
+          }
+
+          processedInBatch++
+          if (result.status === "copied") {
+            copiedInBatch++
+            continue
+          }
+          if (result.status === "moved") {
             movedInBatch++
             deletedInBatch++
-          } else {
-            copiedInBatch++
+            continue
           }
-
-          processedInBatch++
-          lastProcessedCursorKey = sourceFile.key
-        } catch (itemError) {
-          const errorCode = getS3ErrorCode(itemError)
-          const errorMessage = formatTaskProcessingError(itemError)
-          if (!batchLastError) {
-            batchLastError = errorMessage
-          }
-
-          if (errorCode === "NoSuchKey") {
-            // Cache can be stale relative to object storage. Remove missing source entries
-            // so retries don't get stuck on the same missing object forever.
-            await prisma.fileMetadata.deleteMany({
-              where: {
-                id: sourceFile.id,
-                userId: actorUserId,
-              },
-            })
+          if (result.status === "skipped" || result.status === "missing_source") {
             skippedInBatch++
-          } else {
-            failedInBatch++
+            continue
           }
-
-          processedInBatch++
-          lastProcessedCursorKey = sourceFile.key
+          failedInBatch++
         }
+
+        lastProcessedCursorKey = slice[slice.length - 1]?.sourceFile.key ?? lastProcessedCursorKey
       }
 
-
-      const total = progress.total > 0 ? progress.total : sourceBatch.length
+      const total = sourceTotal
       const nextProcessed = progress.processed + processedInBatch
       const nextProgress: ObjectTransferTaskProgress = {
         phase: "transfer",
@@ -1573,9 +2128,11 @@ export async function POST(request: Request) {
         cursorKey: lastProcessedCursorKey,
       }
 
-      await prisma.backgroundTask.update({
-        where: { id: candidate.id },
-        data: {
+      const transferCheckpoint = await persistClaimedTaskCheckpoint({
+        taskId: candidate.id,
+        userId: actorUserId,
+        claimedRunCount: candidate.runCount + 1,
+        normalUpdate: {
           status: "in_progress",
           attempts: 0,
           nextRunAt: new Date(),
@@ -1589,28 +2146,47 @@ export async function POST(request: Request) {
         },
       })
 
-      return NextResponse.json({
-        processed: true,
-        taskId: candidate.id,
-        done: false,
-        type: "object_transfer",
-        processedInBatch,
-        copiedInBatch,
-        movedInBatch,
-        skippedInBatch,
-        failedInBatch,
-        timeBudgetReached,
-      })
+      return buildProcessedResponse(
+        {
+          taskId: candidate.id,
+          taskType: candidate.type,
+          taskStatus: transferCheckpoint.finalStatus,
+          runCount: candidate.runCount + 1,
+          attempts: transferCheckpoint.appliedMode === "canceled" ? 0 : 0,
+          lastError:
+            transferCheckpoint.appliedMode === "canceled"
+              ? null
+              : batchLastError ??
+                (nextProgress.failed > 0
+                  ? candidate.lastError ?? "One or more objects failed during transfer"
+                  : null),
+          taskUserId: actorUserId,
+        },
+        {
+          done: transferCheckpoint.appliedMode === "canceled",
+          type: "object_transfer",
+          processedInBatch,
+          copiedInBatch,
+          movedInBatch,
+          skippedInBatch,
+          failedInBatch,
+          timeBudgetReached,
+        }
+      )
     }
 
     const bulkPlanPayload = resolveTaskPlanPayload(candidate.executionPlan, candidate.payload)
     const payload = parsePayload(bulkPlanPayload)
     if (!payload) {
       const nextAttempts = candidate.attempts + 1
-      await prisma.backgroundTask.update({
-        where: { id: candidate.id },
-        data: {
+      const invalidBulkCheckpoint = await persistClaimedTaskCheckpoint({
+        taskId: candidate.id,
+        userId: actorUserId,
+        claimedRunCount: candidate.runCount + 1,
+        preferTerminal: true,
+        normalUpdate: {
           status: "failed",
+          lifecycleState: "active",
           attempts: nextAttempts,
           lastError: "Invalid task payload",
           completedAt: new Date(),
@@ -1621,7 +2197,21 @@ export async function POST(request: Request) {
           }),
         },
       })
-      return NextResponse.json({ processed: false, message: "Invalid task payload" })
+      return buildProcessedResponse(
+        {
+          taskId: candidate.id,
+          taskType: candidate.type,
+          taskStatus: invalidBulkCheckpoint.finalStatus,
+          runCount: candidate.runCount + 1,
+          attempts: invalidBulkCheckpoint.appliedMode === "canceled" ? 0 : nextAttempts,
+          lastError: invalidBulkCheckpoint.appliedMode === "canceled" ? null : "Invalid task payload",
+          taskUserId: actorUserId,
+        },
+        {
+          done: true,
+          error: "Invalid task payload",
+        }
+      )
     }
 
     const whereClause = buildFileSearchSqlWhereClause({
@@ -1632,35 +2222,50 @@ export async function POST(request: Request) {
       type: payload.selectedType,
     })
     const progress = parseProgress(candidate.progress)
+    const bulkDeleteTotal =
+      progress.total > 0
+        ? progress.total
+        : progress.deleted + Number((
+          await prisma.$queryRaw<Array<{ total: bigint }>>(Prisma.sql`
+            SELECT COUNT(*)::bigint AS "total"
+            FROM "FileMetadata" fm
+            WHERE ${whereClause}
+            ${progress.cursorId ? Prisma.sql`AND fm."id" > ${progress.cursorId}` : Prisma.empty}
+          `)
+        )[0]?.total ?? BigInt(0))
 
     const batch = await prisma.$queryRaw<Array<{
       id: string
       key: string
       bucket: string
       credentialId: string
+      extension: string
+      size: bigint
     }>>(Prisma.sql`
       SELECT
         fm."id",
         fm."key",
         fm."bucket",
-        fm."credentialId"
+        fm."credentialId",
+        fm."extension",
+        fm."size"
       FROM "FileMetadata" fm
       WHERE ${whereClause}
       ${progress.cursorId ? Prisma.sql`AND fm."id" > ${progress.cursorId}` : Prisma.empty}
       ORDER BY fm."id" ASC
-      LIMIT ${CHUNK_SIZE}
+      LIMIT ${getTaskBulkDeleteBatchSize()}
     `)
 
     if (batch.length === 0) {
-      await rebuildUserExtensionStats(actorUserId)
-
       if (claimedTaskSchedule?.enabled) {
         const nextRunAt =
           nextRunAtForTaskSchedule(claimedTaskSchedule, new Date()) ??
           new Date(Date.now() + SYNC_POLL_INTERVAL_SECONDS * 1000)
-        await prisma.backgroundTask.update({
-          where: { id: candidate.id },
-          data: {
+        const scheduledEmptyCheckpoint = await persistClaimedTaskCheckpoint({
+          taskId: candidate.id,
+          userId: actorUserId,
+          claimedRunCount: candidate.runCount + 1,
+          normalUpdate: {
             status: "pending",
             attempts: 0,
             completedAt: null,
@@ -1676,7 +2281,7 @@ export async function POST(request: Request) {
               status: "succeeded",
               message: "Scheduled bulk delete cycle completed",
               metadata: {
-                deleted: progress.total,
+                deleted: bulkDeleteTotal,
                 nextRunAt: nextRunAt.toISOString(),
                 schedule: claimedTaskSchedule.cron ?? claimedTaskSchedule.legacyIntervalSeconds,
               },
@@ -1684,25 +2289,41 @@ export async function POST(request: Request) {
           },
         })
 
-        return NextResponse.json({
-          processed: true,
-          taskId: candidate.id,
-          done: false,
-          recurring: true,
-          nextRunAt: nextRunAt.toISOString(),
-        })
+        return buildProcessedResponse(
+          {
+            taskId: candidate.id,
+            taskType: candidate.type,
+            taskStatus: scheduledEmptyCheckpoint.finalStatus,
+            runCount: candidate.runCount + 1,
+            attempts: 0,
+            lastError: null,
+            taskUserId: actorUserId,
+          },
+          {
+            done: scheduledEmptyCheckpoint.appliedMode === "canceled",
+            recurring: scheduledEmptyCheckpoint.appliedMode === "normal",
+            nextRunAt:
+              scheduledEmptyCheckpoint.appliedMode === "normal"
+                ? nextRunAt.toISOString()
+                : undefined,
+          }
+        )
       }
 
-      await prisma.backgroundTask.update({
-        where: { id: candidate.id },
-        data: {
+      const emptyCompletionCheckpoint = await persistClaimedTaskCheckpoint({
+        taskId: candidate.id,
+        userId: actorUserId,
+        claimedRunCount: candidate.runCount + 1,
+        preferTerminal: true,
+        normalUpdate: {
           status: "completed",
+          lifecycleState: "active",
           attempts: 0,
           completedAt: new Date(),
           nextRunAt: new Date(),
           progress: {
-            total: progress.total,
-            deleted: progress.total,
+            total: bulkDeleteTotal,
+            deleted: bulkDeleteTotal,
             remaining: 0,
             cursorId: null,
           },
@@ -1711,13 +2332,26 @@ export async function POST(request: Request) {
             status: "succeeded",
             message: "Bulk delete completed",
             metadata: {
-              deleted: progress.total,
+              deleted: bulkDeleteTotal,
             },
           }),
         },
       })
 
-      return NextResponse.json({ processed: true, taskId: candidate.id, done: true })
+      return buildProcessedResponse(
+        {
+          taskId: candidate.id,
+          taskType: candidate.type,
+          taskStatus: emptyCompletionCheckpoint.finalStatus,
+          runCount: candidate.runCount + 1,
+          attempts: 0,
+          lastError: null,
+          taskUserId: actorUserId,
+        },
+        {
+          done: true,
+        }
+      )
     }
 
     const grouped = new Map<string, { bucket: string; credentialId: string; rows: typeof batch }>()
@@ -1769,16 +2403,22 @@ export async function POST(request: Request) {
       },
     })
 
-    await rebuildUserExtensionStats(actorUserId)
+    const deletedRows = batch.filter((row) => deletedIds.has(row.id))
+    try {
+      await applyUserExtensionStatsDelta(
+        actorUserId,
+        deletedRows.map((row) => ({
+          extension: row.extension,
+          size: row.size,
+        }))
+      )
+    } catch {
+      await rebuildUserExtensionStats(actorUserId)
+    }
 
-    const [remainingResult] = await prisma.$queryRaw<CountRow[]>(Prisma.sql`
-      SELECT COUNT(*)::bigint AS "total"
-      FROM "FileMetadata" fm
-      WHERE ${whereClause}
-    `)
-    const remaining = Number(remainingResult?.total ?? 0)
-    const total = progress.total > 0 ? progress.total : remaining + deletedIds.size
-    const deleted = Math.max(0, total - remaining)
+    const total = bulkDeleteTotal
+    const deleted = Math.min(total, progress.deleted + deletedIds.size)
+    const remaining = Math.max(0, total - deleted)
     let lastBatchCursorId = progress.cursorId
     let cursorBlocked = false
     for (const row of batch) {
@@ -1793,9 +2433,11 @@ export async function POST(request: Request) {
       const nextRunAt =
         nextRunAtForTaskSchedule(claimedTaskSchedule, new Date()) ??
         new Date(Date.now() + SYNC_POLL_INTERVAL_SECONDS * 1000)
-      await prisma.backgroundTask.update({
-        where: { id: candidate.id },
-        data: {
+      const scheduledRemainingCheckpoint = await persistClaimedTaskCheckpoint({
+        taskId: candidate.id,
+        userId: actorUserId,
+        claimedRunCount: candidate.runCount + 1,
+        normalUpdate: {
           status: "pending",
           attempts: 0,
           completedAt: null,
@@ -1820,20 +2462,36 @@ export async function POST(request: Request) {
         },
       })
 
-      return NextResponse.json({
-        processed: true,
-        taskId: candidate.id,
-        deletedInBatch: deletedIds.size,
-        done: false,
-        recurring: true,
-        nextRunAt: nextRunAt.toISOString(),
-      })
+      return buildProcessedResponse(
+        {
+          taskId: candidate.id,
+          taskType: candidate.type,
+          taskStatus: scheduledRemainingCheckpoint.finalStatus,
+          runCount: candidate.runCount + 1,
+          attempts: 0,
+          lastError: null,
+          taskUserId: actorUserId,
+        },
+        {
+          deletedInBatch: deletedIds.size,
+          done: scheduledRemainingCheckpoint.appliedMode === "canceled",
+          recurring: scheduledRemainingCheckpoint.appliedMode === "normal",
+          nextRunAt:
+            scheduledRemainingCheckpoint.appliedMode === "normal"
+              ? nextRunAt.toISOString()
+              : undefined,
+        }
+      )
     }
 
-    await prisma.backgroundTask.update({
-      where: { id: candidate.id },
-      data: {
+    const bulkCheckpoint = await persistClaimedTaskCheckpoint({
+      taskId: candidate.id,
+      userId: actorUserId,
+      claimedRunCount: candidate.runCount + 1,
+      preferTerminal: remaining === 0,
+      normalUpdate: {
         status: remaining === 0 ? "completed" : "in_progress",
+        lifecycleState: remaining === 0 ? "active" : undefined,
         attempts: 0,
         completedAt: remaining === 0 ? new Date() : null,
         nextRunAt: new Date(),
@@ -1859,12 +2517,21 @@ export async function POST(request: Request) {
       },
     })
 
-    return NextResponse.json({
-      processed: true,
-      taskId: candidate.id,
-      deletedInBatch: deletedIds.size,
-      done: remaining === 0,
-    })
+    return buildProcessedResponse(
+      {
+        taskId: candidate.id,
+        taskType: candidate.type,
+        taskStatus: bulkCheckpoint.finalStatus,
+        runCount: candidate.runCount + 1,
+        attempts: bulkCheckpoint.appliedMode === "canceled" ? 0 : 0,
+        lastError: bulkCheckpoint.appliedMode === "canceled" ? null : null,
+        taskUserId: actorUserId,
+      },
+      {
+        deletedInBatch: deletedIds.size,
+        done: remaining === 0 || bulkCheckpoint.appliedMode === "canceled",
+      }
+    )
   } catch (error) {
     console.error("Failed to process task:", error)
 
@@ -1942,14 +2609,11 @@ export async function POST(request: Request) {
           return base
         })()
 
-        await prisma.backgroundTask.updateMany({
-          where: {
-            id: claimedTask.id,
-            userId,
-            type: claimedTask.type,
-            status: "in_progress",
-          },
-          data: failureUpdate,
+        await persistClaimedTaskCheckpoint({
+          taskId: claimedTask.id,
+          userId,
+          claimedRunCount: claimedTask.runCount,
+          normalUpdate: failureUpdate,
         })
       }
     } catch (updateError) {
@@ -1959,14 +2623,41 @@ export async function POST(request: Request) {
     // A task-level failure was already persisted (retry scheduled or failed state set).
     // Return 200 to avoid noisy client-side 500s while the queue keeps progressing.
     if (taskAttemptFailed && claimedTask) {
-      const retryable = claimedTask.attempts + 1 < claimedTask.maxAttempts
-      return NextResponse.json({
-        processed: true,
-        taskId: claimedTask.id,
-        done: false,
-        error: message,
-        retryable,
+      const nextAttempts = claimedTask.attempts + 1
+      const retryable = nextAttempts < claimedTask.maxAttempts
+      const scheduledRetry = Boolean(claimedTaskSchedule?.enabled && !retryable)
+      const currentTask = await prisma.backgroundTask.findFirst({
+        where: {
+          id: claimedTask.id,
+          userId: userId!,
+        },
+        select: {
+          status: true,
+          attempts: true,
+          lastError: true,
+        },
       })
+      return buildProcessedResponse(
+        {
+          taskId: claimedTask.id,
+          taskType: claimedTask.type,
+          taskStatus: currentTask?.status ?? (retryable || scheduledRetry ? "pending" : "failed"),
+          runCount: claimedTask.runCount,
+          attempts: Math.max(0, currentTask?.attempts ?? (scheduledRetry ? 0 : nextAttempts)),
+          lastError:
+            typeof currentTask?.lastError === "string"
+              ? currentTask.lastError
+              : currentTask?.lastError === null
+                ? null
+                : message,
+          taskUserId: userId!,
+        },
+        {
+          done: currentTask?.status === "canceled",
+          error: message,
+          retryable,
+        }
+      )
     }
 
     return NextResponse.json({ processed: false, error: message }, { status: 500 })

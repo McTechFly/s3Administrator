@@ -1,6 +1,10 @@
 import { Prisma } from "@prisma/client"
 import { prisma } from "@/lib/db"
-import { getTaskMaxActivePerUser, getTaskWorkerScanIntervalSeconds } from "@/lib/task-engine-config"
+import {
+  getTaskWorkerPerUserParallelism,
+  getTaskWorkerScanIntervalSeconds,
+} from "@/lib/task-engine-config"
+import { taskReadyEmitter, TASK_READY_EVENT } from "@/lib/task-notify"
 const PORT = process.env.PORT || "3000"
 
 const TASK_TYPES = ["bulk_delete", "object_transfer"] as const
@@ -53,7 +57,7 @@ async function tick() {
     const dueRows = await findDueUserTypes()
     if (dueRows.length === 0) return
 
-    const concurrency = getTaskMaxActivePerUser()
+    const concurrency = getTaskWorkerPerUserParallelism()
 
     // Group by user -> set of types with due work
     const userTypes = new Map<string, Set<string>>()
@@ -87,6 +91,26 @@ async function tick() {
   }
 }
 
+let tickInProgress = false
+let pendingKick = false
+
+async function safeTick() {
+  if (tickInProgress) {
+    pendingKick = true
+    return
+  }
+  tickInProgress = true
+  try {
+    await tick()
+  } finally {
+    tickInProgress = false
+    if (pendingKick) {
+      pendingKick = false
+      queueMicrotask(() => { void safeTick() })
+    }
+  }
+}
+
 export function startEmbeddedTaskWorker() {
   // Set a default internal token if not configured (local dev convenience)
   if (!process.env.TASK_ENGINE_INTERNAL_TOKEN) {
@@ -95,13 +119,19 @@ export function startEmbeddedTaskWorker() {
 
   const scanIntervalMs = getTaskWorkerScanIntervalSeconds() * 1000
 
-  // Delay the first tick to let the Next.js server start up
+  // Reduced from 5s — 1s is enough for the Next.js server to start listening
   setTimeout(() => {
-    void tick()
+    void safeTick()
     setInterval(() => {
-      void tick()
+      void safeTick()
     }, scanIntervalMs)
-  }, 5_000)
+  }, 1_000)
 
-  console.info(`[embedded-task-worker] started (polls every ${getTaskWorkerScanIntervalSeconds()}s)`)
+  // Instant kick: process tasks immediately when created instead of waiting
+  // for the next poll interval
+  taskReadyEmitter.on(TASK_READY_EVENT, () => {
+    void safeTick()
+  })
+
+  console.info(`[embedded-task-worker] started (polls every ${getTaskWorkerScanIntervalSeconds()}s, instant kick enabled)`)
 }

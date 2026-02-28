@@ -8,10 +8,8 @@ import { getBucketLimitViolation } from "@/lib/plan-limits"
 import { transferTaskSchema } from "@/lib/validations"
 import { rateLimitByUser, rateLimitResponse } from "@/lib/rate-limit"
 import { buildTaskDedupeKey, createTaskExecutionPlan } from "@/lib/task-plans"
-import {
-  assertValidTaskScheduleCron,
-  TaskScheduleValidationError,
-} from "@/lib/task-schedule"
+import { kickTaskProcessing } from "@/lib/task-notify"
+import { TASK_SCHEDULES_DISABLED_MESSAGE } from "@/lib/task-schedule"
 import { isDestinationUpToDateForSync } from "@/lib/transfer-delta"
 import { isBackgroundTaskSchemaOutdated, backgroundTaskSchemaOutdatedResponse } from "@/lib/task-errors"
 
@@ -645,13 +643,15 @@ export async function POST(request: NextRequest) {
       destinationCredentialId,
       destinationPrefix,
       schedule,
-      confirmDestructiveSchedule,
     } = parsed.data
 
-    let scheduleCron: string | null = null
-    if (schedule?.cron) {
-      scheduleCron = assertValidTaskScheduleCron(schedule.cron)
+    if (schedule) {
+      return NextResponse.json(
+        { error: TASK_SCHEDULES_DISABLED_MESSAGE },
+        { status: 400 }
+      )
     }
+    const scheduleCron: string | null = null
 
     if (!isOperationAllowed(scope, operation)) {
       return NextResponse.json(
@@ -843,20 +843,6 @@ export async function POST(request: NextRequest) {
       })
     }
 
-    if (
-      scheduleCron &&
-      isDestructiveTransferOperation(operation) &&
-      !confirmDestructiveSchedule
-    ) {
-      return NextResponse.json(
-        {
-          error:
-            "Recurring destructive transfer requires explicit confirmation",
-        },
-        { status: 400 }
-      )
-    }
-
     if (existingTask) {
       return NextResponse.json({
         task: existingTask,
@@ -876,7 +862,7 @@ export async function POST(request: NextRequest) {
         payload: taskPayload,
         executionPlan: createTaskExecutionPlan("object_transfer", taskPayload),
         dedupeKey,
-        isRecurring: Boolean(scheduleCron),
+        isRecurring: false,
         scheduleCron,
         scheduleIntervalSeconds: null,
         progress: {
@@ -901,6 +887,8 @@ export async function POST(request: NextRequest) {
       },
     })
 
+    kickTaskProcessing({ userId: session.user.id, type: "object_transfer" })
+
     return NextResponse.json({
       task,
       sourceCachedFileCount,
@@ -911,9 +899,6 @@ export async function POST(request: NextRequest) {
     })
   } catch (error) {
     console.error("Failed to create transfer task:", error)
-    if (error instanceof TaskScheduleValidationError) {
-      return NextResponse.json({ error: error.message }, { status: 400 })
-    }
     if (isBackgroundTaskSchemaOutdated(error)) {
       return backgroundTaskSchemaOutdatedResponse()
     }

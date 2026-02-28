@@ -38,6 +38,10 @@ export function getTaskMaxActivePerUser(): number {
   return parseIntegerEnv(process.env.TASK_MAX_ACTIVE_PER_USER, community ? 8 : 4, 1, 32)
 }
 
+export function getTaskWorkerPerUserParallelism(): number {
+  return parseIntegerEnv(process.env.TASK_WORKER_PER_USER_PARALLELISM, community ? 16 : 8, 1, 32)
+}
+
 export function getTaskWorkerUserBurst(): number {
   return parseIntegerEnv(process.env.TASK_WORKER_USER_BURST, community ? 16 : 8, 1, 64)
 }
@@ -48,6 +52,18 @@ export function getTaskWorkerUserBudgetMs(): number {
 
 export function getTaskWorkerScanIntervalSeconds(): number {
   return parseIntegerEnv(process.env.TASK_WORKER_SCAN_INTERVAL_SECONDS, community ? 5 : 10, 2, 300)
+}
+
+export function getTaskTransferItemConcurrency(): number {
+  return parseIntegerEnv(process.env.TASK_TRANSFER_ITEM_CONCURRENCY, community ? 12 : 8, 1, 32)
+}
+
+export function getTaskTransferBatchSize(): number {
+  return parseIntegerEnv(process.env.TASK_TRANSFER_BATCH_SIZE, community ? 200 : 100, 10, 1_000)
+}
+
+export function getTaskBulkDeleteBatchSize(): number {
+  return parseIntegerEnv(process.env.TASK_BULK_DELETE_BATCH_SIZE, 1_000, 100, 5_000)
 }
 
 export function getTaskMissedScheduleGraceSeconds(): number {

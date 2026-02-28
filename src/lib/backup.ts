@@ -1,6 +1,5 @@
 import { spawn } from "node:child_process"
-import { createGzip } from "node:zlib"
-import { Readable, PassThrough } from "node:stream"
+import { PassThrough } from "node:stream"
 import { S3Client, DeleteObjectCommand } from "@aws-sdk/client-s3"
 import { Upload } from "@aws-sdk/lib-storage"
 import { prisma } from "@/lib/db"
@@ -56,7 +55,7 @@ export async function runBackup(): Promise<void> {
   if (!databaseUrl) throw new Error("DATABASE_URL is not set")
 
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-")
-  const key = `backups/${timestamp}.sql.gz`
+  const key = `backups/${timestamp}.dump`
 
   let sizeBytes = 0
 
@@ -78,9 +77,7 @@ export async function runBackup(): Promise<void> {
       pgError += d.toString()
     })
 
-    const gzip = createGzip()
-    const sourceStream = Readable.from(pg.stdout)
-    sourceStream.pipe(gzip).pipe(passthrough)
+    pg.stdout.pipe(passthrough)
 
     const upload = new Upload({
       client: s3,
@@ -88,7 +85,7 @@ export async function runBackup(): Promise<void> {
         Bucket: config.bucket,
         Key: key,
         Body: passthrough,
-        ContentType: "application/gzip",
+        ContentType: "application/octet-stream",
       },
     })
 

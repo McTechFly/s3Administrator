@@ -11,6 +11,12 @@ import { startTaskQueueWorker } from "@/lib/task-queue"
 interface ProcessRouteResponse {
   processed?: boolean
   taskId?: string
+  taskType?: string
+  taskStatus?: string
+  runCount?: number
+  attempts?: number
+  lastError?: string | null
+  taskUserId?: string
   done?: boolean
 }
 
@@ -54,34 +60,35 @@ async function processUserOnce(userId: string, workerId: string, type?: string) 
   }
 
   const payload = (await response.json()) as ProcessRouteResponse
-  if (!payload.processed || !payload.taskId) {
+  if (
+    !payload.processed ||
+    !payload.taskId ||
+    !payload.taskType ||
+    !payload.taskStatus ||
+    !payload.taskUserId ||
+    typeof payload.runCount !== "number" ||
+    typeof payload.attempts !== "number"
+  ) {
     return { processed: false }
   }
 
-  const snapshot = await prisma.backgroundTask.findUnique({
-    where: { id: payload.taskId },
-    select: {
-      id: true,
-      userId: true,
-      type: true,
-      runCount: true,
-      attempts: true,
-      status: true,
-      lastError: true,
+  await recordTaskRunFromSnapshot({
+    snapshot: {
+      id: payload.taskId,
+      userId: payload.taskUserId,
+      type: payload.taskType,
+      runCount: Math.max(1, Math.floor(payload.runCount)),
+      attempts: Math.max(0, Math.floor(payload.attempts)),
+      status: payload.taskStatus,
+      lastError: typeof payload.lastError === "string" ? payload.lastError : null,
+    },
+    startedAt,
+    finishedAt,
+    workerId,
+    metrics: {
+      done: Boolean(payload.done),
     },
   })
-
-  if (snapshot) {
-    await recordTaskRunFromSnapshot({
-      snapshot,
-      startedAt,
-      finishedAt,
-      workerId,
-      metrics: {
-        done: Boolean(payload.done),
-      },
-    })
-  }
 
   return {
     processed: true,

@@ -4,6 +4,24 @@ import { decrypt } from "@/lib/crypto"
 import { quietAwsLogger } from "@/lib/aws-logger"
 
 const LOCAL_HOSTNAMES = new Set(["localhost", "127.0.0.1", "0.0.0.0", "::1"])
+const S3_CLIENT_CACHE_TTL_MS = 5 * 60 * 1000
+const S3_CLIENT_CACHE_MAX_ENTRIES = 128
+
+interface CachedS3ClientEntry {
+  expiresAt: number
+  value: {
+    client: S3Client
+    credential: {
+      id: string
+      endpoint: string
+      region: string
+      provider: string
+      label: string
+    }
+  }
+}
+
+const s3ClientCache = new Map<string, CachedS3ClientEntry>()
 
 function hasProtocol(value: string): boolean {
   return /^https?:\/\//i.test(value)
@@ -114,6 +132,18 @@ export async function getS3Client(
     label: string
   }
 }> {
+  const cacheKey = credentialId ? `${userId}:${credentialId}` : `${userId}:default`
+  const now = Date.now()
+  const cached = s3ClientCache.get(cacheKey)
+  if (cached && cached.expiresAt > now) {
+    s3ClientCache.delete(cacheKey)
+    s3ClientCache.set(cacheKey, cached)
+    return cached.value
+  }
+  if (cached) {
+    s3ClientCache.delete(cacheKey)
+  }
+
   const credential = await prisma.s3Credential.findFirst({
     where: credentialId
       ? { id: credentialId, userId }
@@ -134,7 +164,7 @@ export async function getS3Client(
     secretAccessKey: secretKey,
   })
 
-  return {
+  const value = {
     client,
     credential: {
       id: credential.id,
@@ -144,4 +174,18 @@ export async function getS3Client(
       label: credential.label,
     },
   }
+
+  if (s3ClientCache.size >= S3_CLIENT_CACHE_MAX_ENTRIES) {
+    const oldestKey = s3ClientCache.keys().next().value
+    if (oldestKey) {
+      s3ClientCache.delete(oldestKey)
+    }
+  }
+
+  s3ClientCache.set(cacheKey, {
+    expiresAt: now + S3_CLIENT_CACHE_TTL_MS,
+    value,
+  })
+
+  return value
 }

@@ -1,7 +1,6 @@
-import parser from "cron-parser"
-
 export const MIN_TASK_SCHEDULE_INTERVAL_SECONDS = 60 * 60
 const MAX_TASK_CRON_LENGTH = 120
+export const TASK_SCHEDULES_DISABLED_MESSAGE = "Task schedules are temporarily disabled"
 
 export interface TaskSchedulePayload {
   cron: string
@@ -32,13 +31,6 @@ function normalizeWhitespace(value: string): string {
   return value.trim().replace(/\s+/g, " ")
 }
 
-function parseCronExpression(cron: string, currentDate: Date) {
-  return parser.parseExpression(cron, {
-    currentDate,
-    tz: "UTC",
-  })
-}
-
 export function normalizeTaskScheduleCron(raw: string): string {
   const normalized = normalizeWhitespace(raw)
   if (!normalized) {
@@ -54,54 +46,27 @@ export function assertValidTaskScheduleCron(
   raw: string,
   minIntervalSeconds = MIN_TASK_SCHEDULE_INTERVAL_SECONDS
 ): string {
-  const cron = normalizeTaskScheduleCron(raw)
+  normalizeTaskScheduleCron(raw)
 
-  try {
-    const probe = parseCronExpression(cron, new Date("2026-01-01T00:00:00.000Z"))
-    let previous = probe.next().toDate()
-    for (let i = 0; i < 32; i++) {
-      const next = probe.next().toDate()
-      const diffSeconds = Math.floor((next.getTime() - previous.getTime()) / 1000)
-      if (diffSeconds < minIntervalSeconds) {
-        throw new TaskScheduleValidationError(
-          `Schedule is too frequent. Minimum interval is ${formatIntervalLabel(minIntervalSeconds)}`
-        )
-      }
-      previous = next
-    }
-  } catch (error) {
-    if (error instanceof TaskScheduleValidationError) {
-      throw error
-    }
-    throw new TaskScheduleValidationError("Invalid cron expression")
+  if (minIntervalSeconds < MIN_TASK_SCHEDULE_INTERVAL_SECONDS) {
+    throw new TaskScheduleValidationError(
+      `Schedule is too frequent. Minimum interval is ${formatIntervalLabel(MIN_TASK_SCHEDULE_INTERVAL_SECONDS)}`
+    )
   }
 
-  return cron
+  throw new TaskScheduleValidationError(TASK_SCHEDULES_DISABLED_MESSAGE)
 }
 
-export function nextRunAtFromCron(cron: string, from: Date): Date {
-  const expression = parseCronExpression(cron, from)
-  return expression.next().toDate()
+export function nextRunAtFromCron(_cron: string, _from: Date): Date {
+  return new Date(_from.getTime())
 }
 
 export function getUpcomingRunDatesFromCron(
-  cron: string,
-  nextRunAt: Date,
-  count = 3
+  _cron: string,
+  _nextRunAt: Date,
+  _count = 3
 ): string[] {
-  if (count <= 0) return []
-
-  try {
-    const result: string[] = [nextRunAt.toISOString()]
-    let cursor = nextRunAt
-    for (let i = 1; i < count; i++) {
-      cursor = nextRunAtFromCron(cron, cursor)
-      result.push(cursor.toISOString())
-    }
-    return result
-  } catch {
-    return []
-  }
+  return []
 }
 
 export function resolveTaskSchedule(schedule: {
@@ -109,64 +74,18 @@ export function resolveTaskSchedule(schedule: {
   scheduleCron?: string | null
   scheduleIntervalSeconds?: number | null
 }): ResolvedTaskSchedule {
-  if (!schedule.isRecurring) {
-    return {
-      enabled: false,
-      cron: null,
-      legacyIntervalSeconds: null,
-    }
-  }
-
-  const cronCandidate =
-    typeof schedule.scheduleCron === "string" && schedule.scheduleCron.trim().length > 0
-      ? normalizeWhitespace(schedule.scheduleCron)
-      : null
-  if (cronCandidate) {
-    try {
-      const cron = assertValidTaskScheduleCron(cronCandidate)
-      return {
-        enabled: true,
-        cron,
-        legacyIntervalSeconds: null,
-      }
-    } catch {
-      return {
-        enabled: false,
-        cron: null,
-        legacyIntervalSeconds: null,
-      }
-    }
-  }
-
-  const legacyIntervalSeconds =
-    typeof schedule.scheduleIntervalSeconds === "number" &&
-    Number.isFinite(schedule.scheduleIntervalSeconds) &&
-    schedule.scheduleIntervalSeconds >= MIN_TASK_SCHEDULE_INTERVAL_SECONDS
-      ? Math.floor(schedule.scheduleIntervalSeconds)
-      : null
-
+  void schedule
   return {
-    enabled: legacyIntervalSeconds !== null,
+    enabled: false,
     cron: null,
-    legacyIntervalSeconds,
+    legacyIntervalSeconds: null,
   }
 }
 
 export function nextRunAtForTaskSchedule(
-  schedule: ResolvedTaskSchedule,
-  from: Date
+  _schedule: ResolvedTaskSchedule,
+  _from: Date
 ): Date | null {
-  if (!schedule.enabled) return null
-  if (schedule.cron) {
-    try {
-      return nextRunAtFromCron(schedule.cron, from)
-    } catch {
-      return null
-    }
-  }
-  if (schedule.legacyIntervalSeconds && schedule.legacyIntervalSeconds > 0) {
-    return new Date(from.getTime() + schedule.legacyIntervalSeconds * 1000)
-  }
   return null
 }
 
@@ -175,12 +94,6 @@ export function getEffectiveNextRunAtForTask(params: {
   scheduleCron?: string | null
   scheduleIntervalSeconds?: number | null
   nextRunAt: Date
-}, now: Date = new Date()): Date {
-  const schedule = resolveTaskSchedule(params)
-  if (!schedule.enabled) {
-    return params.nextRunAt
-  }
-  // Keep UI/server responses aligned to current server time for recurring tasks,
-  // even if persisted nextRunAt drifted due to downtime/older state transitions.
-  return nextRunAtForTaskSchedule(schedule, now) ?? params.nextRunAt
+}, _now: Date = new Date()): Date {
+  return params.nextRunAt
 }

@@ -7,10 +7,8 @@ import {
   parseScopes,
 } from "@/lib/file-search"
 import { buildTaskDedupeKey, createTaskExecutionPlan } from "@/lib/task-plans"
-import {
-  assertValidTaskScheduleCron,
-  TaskScheduleValidationError,
-} from "@/lib/task-schedule"
+import { kickTaskProcessing } from "@/lib/task-notify"
+import { TASK_SCHEDULES_DISABLED_MESSAGE } from "@/lib/task-schedule"
 import { isBackgroundTaskSchemaOutdated, backgroundTaskSchemaOutdatedResponse } from "@/lib/task-errors"
 
 interface BulkDeletePayload {
@@ -107,10 +105,13 @@ export async function POST(request: NextRequest) {
     const selectedBucketScopes = Array.isArray(body?.selectedBucketScopes)
       ? body.selectedBucketScopes.filter((value): value is string => typeof value === "string")
       : []
-    let scheduleCron: string | null = null
-    if (body?.schedule && typeof body.schedule === "object" && typeof body.schedule.cron === "string") {
-      scheduleCron = assertValidTaskScheduleCron(body.schedule.cron)
+    if (body?.schedule) {
+      return NextResponse.json(
+        { error: TASK_SCHEDULES_DISABLED_MESSAGE },
+        { status: 400 }
+      )
     }
+    const scheduleCron: string | null = null
 
     const normalizedCredentialIds = Array.from(new Set(selectedCredentialIds)).sort()
     const normalizedBucketScopes = Array.from(new Set(selectedBucketScopes)).sort()
@@ -203,16 +204,6 @@ export async function POST(request: NextRequest) {
       })
     }
 
-    if (scheduleCron && !body.confirmDestructiveSchedule) {
-      return NextResponse.json(
-        {
-          error:
-            "Recurring bulk delete requires explicit confirmation",
-        },
-        { status: 400 }
-      )
-    }
-
     if (existingTask) {
       return NextResponse.json({
         task: existingTask,
@@ -230,7 +221,7 @@ export async function POST(request: NextRequest) {
         payload: taskPayload,
         executionPlan: createTaskExecutionPlan("bulk_delete", taskPayload),
         dedupeKey,
-        isRecurring: Boolean(scheduleCron),
+        isRecurring: false,
         scheduleCron,
         scheduleIntervalSeconds: null,
         progress: {
@@ -249,12 +240,11 @@ export async function POST(request: NextRequest) {
       },
     })
 
+    kickTaskProcessing({ userId: session.user.id, type: "bulk_delete" })
+
     return NextResponse.json({ task })
   } catch (error) {
     console.error("Failed to create bulk delete task:", error)
-    if (error instanceof TaskScheduleValidationError) {
-      return NextResponse.json({ error: error.message }, { status: 400 })
-    }
     if (isBackgroundTaskSchemaOutdated(error)) {
       return backgroundTaskSchemaOutdatedResponse()
     }

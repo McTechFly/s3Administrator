@@ -1,5 +1,10 @@
 import { prisma } from "@/lib/db"
 
+interface UserExtensionStatsDeltaEntry {
+  extension: string
+  size: bigint
+}
+
 export function getObjectExtension(key: string, isFolder: boolean): string {
   if (isFolder) return ""
 
@@ -42,6 +47,82 @@ export async function rebuildUserExtensionStats(userId: string): Promise<void> {
           fileCount: entry._count._all,
           totalSize: entry._sum.size ?? BigInt(0),
         })),
+      })
+    }
+  })
+}
+
+export async function applyUserExtensionStatsDelta(
+  userId: string,
+  entries: UserExtensionStatsDeltaEntry[]
+): Promise<void> {
+  if (entries.length === 0) return
+
+  const deltaByExtension = new Map<string, { fileCount: number; totalSize: bigint }>()
+  for (const entry of entries) {
+    const normalizedExtension = entry.extension ?? ""
+    const current = deltaByExtension.get(normalizedExtension) ?? {
+      fileCount: 0,
+      totalSize: BigInt(0),
+    }
+    current.fileCount += 1
+    current.totalSize += entry.size
+    deltaByExtension.set(normalizedExtension, current)
+  }
+
+  const extensions = Array.from(deltaByExtension.keys())
+
+  await prisma.$transaction(async (tx) => {
+    const existing = await tx.userFileExtensionStat.findMany({
+      where: {
+        userId,
+        extension: {
+          in: extensions,
+        },
+      },
+      select: {
+        extension: true,
+        fileCount: true,
+        totalSize: true,
+      },
+    })
+
+    const existingByExtension = new Map(
+      existing.map((entry) => [entry.extension, entry])
+    )
+
+    for (const [extension, delta] of deltaByExtension) {
+      const current = existingByExtension.get(extension)
+      if (!current) {
+        continue
+      }
+
+      const nextFileCount = Math.max(0, current.fileCount - delta.fileCount)
+      const nextTotalSize = current.totalSize > delta.totalSize
+        ? current.totalSize - delta.totalSize
+        : BigInt(0)
+
+      if (nextFileCount === 0) {
+        await tx.userFileExtensionStat.deleteMany({
+          where: {
+            userId,
+            extension,
+          },
+        })
+        continue
+      }
+
+      await tx.userFileExtensionStat.update({
+        where: {
+          userId_extension: {
+            userId,
+            extension,
+          },
+        },
+        data: {
+          fileCount: nextFileCount,
+          totalSize: nextTotalSize,
+        },
       })
     }
   })

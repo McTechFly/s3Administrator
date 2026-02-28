@@ -4,6 +4,7 @@ import { deleteExpiredTaskEvents } from "@/lib/task-run-history"
 import {
   getTaskEventRetentionDays,
   getTaskWorkerConcurrency,
+  getTaskWorkerPerUserParallelism,
   getTaskWorkerScanIntervalSeconds,
   getTaskWorkerUserBudgetMs,
   getTaskWorkerUserBurst,
@@ -90,11 +91,6 @@ function extractUserIdFromJobData(data: unknown): string | null {
   return readUserId(data)
 }
 
-function createCronEveryNSeconds(seconds: number): string {
-  const clamped = Math.min(59, Math.max(2, Math.floor(seconds)))
-  return `*/${clamped} * * * * *`
-}
-
 async function loadPgBossConstructor(): Promise<BossConstructor | null> {
   try {
     const dynamicImport = new Function(
@@ -130,19 +126,31 @@ async function processUserTypeBurst(
 ): Promise<number> {
   const budgetMs = getTaskWorkerUserBudgetMs()
   const maxBurst = getTaskWorkerUserBurst()
+  const perRound = getTaskWorkerPerUserParallelism()
   const startedAt = Date.now()
   let processed = 0
+  let attempted = 0
 
-  for (let i = 0; i < maxBurst; i++) {
+  while (attempted < maxBurst) {
     if (Date.now() - startedAt >= budgetMs) {
       break
     }
 
-    const result = await processUserOnce(userId, type)
-    if (!result.processed) {
+    const remaining = maxBurst - attempted
+    const roundSize = Math.min(perRound, remaining)
+    const results = await Promise.all(
+      Array.from({ length: roundSize }, () => processUserOnce(userId, type))
+    )
+    attempted += roundSize
+
+    const roundProcessed = results.reduce(
+      (count, result) => count + (result.processed ? 1 : 0),
+      0
+    )
+    if (roundProcessed === 0) {
       break
     }
-    processed += 1
+    processed += roundProcessed
   }
 
   return processed
@@ -244,13 +252,6 @@ async function runPgBossWorker(
   await boss.createQueue(TASK_USER_DISPATCH_QUEUE)
   await boss.createQueue(TASK_MAINTENANCE_QUEUE)
 
-  const cron = createCronEveryNSeconds(getTaskWorkerScanIntervalSeconds())
-  await boss.schedule(
-    TASK_DISPATCH_SCAN_QUEUE,
-    cron,
-    {},
-    { singletonKey: "global-dispatch-scan" }
-  )
   await boss.schedule(
     TASK_MAINTENANCE_QUEUE,
     "0 0 3 * * *",
@@ -258,19 +259,42 @@ async function runPgBossWorker(
     { singletonKey: "task-maintenance-daily" }
   )
 
+  // Use an in-process timer instead of boss.schedule() for the global scan.
+  // pg-boss's timekeeper has a hard singletonSeconds:60 debounce on scheduled
+  // cron jobs, which collapses a sub-minute cron to ~once per 60s. A plain
+  // setInterval + boss.send avoids that bottleneck while the singletonKey still
+  // ensures only one scan job is active across multiple worker processes.
+  const scanIntervalSeconds = getTaskWorkerScanIntervalSeconds()
+  const scanIntervalMs = scanIntervalSeconds * 1000
+
+  const dispatchTick = async () => {
+    try {
+      await boss.send(
+        TASK_DISPATCH_SCAN_QUEUE,
+        {},
+        {
+          singletonKey: "global-dispatch-scan",
+          singletonSeconds: scanIntervalSeconds,
+          retryLimit: 0,
+        }
+      )
+    } catch {
+      // Ignored — next interval will retry
+    }
+  }
+
+  await dispatchTick()
+  const scanInterval = setInterval(() => { void dispatchTick() }, scanIntervalMs)
+
   await boss.work(TASK_DISPATCH_SCAN_QUEUE, { teamSize: 1 }, async () => {
     const dueRows = await findDueUserTypes(Math.max(64, getTaskWorkerConcurrency() * 8))
-    const slotByUserType = new Map<string, number>()
     for (const { userId, type } of dueRows) {
-      const key = `${userId}:${type}`
-      const slotIndex = slotByUserType.get(key) ?? 0
-      slotByUserType.set(key, slotIndex + 1)
       await boss.send(
         TASK_USER_DISPATCH_QUEUE,
-        { userId, type, slotIndex },
+        { userId, type },
         {
-          singletonKey: `user:${userId}:type:${type}:slot:${slotIndex}`,
-          singletonSeconds: 30,
+          singletonKey: `user:${userId}:type:${type}`,
+          singletonSeconds: scanIntervalSeconds,
           retryLimit: 0,
         }
       )
@@ -308,6 +332,7 @@ async function runPgBossWorker(
   })
 
   return async () => {
+    clearInterval(scanInterval)
     await boss.stop()
   }
 }
