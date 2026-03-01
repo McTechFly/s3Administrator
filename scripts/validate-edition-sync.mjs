@@ -11,7 +11,7 @@
  *   EDITION_SYNC_STRICT=true node scripts/validate-edition-sync.mjs
  *
  * Environment variables:
- *   CLOUD_PACKAGES_DIR  — path to cloud-packages root (default: auto-detected)
+ *   CLOUD_PACKAGE_DIR   — path to @s3administrator/cloud package root (default: auto-detected)
  *   COMMUNITY_SETUP_DIR — path to community-setup root (default: auto-detected)
  *   EDITION_SYNC_STRICT — if "true", exit 1 on any FAIL (default: warn only)
  */
@@ -23,8 +23,6 @@ import { pathToFileURL, fileURLToPath } from "node:url"
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
 const PROJECT_ROOT = resolve(__dirname, "..")
-
-const CLOUD_PACKAGES = ["auth", "billing", "admin", "audit", "marketing"]
 
 // ── Output helpers ──────────────────────────────────────────────────
 
@@ -52,13 +50,18 @@ function heading(title) {
 // ── Data source resolution ──────────────────────────────────────────
 
 function resolveCloudPackagesDir() {
+  if (process.env.CLOUD_PACKAGE_DIR) {
+    const dir = resolve(process.env.CLOUD_PACKAGE_DIR)
+    if (existsSync(dir)) return dir
+  }
+
   if (process.env.CLOUD_PACKAGES_DIR) {
     const dir = resolve(process.env.CLOUD_PACKAGES_DIR)
     if (existsSync(dir)) return dir
   }
 
-  // Monorepo sibling: codex-cloud/cloud-packages/
-  const sibling = resolve(PROJECT_ROOT, "..", "cloud-packages")
+  // Monorepo sibling: codex-cloud/cloud-packages/cloud
+  const sibling = resolve(PROJECT_ROOT, "..", "cloud-packages", "cloud")
   if (existsSync(sibling)) return sibling
 
   return null
@@ -89,26 +92,24 @@ function resolveCommunitySetupDir() {
 
 async function loadCloudManifests(cloudDir) {
   const manifests = []
+  const manifestPath = join(cloudDir, "manifest.js")
 
-  for (const pkg of CLOUD_PACKAGES) {
-    const manifestPath = join(cloudDir, pkg, pkg, "manifest.js")
-    if (!existsSync(manifestPath)) {
-      warn(`Cloud manifest not found: ${manifestPath}`)
-      continue
-    }
+  if (!existsSync(manifestPath)) {
+    warn(`Cloud manifest not found: ${manifestPath}`)
+    return manifests
+  }
 
-    try {
-      const url = pathToFileURL(manifestPath).href
-      const mod = await import(url)
-      const manifest = mod.manifest
-      if (manifest && manifest.name && manifest.stubs) {
-        manifests.push(manifest)
-      } else {
-        warn(`Invalid manifest structure in ${pkg}`)
-      }
-    } catch (e) {
-      warn(`Failed to load manifest for ${pkg}: ${e.message}`)
+  try {
+    const url = pathToFileURL(manifestPath).href
+    const mod = await import(url)
+    const manifest = mod.manifest
+    if (manifest && manifest.name && manifest.stubs) {
+      manifests.push(manifest)
+    } else {
+      warn("Invalid cloud manifest structure")
     }
+  } catch (e) {
+    warn(`Failed to load cloud manifest: ${e.message}`)
   }
 
   return manifests
@@ -198,16 +199,33 @@ function readCommunityStubContent(communityDir, stubName) {
 // ── Cloud lib source reader ─────────────────────────────────────────
 
 function resolveCloudLibSource(cloudDir, fromPath) {
-  // fromPath is like "@s3administrator/billing/lib/plan-entitlements"
-  // → cloud-packages/billing/billing/lib/plan-entitlements.ts
+  // fromPath is like "@s3administrator/cloud/src/domains/billing/lib/plan-entitlements.ts"
+  // or "@s3administrator/cloud/billing/lib/plan-entitlements"
   const parts = fromPath.replace("@s3administrator/", "").split("/")
-  const pkgName = parts[0]
-  const relPath = parts.slice(1).join("/")
+  const packageName = parts[0]
+
+  if (packageName !== "cloud" || parts.length < 3) {
+    return null
+  }
+
+  if (parts[1] === "src" && parts[2] === "domains" && parts.length >= 5) {
+    const directPath = join(cloudDir, ...parts.slice(1))
+    if (existsSync(directPath)) {
+      return readFileSync(directPath, "utf-8")
+    }
+    return null
+  }
+
+  const domain = parts[1]
+  const relPath = parts.slice(2).join("/")
 
   const candidates = [
-    join(cloudDir, pkgName, pkgName, `${relPath}.ts`),
-    join(cloudDir, pkgName, pkgName, `${relPath}.tsx`),
-    join(cloudDir, pkgName, pkgName, `${relPath}/index.ts`),
+    join(cloudDir, "src", "domains", domain, `${relPath}.ts`),
+    join(cloudDir, "src", "domains", domain, `${relPath}.tsx`),
+    join(cloudDir, "src", "domains", domain, `${relPath}.js`),
+    join(cloudDir, "src", "domains", domain, relPath, "index.ts"),
+    join(cloudDir, "src", "domains", domain, relPath, "index.tsx"),
+    join(cloudDir, "src", "domains", domain, relPath, "index.js"),
   ]
 
   for (const candidate of candidates) {
@@ -503,8 +521,8 @@ export async function validateEditionSync(options = {}) {
     options.communitySetupDir || resolveCommunitySetupDir()
 
   if (!cloudDir) {
-    info("Cloud packages directory not found — skipping validation")
-    info("Set CLOUD_PACKAGES_DIR to enable")
+    info("Cloud package directory not found - skipping validation")
+    info("Set CLOUD_PACKAGE_DIR to enable")
     console.log("")
     return true
   }
@@ -516,7 +534,7 @@ export async function validateEditionSync(options = {}) {
     return true
   }
 
-  info(`Cloud packages: ${cloudDir}`)
+  info(`Cloud package: ${cloudDir}`)
   info(`Community setup: ${communityDir}`)
 
   // Load data sources

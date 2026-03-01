@@ -134,11 +134,11 @@ const _ready: Promise<AuthModule> = isCommunityEdition()
   ? Promise.resolve(buildCommunityAuth())
   : (async () => {
       try {
-        const pkg = "@s3administrator/auth"
+        const pkg = "@s3administrator/cloud/auth"
         const mod = await import(pkg)
         return mod as unknown as AuthModule
       } catch {
-        console.warn("@s3administrator/auth not available — falling back to community auth")
+        console.warn("@s3administrator/cloud/auth not available - falling back to community auth")
         return buildCommunityAuth()
       }
     })()

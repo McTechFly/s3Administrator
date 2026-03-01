@@ -20,12 +20,14 @@ function probeModule(name: string): boolean {
 export function getInstalledPlugins(): PluginStatus {
   if (cached) return cached
 
+  const cloudInstalled = probeModule("@s3administrator/cloud")
+
   cached = {
-    auth: probeModule("@s3administrator/auth"),
-    billing: probeModule("@s3administrator/billing"),
-    admin: probeModule("@s3administrator/admin"),
-    audit: probeModule("@s3administrator/audit"),
-    marketing: probeModule("@s3administrator/marketing"),
+    auth: cloudInstalled,
+    billing: cloudInstalled,
+    admin: cloudInstalled,
+    audit: cloudInstalled,
+    marketing: cloudInstalled,
   }
 
   return cached
