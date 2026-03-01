@@ -107,7 +107,7 @@ export default function OpenGraphImage() {
                   color: "rgba(224, 242, 254, 0.92)",
                 }}
               >
-                Manage S3 and S3-compatible storage in one dashboard
+                Open-source S3 file manager for real operations
               </div>
             </div>
           </div>
@@ -121,7 +121,7 @@ export default function OpenGraphImage() {
               color: "rgb(224, 242, 254)",
             }}
           >
-            AWS • Hetzner • Cloudflare R2
+            AWS • Hetzner • R2 • MinIO
           </div>
         </div>
 
@@ -130,22 +130,22 @@ export default function OpenGraphImage() {
             style={{
               display: "flex",
               flexDirection: "column",
-              fontSize: "68px",
+              fontSize: "64px",
               fontWeight: 700,
               lineHeight: 1.05,
             }}
           >
-            S3 file operations
+            Bulk operations, search,
             <br />
-            without console friction
+            and safe cleanup
           </div>
           <div
             style={{
-              fontSize: "32px",
+              fontSize: "30px",
               color: "rgba(224, 242, 254, 0.92)",
             }}
           >
-            Browse, upload, move, sync, and automate across buckets
+            Manage S3 without scripts. Self-host free or use cloud.
           </div>
         </div>
 
@@ -159,16 +159,19 @@ export default function OpenGraphImage() {
           }}
         >
           <div style={{ padding: "8px 14px", borderRadius: "999px", background: "rgba(11, 18, 32, 0.3)" }}>
-            Bulk operations
+            Bulk delete
           </div>
           <div style={{ padding: "8px 14px", borderRadius: "999px", background: "rgba(11, 18, 32, 0.3)" }}>
-            Recursive delete
+            Recursive cleanup
           </div>
           <div style={{ padding: "8px 14px", borderRadius: "999px", background: "rgba(11, 18, 32, 0.3)" }}>
-            Secure credentials
+            Sync & migrate
           </div>
           <div style={{ padding: "8px 14px", borderRadius: "999px", background: "rgba(11, 18, 32, 0.3)" }}>
-            Video thumbnails
+            Encrypted credentials
+          </div>
+          <div style={{ padding: "8px 14px", borderRadius: "999px", background: "rgba(11, 18, 32, 0.3)" }}>
+            Open source
           </div>
         </div>
       </div>
