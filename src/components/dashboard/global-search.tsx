@@ -12,7 +12,8 @@ import { MultiSelectToolbar } from "@/components/dashboard/multi-select-toolbar"
 import { DeleteConfirmDialog } from "@/components/dashboard/delete-confirm-dialog"
 import { RenameDialog } from "@/components/dashboard/rename-dialog"
 import { SearchFilters } from "@/components/dashboard/search-filters"
-import type { MediaType, S3Object } from "@/types"
+import { getPreviewType } from "@/lib/media"
+import type { MediaType, PreviewType, S3Object } from "@/types"
 
 interface SearchResult {
   id: string
@@ -38,6 +39,7 @@ interface SearchItem extends S3Object {
   credentialId: string
   extension: string
   mediaType: MediaType | null
+  previewType: PreviewType | null
   previewUrl: string | null
   isVideo: boolean
 }
@@ -71,6 +73,7 @@ function toSearchItem(result: SearchResult): SearchItem {
     credentialId: result.credentialId,
     extension: result.extension,
     mediaType: result.mediaType,
+    previewType: getPreviewType(result.extension),
     previewUrl: result.previewUrl,
     isVideo: result.isVideo,
   }
@@ -613,6 +616,7 @@ export function GlobalSearch() {
         getItemBucket={(item) => (item as SearchItem).bucket}
         getItemCredentialId={(item) => (item as SearchItem).credentialId}
         onNavigate={(index) => setLightboxIndex(index)}
+        onDownload={(item) => void handleDownload(item as unknown as SearchItem)}
       />
 
       {deleteContext && (

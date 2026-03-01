@@ -1,7 +1,7 @@
 "use client"
 
 import { useCallback, useEffect, useMemo, useState } from "react"
-import { ChevronLeft, ChevronRight, Loader2, X } from "lucide-react"
+import { ChevronLeft, ChevronRight, Download, Loader2, X } from "lucide-react"
 import type { GalleryItem } from "@/types"
 import {
   Dialog,
@@ -21,6 +21,7 @@ interface GalleryLightboxProps {
   getItemBucket?: (item: GalleryItem) => string | undefined
   getItemCredentialId?: (item: GalleryItem) => string | undefined
   onNavigate: (index: number) => void
+  onDownload?: (item: GalleryItem) => void
 }
 
 export function GalleryLightbox({
@@ -33,10 +34,12 @@ export function GalleryLightbox({
   getItemBucket,
   getItemCredentialId,
   onNavigate,
+  onDownload,
 }: GalleryLightboxProps) {
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [videoError, setVideoError] = useState(false)
 
   const activeItem = useMemo(() => items[currentIndex] ?? null, [items, currentIndex])
 
@@ -55,6 +58,7 @@ export function GalleryLightbox({
     setLoading(true)
     setError(null)
     setPreviewUrl(null)
+    setVideoError(false)
 
     try {
       const res = await fetch("/api/s3/preview", {
@@ -159,11 +163,24 @@ export function GalleryLightbox({
           ) : error ? (
             <p className="text-sm text-red-300">{error}</p>
           ) : previewUrl && activeItem ? (
-            activeItem.isVideo ? (
+            activeItem.isVideo && videoError ? (
+              <div className="flex flex-col items-center gap-3 text-white">
+                <p className="text-sm text-white/70">
+                  This video format is not supported for browser playback.
+                </p>
+                {onDownload && (
+                  <Button variant="secondary" size="sm" onClick={() => onDownload(activeItem)}>
+                    <Download className="mr-2 h-4 w-4" />
+                    Download to view
+                  </Button>
+                )}
+              </div>
+            ) : activeItem.isVideo ? (
               <video
                 src={previewUrl}
                 controls
                 className="max-h-[80vh] max-w-full rounded object-contain"
+                onError={() => setVideoError(true)}
               />
             ) : (
               // eslint-disable-next-line @next/next/no-img-element

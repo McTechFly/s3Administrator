@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server"
 import { ListObjectsV2Command, GetObjectCommand } from "@aws-sdk/client-s3"
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner"
 import { demoGuard, getDemoS3Client } from "@/lib/demo"
-import { getMediaTypeFromExtension, isGallerySupportedExtension } from "@/lib/media"
+import { getMediaTypeFromExtension, getPreviewType, isGallerySupportedExtension } from "@/lib/media"
 
 const PREVIEW_URL_TTL_SECONDS = 86400
 
@@ -137,6 +137,7 @@ export async function GET(request: NextRequest) {
             lastModified: candidate.lastModified.toISOString(),
             extension: "",
             mediaType: null,
+            previewType: null,
             previewUrl: null,
             isVideo: false,
             isFolder: true,
@@ -146,9 +147,11 @@ export async function GET(request: NextRequest) {
         }
 
         const mediaType = getMediaTypeFromExtension(candidate.extension)
+        const previewType = getPreviewType(candidate.extension)
         let previewUrl: string | null = null
 
-        if (mediaType) {
+        const needsPreviewUrl = mediaType || previewType === "code"
+        if (needsPreviewUrl) {
           if (isStoradera) {
             const params = new URLSearchParams({ bucket, key: candidate.key })
             previewUrl = `/api/demo/s3/preview/proxy?${params.toString()}`
@@ -177,6 +180,7 @@ export async function GET(request: NextRequest) {
           lastModified: candidate.lastModified.toISOString(),
           extension: candidate.extension,
           mediaType,
+          previewType,
           previewUrl,
           isVideo: mediaType === "video",
           isFolder: false,

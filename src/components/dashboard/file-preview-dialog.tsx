@@ -19,7 +19,9 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
+import { useTheme } from "next-themes"
 import { getPreviewType, normalizeExtension, type PreviewType } from "@/lib/media"
+import { highlightCode } from "@/lib/code-highlight"
 import { formatSize } from "@/lib/format"
 
 const MAX_TEXT_PREVIEW_BYTES = 5 * 1024 * 1024 // 5 MB
@@ -83,10 +85,12 @@ export function FilePreviewDialog({
 }: FilePreviewDialogProps) {
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
   const [textContent, setTextContent] = useState<string | null>(null)
+  const [codeHtml, setCodeHtml] = useState<string | null>(null)
   const [csvData, setCsvData] = useState<string[][] | null>(null)
   const [csvTruncated, setCsvTruncated] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const { resolvedTheme } = useTheme()
 
   const previewType = useMemo<PreviewType | null>(() => {
     const ext = extractExtension(fileKey)
@@ -95,11 +99,11 @@ export function FilePreviewDialog({
 
   const fetchPreview = useCallback(async () => {
     if (!open || !fileKey) return
-    if (!previewType || previewType === "image" || previewType === "video") return
+    if (!previewType || previewType === "image" || previewType === "video" || previewType === "odf") return
 
-    // Guard: large files for text/CSV
+    // Guard: large files for text/CSV/code
     if (
-      (previewType === "text" || previewType === "csv") &&
+      (previewType === "text" || previewType === "csv" || previewType === "code") &&
       fileSize &&
       fileSize > MAX_TEXT_PREVIEW_BYTES
     ) {
@@ -113,6 +117,7 @@ export function FilePreviewDialog({
     setError(null)
     setPreviewUrl(null)
     setTextContent(null)
+    setCodeHtml(null)
     setCsvData(null)
     setCsvTruncated(false)
 
@@ -143,6 +148,14 @@ export function FilePreviewDialog({
         setPreviewUrl(url)
       } else if (previewType === "pdf") {
         setPreviewUrl(url)
+      } else if (previewType === "code") {
+        const contentRes = await fetch(url)
+        if (!contentRes.ok) throw new Error("Failed to fetch file content")
+        const text = await contentRes.text()
+        const ext = extractExtension(fileKey)
+        const theme = resolvedTheme === "dark" ? "dark" : "light"
+        const html = await highlightCode(text, ext, theme)
+        setCodeHtml(html)
       } else if (previewType === "text" || previewType === "csv") {
         const contentRes = await fetch(url)
         if (!contentRes.ok) throw new Error("Failed to fetch file content")
@@ -169,7 +182,7 @@ export function FilePreviewDialog({
     } finally {
       setLoading(false)
     }
-  }, [open, fileKey, fileSize, bucket, credentialId, previewType, apiPrefix])
+  }, [open, fileKey, fileSize, bucket, credentialId, previewType, apiPrefix, resolvedTheme])
 
   useEffect(() => {
     void fetchPreview()
@@ -180,6 +193,7 @@ export function FilePreviewDialog({
     if (!open) {
       setPreviewUrl(null)
       setTextContent(null)
+      setCodeHtml(null)
       setCsvData(null)
       setCsvTruncated(false)
       setError(null)
@@ -252,6 +266,13 @@ export function FilePreviewDialog({
               className="h-full w-full border-0"
               title={`Preview: ${fileName}`}
             />
+          ) : previewType === "code" && codeHtml !== null ? (
+            <ScrollArea className="h-full">
+              <div
+                className="overflow-x-auto p-4 text-sm [&_pre]:!m-0 [&_pre]:!bg-transparent"
+                dangerouslySetInnerHTML={{ __html: codeHtml }}
+              />
+            </ScrollArea>
           ) : previewType === "text" && textContent !== null ? (
             <ScrollArea className="h-full">
               <pre className="whitespace-pre-wrap break-words p-4 font-mono text-sm">

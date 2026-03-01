@@ -579,6 +579,12 @@ function DemoDashboardContent() {
               return
             }
 
+            // ODF files (odt, ods, odp) → download only (no preview support)
+            if (pType === "odf") {
+              void handleDownload([item.key])
+              return
+            }
+
             if (pType !== "image" && pType !== "video") {
               setPreviewFile({
                 key: item.key,
@@ -631,6 +637,7 @@ function DemoDashboardContent() {
         bucket={bucket}
         credentialId={credentialId}
         onNavigate={(index) => setLightboxIndex(index)}
+        onDownload={(item) => void handleDownload([item.key])}
       />
 
       {previewFile && (

@@ -3,6 +3,7 @@ import {
   getCachedThumbnail,
   storeThumbnail,
 } from "@/lib/thumbnail-db";
+import { normalizeExtension } from "@/lib/media";
 
 const THUMBNAIL_MAX_WIDTH = 480;
 const THUMBNAIL_QUALITY = 0.8;
@@ -44,6 +45,52 @@ function cacheKey(
   key: string
 ): string {
   return `${credentialId}|${bucket}|${key}`;
+}
+
+async function generateSvgThumbnail(url: string): Promise<Blob> {
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch SVG: ${response.status}`);
+  }
+  const blob = await response.blob();
+  const dataUrl = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = () => reject(new Error("Failed to read SVG blob"));
+    reader.readAsDataURL(blob);
+  });
+
+  const img = new Image();
+  const loaded = new Promise<void>((resolve, reject) => {
+    img.onload = () => resolve();
+    img.onerror = () => reject(new Error("Failed to load SVG as image"));
+  });
+  img.src = dataUrl;
+  await loaded;
+
+  // Use intrinsic dimensions or fall back to a default
+  const naturalW = img.naturalWidth || 300;
+  const naturalH = img.naturalHeight || 150;
+  const scale = Math.min(1, THUMBNAIL_MAX_WIDTH / naturalW);
+  const width = Math.round(naturalW * scale);
+  const height = Math.round(naturalH * scale);
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) {
+    throw new Error("Failed to get 2D context");
+  }
+  ctx.drawImage(img, 0, 0, width, height);
+
+  return new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob(
+      (b) => (b ? resolve(b) : reject(new Error("Canvas toBlob failed"))),
+      "image/webp",
+      THUMBNAIL_QUALITY,
+    );
+  });
 }
 
 async function generateImageThumbnail(url: string): Promise<Blob> {
@@ -160,9 +207,12 @@ export async function getOrGenerateThumbnail(
         // IndexedDB unavailable — proceed to generate
       }
 
+      const ext = normalizeExtension(item.extension);
       const blob = item.isVideo
         ? await generateVideoThumbnail(item.previewUrl!)
-        : await generateImageThumbnail(item.previewUrl!);
+        : ext === "svg"
+          ? await generateSvgThumbnail(item.previewUrl!)
+          : await generateImageThumbnail(item.previewUrl!);
 
       try {
         await storeThumbnail(

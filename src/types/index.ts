@@ -24,6 +24,8 @@ export interface ListObjectsResponse {
 
 export type MediaType = "image" | "video"
 
+export type PreviewType = "image" | "video" | "audio" | "pdf" | "text" | "csv" | "office" | "odf" | "code"
+
 export interface GalleryItem {
   id: string
   key: string
@@ -31,6 +33,7 @@ export interface GalleryItem {
   lastModified: string
   extension: string
   mediaType: MediaType | null
+  previewType: PreviewType | null
   previewUrl: string | null
   isVideo: boolean
   isFolder: boolean
