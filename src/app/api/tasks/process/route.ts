@@ -1,13 +1,16 @@
 import { NextResponse } from "next/server"
 import {
+  AbortMultipartUploadCommand,
+  CompleteMultipartUploadCommand,
   CopyObjectCommand,
+  CreateMultipartUploadCommand,
   DeleteObjectsCommand,
   GetObjectCommand,
   HeadObjectCommand,
-  PutObjectCommand,
-  type PutObjectCommandInput,
   type S3Client,
+  UploadPartCopyCommand,
 } from "@aws-sdk/client-s3"
+import { Upload } from "@aws-sdk/lib-storage"
 import { Prisma } from "@prisma/client"
 import { auth } from "@/lib/auth"
 import { prisma } from "@/lib/db"
@@ -45,6 +48,13 @@ const LOCK_SECONDS = 45
 const SYNC_POLL_INTERVAL_SECONDS = 60
 const MAX_STALE_SCHEDULE_SKIPS_PER_CALL = 32
 const PAUSE_HOLD_MS = 365 * 24 * 60 * 60 * 1000
+const ONE_MEBIBYTE_BYTES = 1024 * 1024
+const ONE_MEBIBYTE_BIGINT = BigInt(ONE_MEBIBYTE_BYTES)
+const DEFAULT_MULTIPART_PART_SIZE_BYTES = 64 * ONE_MEBIBYTE_BYTES
+const DEFAULT_MULTIPART_PART_SIZE_BIGINT = BigInt(DEFAULT_MULTIPART_PART_SIZE_BYTES)
+const MAX_MULTIPART_PARTS = 10_000
+const RELAY_UPLOAD_QUEUE_SIZE = 4
+const SINGLE_REQUEST_COPY_MAX_BYTES = BigInt(5 * 1024 * 1024 * 1024)
 
 interface BulkDeleteTaskPayload {
   query: string
@@ -140,6 +150,11 @@ interface TransferItemResult {
   sourceDeleteRequired: boolean
   errorMessage: string | null
 }
+
+type TransferStrategy =
+  | "single_request_server_copy"
+  | "multipart_server_copy"
+  | "multipart_relay_upload"
 
 interface ClaimedTaskControlState {
   status: string
@@ -401,6 +416,131 @@ function toValidContentLength(value: unknown): number | null {
   }
 
   return null
+}
+
+function getS3ErrorStatus(error: unknown): number | null {
+  if (!error || typeof error !== "object") return null
+  const candidate = error as {
+    $metadata?: {
+      httpStatusCode?: unknown
+    }
+  }
+  return typeof candidate.$metadata?.httpStatusCode === "number"
+    ? candidate.$metadata.httpStatusCode
+    : null
+}
+
+function getS3ErrorMessage(error: unknown): string {
+  if (!error || typeof error !== "object") {
+    return error instanceof Error ? error.message : ""
+  }
+
+  const candidate = error as {
+    message?: unknown
+    Message?: unknown
+  }
+  if (typeof candidate.message === "string") return candidate.message
+  if (typeof candidate.Message === "string") return candidate.Message
+  return error instanceof Error ? error.message : ""
+}
+
+function isEntityTooLargeError(error: unknown): boolean {
+  const code = getS3ErrorCode(error)
+  if (code.includes("EntityTooLarge")) return true
+  return getS3ErrorMessage(error).includes("EntityTooLarge")
+}
+
+function isCopyCompatibilityFallbackError(error: unknown): boolean {
+  const status = getS3ErrorStatus(error)
+  if (status === 405 || status === 501) return true
+
+  const code = getS3ErrorCode(error)
+  return code.includes("NotImplemented") || code.includes("InvalidRequest")
+}
+
+function isSameS3Backend(params: {
+  sourceEndpoint: string
+  destinationEndpoint: string
+  sourceRegion: string
+  destinationRegion: string
+  sourceProvider: string
+  destinationProvider: string
+}): boolean {
+  return (
+    params.sourceEndpoint.trim().toLowerCase() === params.destinationEndpoint.trim().toLowerCase() &&
+    params.sourceRegion.trim() === params.destinationRegion.trim() &&
+    params.sourceProvider.trim().toUpperCase() === params.destinationProvider.trim().toUpperCase()
+  )
+}
+
+function selectTransferStrategy(params: {
+  sameCredential: boolean
+  sourceSizeBytes: bigint | null
+  sourceEndpoint: string
+  destinationEndpoint: string
+  sourceRegion: string
+  destinationRegion: string
+  sourceProvider: string
+  destinationProvider: string
+}): TransferStrategy {
+  if (
+    params.sameCredential &&
+    isSameS3Backend({
+      sourceEndpoint: params.sourceEndpoint,
+      destinationEndpoint: params.destinationEndpoint,
+      sourceRegion: params.sourceRegion,
+      destinationRegion: params.destinationRegion,
+      sourceProvider: params.sourceProvider,
+      destinationProvider: params.destinationProvider,
+    })
+  ) {
+    if (params.sourceSizeBytes !== null && params.sourceSizeBytes > SINGLE_REQUEST_COPY_MAX_BYTES) {
+      return "multipart_server_copy"
+    }
+    return "single_request_server_copy"
+  }
+
+  return "multipart_relay_upload"
+}
+
+function computeMultipartPartSizeBytes(sourceSizeBytes: bigint): bigint {
+  const partCountFloor = (
+    sourceSizeBytes + BigInt(MAX_MULTIPART_PARTS) - BigInt(1)
+  ) / BigInt(MAX_MULTIPART_PARTS)
+  const minimumSize = partCountFloor > DEFAULT_MULTIPART_PART_SIZE_BIGINT
+    ? partCountFloor
+    : DEFAULT_MULTIPART_PART_SIZE_BIGINT
+  return (
+    (minimumSize + ONE_MEBIBYTE_BIGINT - BigInt(1)) / ONE_MEBIBYTE_BIGINT
+  ) * ONE_MEBIBYTE_BIGINT
+}
+
+async function readSourceObjectHeadDetails(params: {
+  sourceClient: S3Client
+  sourceBucket: string
+  sourceKey: string
+  expectedContentLength?: unknown
+}): Promise<{
+  sizeBytes: bigint | null
+  contentType: string | undefined
+  cacheControl: string | undefined
+}> {
+  const response = await params.sourceClient.send(
+    new HeadObjectCommand({
+      Bucket: params.sourceBucket,
+      Key: params.sourceKey,
+    })
+  )
+
+  const size =
+    toValidContentLength(response.ContentLength) ??
+    toValidContentLength(params.expectedContentLength)
+
+  return {
+    sizeBytes: size === null ? null : BigInt(size),
+    contentType: typeof response.ContentType === "string" ? response.ContentType : undefined,
+    cacheControl: typeof response.CacheControl === "string" ? response.CacheControl : undefined,
+  }
 }
 
 interface RemoteObjectSnapshot {
@@ -828,13 +968,165 @@ async function copyObjectAcrossLocations(params: {
   sourceClient: S3Client
   destinationClient: S3Client
   sameCredential: boolean
+  sourceEndpoint: string
+  destinationEndpoint: string
+  sourceRegion: string
+  destinationRegion: string
+  sourceProvider: string
+  destinationProvider: string
   sourceBucket: string
   sourceKey: string
   destinationBucket: string
   destinationKey: string
   expectedContentLength?: unknown
 }) {
-  if (params.sameCredential) {
+  async function multipartRelayObjectAcrossLocations(): Promise<void> {
+    const sourceObject = await params.sourceClient.send(
+      new GetObjectCommand({
+        Bucket: params.sourceBucket,
+        Key: params.sourceKey,
+      })
+    )
+
+    if (!sourceObject.Body) {
+      throw new Error(`Missing source object body for key '${params.sourceKey}'`)
+    }
+
+    const contentLength =
+      toValidContentLength(sourceObject.ContentLength) ??
+      toValidContentLength(params.expectedContentLength)
+
+    const upload = new Upload({
+      client: params.destinationClient,
+      params: {
+        Bucket: params.destinationBucket,
+        Key: params.destinationKey,
+        Body: sourceObject.Body,
+        ContentType: sourceObject.ContentType,
+        CacheControl: sourceObject.CacheControl,
+        ...(contentLength !== null ? { ContentLength: contentLength } : {}),
+      },
+      queueSize: RELAY_UPLOAD_QUEUE_SIZE,
+      partSize: DEFAULT_MULTIPART_PART_SIZE_BYTES,
+      leavePartsOnError: false,
+    })
+
+    await upload.done()
+  }
+
+  async function multipartCopyObjectWithinBackend(): Promise<boolean> {
+    const headDetails = await readSourceObjectHeadDetails({
+      sourceClient: params.sourceClient,
+      sourceBucket: params.sourceBucket,
+      sourceKey: params.sourceKey,
+      expectedContentLength: params.expectedContentLength,
+    })
+
+    if (!headDetails.sizeBytes || headDetails.sizeBytes <= BigInt(0)) {
+      return false
+    }
+
+    const createResponse = await params.destinationClient.send(
+      new CreateMultipartUploadCommand({
+        Bucket: params.destinationBucket,
+        Key: params.destinationKey,
+        ...(headDetails.contentType ? { ContentType: headDetails.contentType } : {}),
+        ...(headDetails.cacheControl ? { CacheControl: headDetails.cacheControl } : {}),
+      })
+    )
+
+    const uploadId = createResponse.UploadId
+    if (!uploadId) {
+      throw new Error(`Failed to start multipart copy for key '${params.destinationKey}'`)
+    }
+
+    const completedParts: Array<{ ETag: string; PartNumber: number }> = []
+    const partSizeBytes = computeMultipartPartSizeBytes(headDetails.sizeBytes)
+    let offset = BigInt(0)
+    let partNumber = 1
+
+    try {
+      while (offset < headDetails.sizeBytes) {
+        const nextOffset = offset + partSizeBytes < headDetails.sizeBytes
+          ? offset + partSizeBytes
+          : headDetails.sizeBytes
+        const rangeEnd = nextOffset - BigInt(1)
+
+        const partResponse = await params.destinationClient.send(
+          new UploadPartCopyCommand({
+            Bucket: params.destinationBucket,
+            Key: params.destinationKey,
+            UploadId: uploadId,
+            PartNumber: partNumber,
+            CopySource: buildCopySource(params.sourceBucket, params.sourceKey),
+            CopySourceRange: `bytes=${offset.toString()}-${rangeEnd.toString()}`,
+          })
+        )
+
+        const etag = partResponse.CopyPartResult?.ETag
+        if (!etag) {
+          throw new Error(
+            `Multipart copy part ${partNumber} did not return an ETag for key '${params.destinationKey}'`
+          )
+        }
+
+        completedParts.push({
+          ETag: etag,
+          PartNumber: partNumber,
+        })
+
+        offset = nextOffset
+        partNumber += 1
+      }
+
+      await params.destinationClient.send(
+        new CompleteMultipartUploadCommand({
+          Bucket: params.destinationBucket,
+          Key: params.destinationKey,
+          UploadId: uploadId,
+          MultipartUpload: {
+            Parts: completedParts,
+          },
+        })
+      )
+
+      return true
+    } catch (error) {
+      await params.destinationClient.send(
+        new AbortMultipartUploadCommand({
+          Bucket: params.destinationBucket,
+          Key: params.destinationKey,
+          UploadId: uploadId,
+        })
+      ).catch(() => {})
+      throw error
+    }
+  }
+
+  const sourceSizeBytes = (() => {
+    const contentLength = toValidContentLength(params.expectedContentLength)
+    return contentLength === null ? null : BigInt(contentLength)
+  })()
+
+  const strategy = selectTransferStrategy({
+    sameCredential: params.sameCredential,
+    sourceSizeBytes,
+    sourceEndpoint: params.sourceEndpoint,
+    destinationEndpoint: params.destinationEndpoint,
+    sourceRegion: params.sourceRegion,
+    destinationRegion: params.destinationRegion,
+    sourceProvider: params.sourceProvider,
+    destinationProvider: params.destinationProvider,
+  })
+
+  if (strategy === "multipart_server_copy") {
+    const copied = await multipartCopyObjectWithinBackend()
+    if (copied) return
+    await multipartRelayObjectAcrossLocations()
+    return
+  }
+
+  if (strategy === "single_request_server_copy") {
     try {
       await params.destinationClient.send(
         new CopyObjectCommand({
@@ -844,53 +1136,24 @@ async function copyObjectAcrossLocations(params: {
         })
       )
       return
-    } catch {
-      // Some S3-compatible providers fail CopyObject unexpectedly.
-      // Fall back to streaming through this server.
+    } catch (error) {
+      if (isEntityTooLargeError(error)) {
+        const copied = await multipartCopyObjectWithinBackend()
+        if (copied) return
+        await multipartRelayObjectAcrossLocations()
+        return
+      }
+
+      if (isCopyCompatibilityFallbackError(error)) {
+        await multipartRelayObjectAcrossLocations()
+        return
+      }
+
+      throw error
     }
   }
 
-  const sourceObject = await params.sourceClient.send(
-    new GetObjectCommand({
-      Bucket: params.sourceBucket,
-      Key: params.sourceKey,
-    })
-  )
-
-  if (!sourceObject.Body) {
-    throw new Error(`Missing source object body for key '${params.sourceKey}'`)
-  }
-
-  let body = sourceObject.Body as PutObjectCommandInput["Body"]
-  let contentLength =
-    toValidContentLength(sourceObject.ContentLength) ??
-    toValidContentLength(params.expectedContentLength)
-
-  if (contentLength === null) {
-    const bodyWithTransform = sourceObject.Body as {
-      transformToByteArray?: () => Promise<Uint8Array>
-    }
-    if (typeof bodyWithTransform.transformToByteArray === "function") {
-      const bytes = await bodyWithTransform.transformToByteArray()
-      body = bytes
-      contentLength = bytes.byteLength
-    }
-  }
-
-  const putInput: PutObjectCommandInput = {
-    Bucket: params.destinationBucket,
-    Key: params.destinationKey,
-    Body: body,
-    ContentType: sourceObject.ContentType,
-    CacheControl: sourceObject.CacheControl,
-  }
-  if (contentLength !== null) {
-    putInput.ContentLength = contentLength
-  }
-
-  await params.destinationClient.send(
-    new PutObjectCommand(putInput)
-  )
+  await multipartRelayObjectAcrossLocations()
 }
 
 async function deleteKeysFromBucket(
@@ -1779,10 +2042,12 @@ export async function POST(request: Request) {
         )
       }
 
-      const [{ client: sourceClient }, { client: destinationClient }] = await Promise.all([
+      const [sourceClientInfo, destinationClientInfo] = await Promise.all([
         getS3Client(actorUserId, activeTransferPayload.sourceCredentialId),
         getS3Client(actorUserId, activeTransferPayload.destinationCredentialId),
       ])
+      const sourceClient = sourceClientInfo.client
+      const destinationClient = destinationClientInfo.client
 
       const sameCredential =
         activeTransferPayload.sourceCredentialId === activeTransferPayload.destinationCredentialId
@@ -1955,6 +2220,12 @@ export async function POST(request: Request) {
                 sourceClient,
                 destinationClient,
                 sameCredential,
+                sourceEndpoint: sourceClientInfo.credential.endpoint,
+                destinationEndpoint: destinationClientInfo.credential.endpoint,
+                sourceRegion: sourceClientInfo.credential.region,
+                destinationRegion: destinationClientInfo.credential.region,
+                sourceProvider: sourceClientInfo.credential.provider,
+                destinationProvider: destinationClientInfo.credential.provider,
                 sourceBucket: activeTransferPayload.sourceBucket,
                 sourceKey: item.sourceFile.key,
                 destinationBucket: activeTransferPayload.destinationBucket,
