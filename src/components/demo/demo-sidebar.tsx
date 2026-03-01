@@ -40,9 +40,11 @@ interface Credential {
 }
 
 export function DemoSidebar({
+  signupUrl,
   className,
   collapsible = true,
 }: {
+  signupUrl: string
   className?: string
   collapsible?: boolean
 }) {
@@ -214,7 +216,7 @@ export function DemoSidebar({
             <Separator className="my-2" />
 
             <a
-              href="https://s3administrator.com/pricing"
+              href={signupUrl}
               target="_blank"
               rel="noopener noreferrer"
               className="flex items-center gap-2 rounded-md bg-primary px-2 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 sm:py-2 sm:text-sm"

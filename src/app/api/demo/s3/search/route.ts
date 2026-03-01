@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server"
-import { ListObjectsV2Command } from "@aws-sdk/client-s3"
+import { ListBucketsCommand, ListObjectsV2Command } from "@aws-sdk/client-s3"
 import { demoGuard, getDemoS3Client } from "@/lib/demo"
 import { getMediaTypeFromExtension } from "@/lib/media"
 
@@ -29,35 +29,52 @@ export async function GET(request: NextRequest) {
     const { client, credential } = getDemoS3Client()
     const lowerQuery = query.toLowerCase()
 
+    const bucketNames = bucket
+      ? [bucket]
+      : (await client.send(new ListBucketsCommand({}))).Buckets
+          ?.map((entry) => entry.Name)
+          .filter((name): name is string => Boolean(name)) ?? []
+
     // List all objects and filter by query
     const allObjects: Array<{
+      bucket: string
       key: string
       size: number
       lastModified: Date
     }> = []
 
-    let continuationToken: string | undefined
-    do {
-      const response = await client.send(
-        new ListObjectsV2Command({
-          Bucket: bucket || undefined,
-          MaxKeys: 1000,
-          ContinuationToken: continuationToken,
-        })
-      )
-      for (const obj of response.Contents ?? []) {
-        if (obj.Key && obj.Key.toLowerCase().includes(lowerQuery)) {
-          allObjects.push({
-            key: obj.Key,
-            size: obj.Size ?? 0,
-            lastModified: obj.LastModified ?? new Date(),
+    for (const bucketName of bucketNames) {
+      let continuationToken: string | undefined
+
+      do {
+        const response = await client.send(
+          new ListObjectsV2Command({
+            Bucket: bucketName,
+            MaxKeys: 1000,
+            ContinuationToken: continuationToken,
           })
+        )
+        for (const obj of response.Contents ?? []) {
+          if (obj.Key && obj.Key.toLowerCase().includes(lowerQuery)) {
+            allObjects.push({
+              bucket: bucketName,
+              key: obj.Key,
+              size: obj.Size ?? 0,
+              lastModified: obj.LastModified ?? new Date(),
+            })
+          }
         }
-      }
-      continuationToken = response.IsTruncated
-        ? response.NextContinuationToken
-        : undefined
-    } while (continuationToken)
+        continuationToken = response.IsTruncated
+          ? response.NextContinuationToken
+          : undefined
+      } while (continuationToken)
+    }
+
+    allObjects.sort((a, b) => {
+      const byModified = b.lastModified.getTime() - a.lastModified.getTime()
+      if (byModified !== 0) return byModified
+      return a.key.localeCompare(b.key)
+    })
 
     const total = allObjects.length
     const page = allObjects.slice(skip, skip + take)
@@ -67,7 +84,7 @@ export async function GET(request: NextRequest) {
       const mediaType = getMediaTypeFromExtension(extension)
       const previewUrl = mediaType
         ? `/api/demo/s3/preview/proxy?${new URLSearchParams({
-            bucket: bucket || "",
+            bucket: obj.bucket,
             key: obj.key,
           }).toString()}`
         : null
@@ -75,7 +92,7 @@ export async function GET(request: NextRequest) {
       return {
         id: `demo-search-${skip + idx}`,
         key: obj.key,
-        bucket: bucket || "",
+        bucket: obj.bucket,
         credentialId: credential.id,
         extension,
         mediaType,

@@ -634,6 +634,7 @@ function DemoDashboardContent() {
         }}
         items={lightboxItems}
         currentIndex={lightboxIndex ?? 0}
+        apiPrefix={API_PREFIX}
         bucket={bucket}
         credentialId={credentialId}
         onNavigate={(index) => setLightboxIndex(index)}

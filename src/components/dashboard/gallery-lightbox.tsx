@@ -16,6 +16,7 @@ interface GalleryLightboxProps {
   onOpenChange: (open: boolean) => void
   items: GalleryItem[]
   currentIndex: number
+  apiPrefix?: string
   bucket?: string
   credentialId?: string
   getItemBucket?: (item: GalleryItem) => string | undefined
@@ -29,6 +30,7 @@ export function GalleryLightbox({
   onOpenChange,
   items,
   currentIndex,
+  apiPrefix = "/api/s3",
   bucket,
   credentialId,
   getItemBucket,
@@ -45,6 +47,16 @@ export function GalleryLightbox({
 
   const fetchPreviewUrl = useCallback(async () => {
     if (!open || !activeItem) return
+
+    setError(null)
+    setVideoError(false)
+
+    if (activeItem.previewUrl) {
+      setPreviewUrl(activeItem.previewUrl)
+      setLoading(false)
+      return
+    }
+
     const resolvedBucket = getItemBucket?.(activeItem) ?? bucket
     if (!resolvedBucket) {
       setError("Missing preview bucket")
@@ -56,12 +68,10 @@ export function GalleryLightbox({
     const resolvedCredentialId = getItemCredentialId?.(activeItem) ?? credentialId
 
     setLoading(true)
-    setError(null)
     setPreviewUrl(null)
-    setVideoError(false)
 
     try {
-      const res = await fetch("/api/s3/preview", {
+      const res = await fetch(`${apiPrefix}/preview`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -84,7 +94,7 @@ export function GalleryLightbox({
     } finally {
       setLoading(false)
     }
-  }, [activeItem, bucket, credentialId, getItemBucket, getItemCredentialId, open])
+  }, [activeItem, apiPrefix, bucket, credentialId, getItemBucket, getItemCredentialId, open])
 
   useEffect(() => {
     void fetchPreviewUrl()
