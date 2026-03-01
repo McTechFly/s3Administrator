@@ -53,6 +53,7 @@ interface FileBrowserProps {
   onPreview?: (file: S3Object) => void
   showVersions?: boolean
   onDeleteVersion?: (key: string, versionId: string) => void
+  readOnly?: boolean
 }
 
 
@@ -85,6 +86,7 @@ export function FileBrowser({
   onSort,
   showVersions,
   onDeleteVersion,
+  readOnly,
 }: FileBrowserProps) {
   const resolveRowId = (file: S3Object) =>
     getRowId?.(file) ?? (file.versionId ? `${file.key}:${file.versionId}` : file.key)
@@ -273,7 +275,7 @@ export function FileBrowser({
                   {formatDate(file.lastModified)}
                 </TableCell>
                 <TableCell className={compact ? "py-1.5" : undefined}>
-                  {isVersionRow && file.versionId && onDeleteVersion ? (
+                  {isVersionRow && file.versionId && onDeleteVersion && !readOnly ? (
                     <DropdownMenu>
                       <DropdownMenuTrigger asChild>
                         <Button
@@ -320,19 +322,23 @@ export function FileBrowser({
                             Download
                           </DropdownMenuItem>
                         )}
-                        <DropdownMenuItem
-                          onClick={() => onRename(file)}
-                        >
-                          <Pencil className="mr-2 h-4 w-4" />
-                          Rename
-                        </DropdownMenuItem>
-                        <DropdownMenuItem
-                          className="text-destructive"
-                          onClick={() => onDelete(file)}
-                        >
-                          <Trash2 className="mr-2 h-4 w-4" />
-                          Delete
-                        </DropdownMenuItem>
+                        {!readOnly && (
+                          <DropdownMenuItem
+                            onClick={() => onRename(file)}
+                          >
+                            <Pencil className="mr-2 h-4 w-4" />
+                            Rename
+                          </DropdownMenuItem>
+                        )}
+                        {!readOnly && (
+                          <DropdownMenuItem
+                            className="text-destructive"
+                            onClick={() => onDelete(file)}
+                          >
+                            <Trash2 className="mr-2 h-4 w-4" />
+                            Delete
+                          </DropdownMenuItem>
+                        )}
                       </DropdownMenuContent>
                     </DropdownMenu>
                   ) : null}

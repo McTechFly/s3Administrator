@@ -45,9 +45,11 @@ interface TopbarProps {
   onViewModeChange?: (mode: "list" | "gallery") => void
   showVersions?: boolean
   onShowVersionsChange?: (show: boolean) => void
+  readOnly?: boolean
+  basePath?: string
 }
 
-function buildBreadcrumbSegments(bucket: string, prefix: string, credentialId?: string) {
+function buildBreadcrumbSegments(bucket: string, prefix: string, credentialId?: string, basePath = "/dashboard") {
   const credentialQuery = credentialId
     ? `&credentialId=${encodeURIComponent(credentialId)}`
     : ""
@@ -56,7 +58,7 @@ function buildBreadcrumbSegments(bucket: string, prefix: string, credentialId?: 
   if (bucket) {
     segments.push({
       label: bucket,
-      href: `/dashboard?bucket=${encodeURIComponent(bucket)}${credentialQuery}`,
+      href: `${basePath}?bucket=${encodeURIComponent(bucket)}${credentialQuery}`,
     })
 
     if (prefix) {
@@ -66,7 +68,7 @@ function buildBreadcrumbSegments(bucket: string, prefix: string, credentialId?: 
         accumulated += part + "/"
         segments.push({
           label: part,
-          href: `/dashboard?bucket=${encodeURIComponent(bucket)}&prefix=${encodeURIComponent(accumulated)}${credentialQuery}`,
+          href: `${basePath}?bucket=${encodeURIComponent(bucket)}&prefix=${encodeURIComponent(accumulated)}${credentialQuery}`,
         })
       }
     }
@@ -90,6 +92,8 @@ export function Topbar({
   onViewModeChange,
   showVersions,
   onShowVersionsChange,
+  readOnly,
+  basePath = "/dashboard",
 }: TopbarProps) {
   const [searchValue, setSearchValue] = useState("")
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -115,7 +119,7 @@ export function Topbar({
     }
   }, [])
 
-  const segments = buildBreadcrumbSegments(bucket, prefix, credentialId)
+  const segments = buildBreadcrumbSegments(bucket, prefix, credentialId, basePath)
   const lastSegment = segments[segments.length - 1]
   const parentSegments = segments.slice(0, -1)
 
@@ -126,7 +130,7 @@ export function Topbar({
           <BreadcrumbList>
             <BreadcrumbItem>
               <BreadcrumbLink asChild>
-                <Link href="/dashboard">
+                <Link href={basePath}>
                   <Home className="h-4 w-4" />
                 </Link>
               </BreadcrumbLink>
@@ -179,14 +183,18 @@ export function Topbar({
               </Button>
             </div>
           )}
-          <Button variant="outline" size="sm" onClick={onUpload}>
-            <Upload className="mr-1.5 h-4 w-4" />
-            Upload
-          </Button>
-          <Button variant="outline" size="sm" onClick={onCreateFolder}>
-            <FolderPlus className="mr-1.5 h-4 w-4" />
-            New Folder
-          </Button>
+          {!readOnly && (
+            <Button variant="outline" size="sm" onClick={onUpload}>
+              <Upload className="mr-1.5 h-4 w-4" />
+              Upload
+            </Button>
+          )}
+          {!readOnly && (
+            <Button variant="outline" size="sm" onClick={onCreateFolder}>
+              <FolderPlus className="mr-1.5 h-4 w-4" />
+              New Folder
+            </Button>
+          )}
           {onSort && (
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
@@ -220,10 +228,12 @@ export function Topbar({
               Versions
             </Button>
           )}
-          <Button variant="outline" size="sm" onClick={onSync}>
-            <RefreshCw className="mr-1.5 h-4 w-4" />
-            Sync
-          </Button>
+          {!readOnly && (
+            <Button variant="outline" size="sm" onClick={onSync}>
+              <RefreshCw className="mr-1.5 h-4 w-4" />
+              Sync
+            </Button>
+          )}
         </div>
       </div>
 

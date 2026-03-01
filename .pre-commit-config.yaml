@@ -23,5 +23,5 @@ repos:
         name: no-private-deps
         entry: node scripts/validate-no-private-deps.mjs
         language: system
-        files: ^package\.json$
+        always_run: true
         pass_filenames: false

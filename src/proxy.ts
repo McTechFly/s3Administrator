@@ -53,6 +53,14 @@ const cloudMiddleware = auth((req) => {
     return NextResponse.next()
   }
 
+  // Demo routes are public — no auth required, but only when demo is enabled.
+  if (pathname.startsWith("/demo") || pathname.startsWith("/api/demo/")) {
+    if (Boolean(process.env.DEMO_S3_ACCESS_KEY?.trim())) {
+      return NextResponse.next()
+    }
+    return NextResponse.redirect(new URL("/login", req.url))
+  }
+
   if (isInternalTaskProcessRequest(pathname, req)) {
     return NextResponse.next()
   }
@@ -104,5 +112,7 @@ export const config = {
     "/api/audit/:path*",
     "/admin/:path*",
     "/api/admin/:path*",
+    "/demo/:path*",
+    "/api/demo/:path*",
   ],
 }

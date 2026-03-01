@@ -1,0 +1,57 @@
+import { NextRequest, NextResponse } from "next/server"
+import { GetObjectCommand } from "@aws-sdk/client-s3"
+import { demoGuard, getDemoS3Client } from "@/lib/demo"
+
+export const runtime = "nodejs"
+
+function extractFilename(key: string): string {
+  const normalized = key.endsWith("/") ? key.slice(0, -1) : key
+  return normalized.split("/").pop() || "download"
+}
+
+function toContentDispositionFilename(filename: string): string {
+  return filename.replace(/["\\]/g, "_")
+}
+
+export async function GET(request: NextRequest) {
+  const guard = demoGuard()
+  if (guard) return guard
+
+  try {
+    const bucket = request.nextUrl.searchParams.get("bucket") ?? ""
+    const key = request.nextUrl.searchParams.get("key") ?? ""
+
+    if (!bucket || !key) {
+      return NextResponse.json({ error: "bucket and key are required" }, { status: 400 })
+    }
+
+    const { client } = getDemoS3Client()
+    const filename = extractFilename(key)
+
+    const response = await client.send(
+      new GetObjectCommand({ Bucket: bucket, Key: key })
+    )
+
+    if (!response.Body) {
+      return NextResponse.json({ error: "Empty response from storage" }, { status: 502 })
+    }
+
+    const headers = new Headers()
+    headers.set(
+      "Content-Disposition",
+      `attachment; filename="${toContentDispositionFilename(filename)}"`
+    )
+    if (response.ContentType) {
+      headers.set("Content-Type", response.ContentType)
+    }
+    if (response.ContentLength != null) {
+      headers.set("Content-Length", String(response.ContentLength))
+    }
+
+    const webStream = response.Body.transformToWebStream()
+    return new NextResponse(webStream, { status: 200, headers })
+  } catch (error) {
+    console.error("Demo: Download proxy failed:", error)
+    return NextResponse.json({ error: "Failed to download object" }, { status: 500 })
+  }
+}

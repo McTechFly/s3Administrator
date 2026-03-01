@@ -59,6 +59,7 @@ interface SidebarBucketListProps {
   syncIssueByBucketKey: Record<string, string>
   onSyncAll: () => void
   onOpenSettings: (bucket: Bucket) => void
+  basePath?: string
 }
 
 export function SidebarBucketList({
@@ -70,6 +71,7 @@ export function SidebarBucketList({
   syncIssueByBucketKey,
   onSyncAll,
   onOpenSettings,
+  basePath = "/dashboard",
 }: SidebarBucketListProps) {
   const pathname = usePathname()
   const searchParams = useSearchParams()
@@ -233,9 +235,9 @@ export function SidebarBucketList({
       ) : filteredAndSortedBuckets.length > 0 ? (
         <div className="space-y-1">
           {filteredAndSortedBuckets.map((bucket) => {
-            const href = `/dashboard?bucket=${encodeURIComponent(bucket.name)}&credentialId=${encodeURIComponent(bucket.credentialId)}`
+            const href = `${basePath}?bucket=${encodeURIComponent(bucket.name)}&credentialId=${encodeURIComponent(bucket.credentialId)}`
             const isActive =
-              pathname === "/dashboard" &&
+              pathname === basePath &&
               searchParams.get("bucket") === bucket.name &&
               searchParams.get("credentialId") === bucket.credentialId
             const bucketStat = statsByBucket.get(`${bucket.credentialId}:${bucket.name}`)

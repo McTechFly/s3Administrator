@@ -28,6 +28,7 @@ interface GalleryBrowserProps {
   onDownload: (item: GalleryItem) => void
   onDelete: (item: GalleryItem) => void
   onLoadMore: () => void
+  readOnly?: boolean
 }
 
 function getDisplayName(key: string): string {
@@ -49,6 +50,7 @@ interface GalleryItemCardProps {
   onOpenPreview: (item: GalleryItem) => void
   onDownload: (item: GalleryItem) => void
   onDelete: (item: GalleryItem) => void
+  readOnly?: boolean
 }
 
 function GalleryItemCard({
@@ -64,6 +66,7 @@ function GalleryItemCard({
   onOpenPreview,
   onDownload,
   onDelete,
+  readOnly,
 }: GalleryItemCardProps) {
   const resolvedCredentialId = getItemCredentialId?.(item) ?? credentialId ?? ""
   const resolvedBucket = getItemBucket?.(item) ?? bucket ?? ""
@@ -158,9 +161,11 @@ function GalleryItemCard({
               <Download className="h-3.5 w-3.5" />
             </Button>
           )}
-          <Button size="sm" variant="outline" className="h-7 px-2" onClick={() => onDelete(item)}>
-            <Trash2 className="h-3.5 w-3.5" />
-          </Button>
+          {!readOnly && (
+            <Button size="sm" variant="outline" className="h-7 px-2" onClick={() => onDelete(item)}>
+              <Trash2 className="h-3.5 w-3.5" />
+            </Button>
+          )}
         </div>
       </div>
     </div>
@@ -185,6 +190,7 @@ export function GalleryBrowser({
   onDownload,
   onDelete,
   onLoadMore,
+  readOnly,
 }: GalleryBrowserProps) {
   const sentinelRef = useRef<HTMLDivElement | null>(null)
   const shiftPressedRef = useRef(false)
@@ -258,6 +264,7 @@ export function GalleryBrowser({
             onOpenPreview={onOpenPreview}
             onDownload={onDownload}
             onDelete={onDelete}
+            readOnly={readOnly}
           />
         ))}
       </div>

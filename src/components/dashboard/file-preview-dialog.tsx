@@ -34,6 +34,7 @@ interface FilePreviewDialogProps {
   bucket: string
   credentialId?: string
   onDownload: () => void
+  apiPrefix?: string
 }
 
 function extractExtension(key: string): string {
@@ -78,6 +79,7 @@ export function FilePreviewDialog({
   bucket,
   credentialId,
   onDownload,
+  apiPrefix = "/api/s3",
 }: FilePreviewDialogProps) {
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
   const [textContent, setTextContent] = useState<string | null>(null)
@@ -115,7 +117,7 @@ export function FilePreviewDialog({
     setCsvTruncated(false)
 
     try {
-      const res = await fetch("/api/s3/preview", {
+      const res = await fetch(`${apiPrefix}/preview`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ bucket, credentialId, key: fileKey }),
@@ -165,7 +167,7 @@ export function FilePreviewDialog({
     } finally {
       setLoading(false)
     }
-  }, [open, fileKey, fileSize, bucket, credentialId, previewType])
+  }, [open, fileKey, fileSize, bucket, credentialId, previewType, apiPrefix])
 
   useEffect(() => {
     void fetchPreview()

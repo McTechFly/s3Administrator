@@ -13,6 +13,7 @@ interface MultiSelectToolbarProps {
   selectionHint?: string
   selectAllLabel?: string
   onSelectAllAcrossResults?: () => void
+  readOnly?: boolean
 }
 
 export function MultiSelectToolbar({
@@ -25,6 +26,7 @@ export function MultiSelectToolbar({
   selectionHint,
   selectAllLabel,
   onSelectAllAcrossResults,
+  readOnly,
 }: MultiSelectToolbarProps) {
   if (selectedCount === 0) return null
 
@@ -61,10 +63,12 @@ export function MultiSelectToolbar({
               Move to Folder
             </Button>
           ) : null}
-          <Button variant="destructive" size="sm" onClick={onDelete}>
-            <Trash2 className="mr-1.5 h-4 w-4" />
-            Delete
-          </Button>
+          {!readOnly && (
+            <Button variant="destructive" size="sm" onClick={onDelete}>
+              <Trash2 className="mr-1.5 h-4 w-4" />
+              Delete
+            </Button>
+          )}
         </div>
       </div>
       <Button variant="ghost" size="sm" onClick={onClear}>
