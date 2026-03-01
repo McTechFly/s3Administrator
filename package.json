@@ -10,8 +10,9 @@
     "build": "node scripts/next-with-env.mjs build",
     "start": "node scripts/next-with-env.mjs start",
     "task-worker": "tsx src/worker/task-worker.ts",
-    "lint": "node scripts/ensure-edition-stubs.mjs && eslint",
-    "validate:edition-sync": "node scripts/validate-edition-sync.mjs"
+    "lint": "node scripts/validate-no-private-deps.mjs && node scripts/ensure-edition-stubs.mjs && eslint",
+    "validate:edition-sync": "node scripts/validate-edition-sync.mjs",
+    "validate:no-private-deps": "node scripts/validate-no-private-deps.mjs"
   },
   "dependencies": {
     "@auth/prisma-adapter": "^2.11.1",
@@ -20,7 +21,6 @@
     "@aws-sdk/s3-request-presigner": "^3.997.0",
     "@prisma/adapter-pg": "^7.4.0",
     "@prisma/client": "^7.4.0",
-    "@s3administrator/billing": "^1.1.14",
     "@tanstack/react-query": "^5.90.20",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
