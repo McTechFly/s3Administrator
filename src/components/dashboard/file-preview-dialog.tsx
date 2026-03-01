@@ -139,6 +139,8 @@ export function FilePreviewDialog({
           return
         }
         setPreviewUrl(url)
+      } else if (previewType === "audio") {
+        setPreviewUrl(url)
       } else if (previewType === "pdf") {
         setPreviewUrl(url)
       } else if (previewType === "text" || previewType === "csv") {
@@ -227,6 +229,16 @@ export function FilePreviewDialog({
                 <Download className="mr-2 h-4 w-4" />
                 Download Instead
               </Button>
+            </div>
+          ) : previewType === "audio" && previewUrl ? (
+            <div className="flex h-full items-center justify-center p-6">
+              <audio
+                src={previewUrl}
+                controls
+                autoPlay
+                preload="metadata"
+                className="w-full max-w-3xl"
+              />
             </div>
           ) : previewType === "pdf" && previewUrl ? (
             <iframe

@@ -1,12 +1,28 @@
 import { Prisma } from "@prisma/client"
 
 export const FILE_TYPE_EXTENSIONS: Record<string, string[]> = {
-  image: ["jpg", "jpeg", "png", "gif", "webp", "svg", "ico"],
+  image: ["jpg", "jpeg", "png", "gif", "webp", "svg", "ico", "tiff", "tif", "ai"],
   video: ["mp4", "avi", "mov", "mkv", "flv", "wmv", "webm"],
-  audio: ["mp3", "wav", "flac", "aac", "m4a", "ogg", "wma"],
-  document: ["pdf", "doc", "docx", "txt", "rtf", "odt", "xls", "xlsx"],
+  audio: [
+    "aac",
+    "ac3",
+    "aiff",
+    "amr",
+    "au",
+    "flac",
+    "m4a",
+    "mid",
+    "mka",
+    "mp3",
+    "ogg",
+    "ra",
+    "voc",
+    "wav",
+    "wma",
+  ],
+  document: ["pdf", "doc", "docx", "txt", "rtf", "odt", "ods", "odp", "xls", "xlsx"],
   archive: ["zip", "rar", "7z", "tar", "gz", "bz2"],
-  code: ["js", "ts", "tsx", "jsx", "py", "java", "cpp", "c", "go", "rs", "rb", "php", "html", "css", "json", "xml"],
+  code: ["js", "ts", "tsx", "jsx", "py", "java", "cpp", "c", "go", "rs", "rb", "php", "html", "css", "scss", "json", "xml", "yaml", "yml", "sh", "bash", "sql"],
   other: [],
 }
 

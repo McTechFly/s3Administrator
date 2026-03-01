@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server"
 import { ListObjectsV2Command, GetObjectCommand } from "@aws-sdk/client-s3"
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner"
 import { demoGuard, getDemoS3Client } from "@/lib/demo"
-import { getMediaTypeFromExtension, getPreviewType } from "@/lib/media"
+import { getMediaTypeFromExtension, isGallerySupportedExtension } from "@/lib/media"
 
 const PREVIEW_URL_TTL_SECONDS = 86400
 
@@ -99,12 +99,12 @@ export async function GET(request: NextRequest) {
       })
     )
 
-    // Build media files
+    // Build gallery-eligible files
     const mediaFiles = (response.Contents ?? [])
       .filter((obj) => {
         if (!obj.Key || obj.Key === prefix) return false
         const ext = getExtension(obj.Key)
-        return getMediaTypeFromExtension(ext) !== null || getPreviewType(ext) !== null
+        return isGallerySupportedExtension(ext)
       })
       .map((obj) => ({
         kind: "file" as const,

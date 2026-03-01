@@ -313,8 +313,8 @@ function DashboardContent() {
   )
 
 
-  const previewableGalleryItems = useMemo(
-    () => sortedGalleryItems.filter((item) => !item.isFolder),
+  const lightboxItems = useMemo(
+    () => sortedGalleryItems.filter((item) => !item.isFolder && Boolean(item.mediaType)),
     [sortedGalleryItems]
   )
 
@@ -875,12 +875,17 @@ function DashboardContent() {
               return
             }
 
-            // Document files → open FilePreviewDialog
+            // Audio and document files → open FilePreviewDialog
             const ext = item.key.includes(".")
               ? item.key.slice(item.key.lastIndexOf(".") + 1)
               : ""
             const pType = getPreviewType(ext)
-            if (pType && pType !== "image" && pType !== "video") {
+            if (!pType) {
+              void handleDownload([item.key])
+              return
+            }
+
+            if (pType !== "image" && pType !== "video") {
               setPreviewFile({
                 key: item.key,
                 size: item.size,
@@ -891,7 +896,7 @@ function DashboardContent() {
             }
 
             // Image/video files → open lightbox
-            const index = previewableGalleryItems.findIndex((entry) => entry.key === item.key)
+            const index = lightboxItems.findIndex((entry) => entry.key === item.key)
             if (index >= 0) setLightboxIndex(index)
           }}
           onDownload={(item) => {
@@ -951,7 +956,7 @@ function DashboardContent() {
         onOpenChange={(open) => {
           if (!open) setLightboxIndex(null)
         }}
-        items={previewableGalleryItems}
+        items={lightboxItems}
         currentIndex={lightboxIndex ?? 0}
         bucket={bucket}
         credentialId={credentialId}

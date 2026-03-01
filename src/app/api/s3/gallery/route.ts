@@ -4,7 +4,7 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner"
 import { auth } from "@/lib/auth"
 import { prisma } from "@/lib/db"
 import { getS3Client } from "@/lib/s3"
-import { getMediaTypeFromExtension, getPreviewType, type MediaType } from "@/lib/media"
+import { getMediaTypeFromExtension, getPreviewType, isGallerySupportedExtension, type MediaType, type PreviewType } from "@/lib/media"
 import { galleryListSchema } from "@/lib/validations"
 import { rateLimitByUser, rateLimitResponse } from "@/lib/rate-limit"
 import { getRequestContext, logUserAuditAction } from "@/lib/audit-logger"
@@ -32,6 +32,7 @@ type FileCandidate = {
   lastModified: Date
   extension: string
   mediaType: MediaType | null
+  previewType: PreviewType | null
   isVideo: boolean
 }
 
@@ -136,6 +137,7 @@ export async function GET(request: NextRequest) {
       lastModified: Date
       extension: string
       mediaType: MediaType | null
+      previewType: PreviewType | null
       isVideo: boolean
     }> = []
 
@@ -175,7 +177,7 @@ export async function GET(request: NextRequest) {
       const entryMediaType = getMediaTypeFromExtension(entry.extension)
       const entryPreviewType = getPreviewType(entry.extension)
 
-      if (!entryMediaType && !entryPreviewType) {
+      if (!isGallerySupportedExtension(entry.extension)) {
         continue
       }
 
@@ -191,6 +193,7 @@ export async function GET(request: NextRequest) {
         lastModified: entry.lastModified,
         extension: entry.extension,
         mediaType: entryMediaType,
+        previewType: entryPreviewType,
         isVideo: entryMediaType === "video",
       })
     }
@@ -211,6 +214,7 @@ export async function GET(request: NextRequest) {
       lastModified: entry.lastModified,
       extension: entry.extension,
       mediaType: entry.mediaType,
+      previewType: entry.previewType,
       isVideo: entry.isVideo,
     }))
 
@@ -232,6 +236,7 @@ export async function GET(request: NextRequest) {
             lastModified: candidate.lastModified.toISOString(),
             extension: "",
             mediaType: null,
+            previewType: null,
             previewUrl: null,
             isVideo: false,
             isFolder: true,
@@ -242,9 +247,10 @@ export async function GET(request: NextRequest) {
 
         let previewUrl: string | null = null
 
-        // Only generate preview URLs for media files (used for thumbnails)
-        // Document files (pdf, txt, csv, office) don't need thumbnails
-        if (candidate.mediaType) {
+        // Media files need preview URLs for client-side thumbnail generation.
+        // Code files need preview URLs for fetching content to syntax-highlight.
+        const needsPreviewUrl = candidate.mediaType || candidate.previewType === "code"
+        if (needsPreviewUrl) {
           if (isStoradera) {
             // Storadera does not support presigned URLs; use the preview proxy with the original file
             const params = new URLSearchParams({ bucket, key: candidate.key })
@@ -278,6 +284,7 @@ export async function GET(request: NextRequest) {
           lastModified: candidate.lastModified.toISOString(),
           extension: candidate.extension,
           mediaType: candidate.mediaType,
+          previewType: candidate.previewType,
           previewUrl,
           isVideo: candidate.isVideo,
           isFolder: false,
