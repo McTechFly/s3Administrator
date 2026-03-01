@@ -28,7 +28,7 @@ RUN --mount=type=cache,target=/root/.npm set -e; \
         "@s3administrator/audit@^1.1.3" \
         "@s3administrator/billing@^1.1.14" \
         "@s3administrator/auth@^1.1.0" \
-        "@s3administrator/marketing@^1.1.0" \
+        "@s3administrator/marketing@^1.1.1" \
         "@s3administrator/setup@^1.0.2"; \
     fi; \
     rm -f .npmrc
