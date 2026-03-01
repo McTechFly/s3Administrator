@@ -283,12 +283,6 @@ function parseObjectTransferPayload(raw: unknown): ObjectTransferTaskPayload | n
         ? payload.destinationPrefix
         : null
 
-  if (scope === "folder") {
-    if (!sourcePrefix || !destinationPrefix) {
-      return null
-    }
-  }
-
   const pollIntervalSeconds =
     typeof payload.pollIntervalSeconds === "number" &&
     Number.isFinite(payload.pollIntervalSeconds) &&

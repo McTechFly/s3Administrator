@@ -80,7 +80,6 @@ export function FolderPickerDialog({
   const segments = useMemo(() => buildSegments(currentPrefix), [currentPrefix])
 
   function handleSelectCurrent() {
-    if (!currentPrefix) return
     onChange(currentPrefix)
     setOpen(false)
   }
@@ -95,7 +94,7 @@ export function FolderPickerDialog({
         disabled={disabled}
       >
         <Folder className="mr-2 h-4 w-4" />
-        {value ? value : "Choose folder"}
+        {value ? value : "Bucket root"}
       </Button>
 
       <Dialog
@@ -159,9 +158,8 @@ export function FolderPickerDialog({
                   type="button"
                   size="sm"
                   onClick={handleSelectCurrent}
-                  disabled={!currentPrefix}
                 >
-                  Select Current Folder
+                  {currentPrefix ? "Select Current Folder" : "Select Bucket Root"}
                 </Button>
               </div>
 

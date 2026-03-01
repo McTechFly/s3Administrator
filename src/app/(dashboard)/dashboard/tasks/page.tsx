@@ -363,12 +363,6 @@ export default function TasksPage() {
       toast.error("Select source and destination buckets")
       return null
     }
-    if (scope === "folder") {
-      if (!sourcePrefix.trim() || !destinationPrefix.trim()) {
-        toast.error("Source and destination folder prefixes are required")
-        return null
-      }
-    }
 
     const body: TransferTaskCreateBody = {
       scope,
@@ -752,7 +746,7 @@ export default function TasksPage() {
                 <Label>Source folder prefix</Label>
                 <FolderPickerDialog
                   title="Pick Source Folder"
-                  description="Select the source folder from cached paths."
+                  description="Select the source folder or bucket root from cached paths."
                   credentialId={sourceCredentialId}
                   bucket={sourceBucket}
                   value={sourcePrefix}
@@ -764,7 +758,7 @@ export default function TasksPage() {
                 <Label>Destination folder prefix</Label>
                 <FolderPickerDialog
                   title="Pick Destination Folder"
-                  description="Select the destination folder from cached paths."
+                  description="Select the destination folder or bucket root from cached paths."
                   credentialId={destinationCredentialId}
                   bucket={destinationBucket}
                   value={destinationPrefix}

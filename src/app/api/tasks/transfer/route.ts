@@ -529,6 +529,15 @@ function isDestructiveTransferOperation(operation: TransferOperation): boolean {
   return operation === "sync" || operation === "move" || operation === "migrate"
 }
 
+function formatTransferLocation(
+  scope: TransferScope,
+  bucket: string,
+  prefix: string
+): string {
+  if (scope !== "folder") return bucket
+  return prefix ? `${bucket}/${prefix}` : `${bucket} (root)`
+}
+
 function buildTransferPreview(params: {
   scope: TransferScope
   operation: TransferOperation
@@ -547,8 +556,8 @@ function buildTransferPreview(params: {
 
   const summary = [
     `Operation: ${params.operation.toUpperCase()} (${params.scope === "folder" ? "folder-to-folder" : "bucket-to-bucket"})`,
-    `Source: ${params.scope === "folder" ? `${params.sourceBucket}/${params.sourcePrefix}` : params.sourceBucket}`,
-    `Destination: ${params.scope === "folder" ? `${params.destinationBucket}/${params.destinationPrefix}` : params.destinationBucket}`,
+    `Source: ${formatTransferLocation(params.scope, params.sourceBucket, params.sourcePrefix)}`,
+    `Destination: ${formatTransferLocation(params.scope, params.destinationBucket, params.destinationPrefix)}`,
     `Estimated source objects from cache: ${params.sourceCachedFileCount.toLocaleString()}`,
     params.scheduleCron
       ? `Schedule: CRON (${params.scheduleCron}) UTC`
@@ -663,15 +672,6 @@ export async function POST(request: NextRequest) {
     const normalizedSourcePrefix = scope === "folder" ? normalizeFolderPrefix(sourcePrefix) : ""
     const normalizedDestinationPrefix = scope === "folder" ? normalizeFolderPrefix(destinationPrefix) : ""
 
-    if (scope === "folder") {
-      if (!normalizedSourcePrefix || !normalizedDestinationPrefix) {
-        return NextResponse.json(
-          { error: "sourcePrefix and destinationPrefix are required for folder tasks" },
-          { status: 400 }
-        )
-      }
-    }
-
     const { credential: sourceCredential } = await getS3Client(session.user.id, sourceCredentialId)
     const { credential: destinationCredential } = await getS3Client(
       session.user.id,
@@ -770,7 +770,7 @@ export async function POST(request: NextRequest) {
 
     const title =
       scope === "folder"
-        ? `${operation.toUpperCase()} folder ${sourceBucket}/${normalizedSourcePrefix} -> ${destinationBucket}/${normalizedDestinationPrefix}`
+        ? `${operation.toUpperCase()} folder ${formatTransferLocation(scope, sourceBucket, normalizedSourcePrefix)} -> ${formatTransferLocation(scope, destinationBucket, normalizedDestinationPrefix)}`
         : `${operation.toUpperCase()} bucket ${sourceBucket} -> ${destinationBucket}`
 
     const taskPayload = {
