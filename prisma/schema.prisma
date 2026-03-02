@@ -26,6 +26,7 @@ model User {
   backgroundTaskEvents BackgroundTaskEvent[]
   subscriptions  Subscription[]
   actionEvents   UserActionEvent[]
+  organizationMemberships OrganizationMember[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -245,6 +246,7 @@ model Plan {
   id                 String   @id @default(cuid())
   slug               String   @unique
   name               String
+  type               String   @default("individual") // "individual" | "team"
   priceMonthly       Int      @default(0)
   stripePriceId      String?  @unique
   bucketLimit        Int      @default(1)
@@ -256,7 +258,11 @@ model Plan {
   isActive           Boolean  @default(true)
   sortOrder          Int      @default(0)
 
-  subscriptions Subscription[]
+  subscriptions    Subscription[]
+  orgSubscriptions OrganizationSubscription[]
+
+  seatPriceMonthly Int? // per-seat price in cents (null = not a team plan)
+  maxSeats         Int? // null = unlimited
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -293,4 +299,120 @@ model Subscription {
 
   @@index([userId])
   @@index([stripeSubscriptionId])
+}
+
+// ── Team / Organization ─────────────────────────────────────────────
+
+model Organization {
+  id        String  @id @default(cuid())
+  name      String
+  slug      String  @unique
+  avatarUrl String?
+  ownerId   String
+
+  members           OrganizationMember[]
+  invitations       OrganizationInvitation[]
+  sharedCredentials SharedS3Credential[]
+  subscription      OrganizationSubscription?
+  auditEvents       OrgAuditEvent[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([ownerId])
+}
+
+model OrganizationMember {
+  id             String @id @default(cuid())
+  organizationId String
+  userId         String
+  role           String @default("member") // "owner" | "admin" | "member" | "viewer"
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  joinedAt  DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([organizationId, userId])
+  @@index([userId])
+}
+
+model OrganizationInvitation {
+  id             String   @id @default(cuid())
+  organizationId String
+  email          String
+  role           String   @default("member")
+  token          String   @unique @default(cuid())
+  invitedById    String
+  status         String   @default("pending") // "pending" | "accepted" | "expired"
+  expiresAt      DateTime
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([organizationId])
+  @@index([email])
+  @@index([token])
+}
+
+model SharedS3Credential {
+  id              String @id @default(cuid())
+  organizationId  String
+  label           String
+  provider        String @default("HETZNER")
+  endpoint        String
+  region          String
+  accessKeyEnc    String @db.Text
+  secretKeyEnc    String @db.Text
+  ivAccessKey     String
+  ivSecretKey     String
+  addedById       String
+  permissionLevel String @default("full") // "full" | "read_only"
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([organizationId])
+}
+
+model OrganizationSubscription {
+  id                   String    @id @default(cuid())
+  organizationId       String    @unique
+  planId               String
+  stripeSubscriptionId String    @unique
+  stripeCustomerId     String
+  status               String    @default("active")
+  seatCount            Int       @default(1)
+  currentPeriodStart   DateTime
+  currentPeriodEnd     DateTime
+  cancelAtPeriodEnd    Boolean   @default(false)
+  canceledAt           DateTime?
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  plan         Plan         @relation(fields: [planId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model OrgAuditEvent {
+  id             String   @id @default(cuid())
+  organizationId String
+  actorId        String?
+  eventType      String
+  eventName      String
+  target         String?
+  metadata       Json?
+  ipAddress      String?
+  userAgent      String?
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, createdAt])
+  @@index([actorId, createdAt])
 }

@@ -1,6 +1,15 @@
 import { prisma } from "@/lib/db"
 import type { PlanEntitlements } from "@/lib/plan-entitlements"
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function getOrgMemberIds(orgId: string): Promise<string[]> {
+  const members = await (prisma as any).organizationMember.findMany({
+    where: { organizationId: orgId },
+    select: { userId: true },
+  })
+  return members.map((m: { userId: string }) => m.userId)
+}
+
 export interface BucketLimitViolation {
   bucketLimit: number
   currentBucketCount: number
@@ -132,5 +141,92 @@ export async function getAdditionalStorageLimitViolation(params: {
     }
   }
 
+  return null
+}
+
+// ── Org-scoped limit checks (pooled across all members) ─────────────
+
+export async function countOrgIndexedBuckets(orgId: string): Promise<number> {
+  const memberIds = await getOrgMemberIds(orgId)
+  if (memberIds.length === 0) return 0
+  const buckets = await prisma.fileMetadata.groupBy({
+    by: ["credentialId", "bucket"],
+    where: { userId: { in: memberIds } },
+  })
+  return buckets.length
+}
+
+export async function getOrgBucketLimitViolation(params: {
+  orgId: string
+  userId: string
+  credentialId: string
+  bucket: string
+  entitlements: PlanEntitlements
+}): Promise<BucketLimitViolation | null> {
+  if (!Number.isFinite(params.entitlements.bucketLimit)) return null
+
+  const alreadyIndexed = await hasIndexedBucket({
+    userId: params.userId,
+    credentialId: params.credentialId,
+    bucket: params.bucket,
+  })
+  if (alreadyIndexed) return null
+
+  const currentBucketCount = await countOrgIndexedBuckets(params.orgId)
+  if (currentBucketCount >= params.entitlements.bucketLimit) {
+    return { bucketLimit: params.entitlements.bucketLimit, currentBucketCount }
+  }
+  return null
+}
+
+export async function getOrgFileLimitViolation(params: {
+  orgId: string
+  requestedAdditionalFiles: number
+  entitlements: PlanEntitlements
+}): Promise<FileLimitViolation | null> {
+  const requested = Math.max(0, Math.floor(params.requestedAdditionalFiles))
+  if (requested <= 0 || !Number.isFinite(params.entitlements.fileLimit)) return null
+
+  const memberIds = await getOrgMemberIds(params.orgId)
+  const currentFileCount = await prisma.fileMetadata.count({
+    where: { userId: { in: memberIds }, isFolder: false },
+  })
+
+  const availableSlots = Math.max(0, params.entitlements.fileLimit - currentFileCount)
+  if (requested > availableSlots) {
+    return {
+      fileLimit: params.entitlements.fileLimit,
+      currentFileCount,
+      requestedAdditionalFiles: requested,
+      availableSlots,
+    }
+  }
+  return null
+}
+
+export async function getOrgStorageLimitViolation(params: {
+  orgId: string
+  requestedAdditionalBytes: number
+  entitlements: PlanEntitlements
+}): Promise<StorageLimitViolation | null> {
+  const requested = Math.max(0, Math.floor(params.requestedAdditionalBytes))
+  if (requested <= 0 || !Number.isFinite(params.entitlements.storageLimitBytes)) return null
+
+  const memberIds = await getOrgMemberIds(params.orgId)
+  const aggregate = await prisma.fileMetadata.aggregate({
+    where: { userId: { in: memberIds }, isFolder: false },
+    _sum: { size: true },
+  })
+  const currentStorageBytes = Number(aggregate._sum.size ?? 0)
+
+  const availableBytes = Math.max(0, params.entitlements.storageLimitBytes - currentStorageBytes)
+  if (requested > availableBytes) {
+    return {
+      storageLimitBytes: params.entitlements.storageLimitBytes,
+      currentStorageBytes,
+      requestedAdditionalBytes: requested,
+      availableBytes,
+    }
+  }
   return null
 }

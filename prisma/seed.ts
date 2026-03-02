@@ -22,11 +22,15 @@ function getStripe(): Stripe | null {
 
 const GB = BigInt(1024 ** 3)
 
-const defaultPlans = [
+// ── Individual Plans ────────────────────────────────────────────────
+const individualPlans = [
   {
     slug: "free",
     name: "Free",
+    type: "individual" as const,
     priceMonthly: 0,
+    seatPriceMonthly: null,
+    maxSeats: null,
     bucketLimit: 10,
     fileLimit: 10000,
     storageLimitBytes: BigInt(50) * GB,
@@ -44,7 +48,10 @@ const defaultPlans = [
   {
     slug: "starter",
     name: "Starter",
-    priceMonthly: 300,
+    type: "individual" as const,
+    priceMonthly: 500,
+    seatPriceMonthly: null,
+    maxSeats: null,
     bucketLimit: 50,
     fileLimit: 50000,
     storageLimitBytes: BigInt(50) * GB,
@@ -52,10 +59,8 @@ const defaultPlans = [
     thumbnailCache: true,
     features: [
       "Everything in Free",
-      "Preview thumbnails",
       "Copy folder to folder",
       "Copy bucket to bucket",
-      "Audit logs",
       "Search all files",
       "Up to 50,000 cached files",
       "Up to 50 buckets",
@@ -66,7 +71,10 @@ const defaultPlans = [
   {
     slug: "pro",
     name: "Pro",
-    priceMonthly: 900,
+    type: "individual" as const,
+    priceMonthly: 1200,
+    seatPriceMonthly: null,
+    maxSeats: null,
     bucketLimit: 1000,
     fileLimit: 500000,
     storageLimitBytes: BigInt(500) * GB,
@@ -84,7 +92,10 @@ const defaultPlans = [
   {
     slug: "enterprise",
     name: "Enterprise",
+    type: "individual" as const,
     priceMonthly: 0,
+    seatPriceMonthly: null,
+    maxSeats: null,
     bucketLimit: 1000,
     fileLimit: 0,
     storageLimitBytes: BigInt(0),
@@ -102,6 +113,82 @@ const defaultPlans = [
   },
 ]
 
+// ── Team Plans ──────────────────────────────────────────────────────
+const teamPlans = [
+  {
+    slug: "team-startup",
+    name: "Startup",
+    type: "team" as const,
+    priceMonthly: 0,
+    seatPriceMonthly: 1500,
+    maxSeats: 10,
+    bucketLimit: 50,
+    fileLimit: 50000,
+    storageLimitBytes: BigInt(100) * GB,
+    auditLogs: true,
+    thumbnailCache: true,
+    features: [
+      "Up to 10 team members",
+      "Shared S3 credentials",
+      "Copy folder to folder",
+      "Copy bucket to bucket",
+      "Search all files",
+      "Up to 50,000 cached files",
+      "Up to 50 buckets",
+      "Up to 100 GB storage",
+    ],
+    sortOrder: 10,
+  },
+  {
+    slug: "team-scaling",
+    name: "Scaling",
+    type: "team" as const,
+    priceMonthly: 0,
+    seatPriceMonthly: 2500,
+    maxSeats: 50,
+    bucketLimit: 1000,
+    fileLimit: 500000,
+    storageLimitBytes: BigInt(500) * GB,
+    auditLogs: true,
+    thumbnailCache: true,
+    features: [
+      "Everything in Startup",
+      "Up to 50 team members",
+      "Viewer role",
+      "Sync tasks",
+      "Up to 500,000 cached files",
+      "Up to 1,000 buckets",
+      "Up to 500 GB storage",
+    ],
+    sortOrder: 11,
+  },
+  {
+    slug: "team-enterprise",
+    name: "Enterprise",
+    type: "team" as const,
+    priceMonthly: 0,
+    seatPriceMonthly: null,
+    maxSeats: null,
+    bucketLimit: 1000,
+    fileLimit: 0,
+    storageLimitBytes: BigInt(0),
+    auditLogs: true,
+    thumbnailCache: true,
+    features: [
+      "Everything in Scaling",
+      "Unlimited team members",
+      "Unlimited cached files",
+      "Unlimited storage",
+      "Dedicated support",
+      "Custom integrations",
+      "SLA",
+    ],
+    sortOrder: 12,
+  },
+]
+
+const defaultPlans = [...individualPlans, ...teamPlans]
+
 async function main() {
   const stripe = isCommunity ? null : getStripe()
 
@@ -115,15 +202,16 @@ async function main() {
 
     // Create Stripe product+price for paid plans that don't have one yet
     let stripePriceId = existing?.stripePriceId ?? null
-    if (stripe && plan.priceMonthly > 0 && !stripePriceId) {
+    const billablePrice = plan.seatPriceMonthly ?? plan.priceMonthly
+    if (stripe && billablePrice > 0 && !stripePriceId) {
       console.log(`  Creating Stripe product+price for ${plan.slug}...`)
       const product = await stripe.products.create({
-        name: plan.name,
-        metadata: { slug: plan.slug },
+        name: `${plan.type === "team" ? "Team: " : ""}${plan.name}`,
+        metadata: { slug: plan.slug, type: plan.type },
       })
       const price = await stripe.prices.create({
         product: product.id,
-        unit_amount: plan.priceMonthly,
+        unit_amount: billablePrice,
         currency: "usd",
         recurring: { interval: "month" },
         metadata: { slug: plan.slug },
@@ -136,6 +224,10 @@ async function main() {
       where: { slug: plan.slug },
       update: {
         name: plan.name,
+        type: plan.type,
+        priceMonthly: plan.priceMonthly,
+        seatPriceMonthly: plan.seatPriceMonthly,
+        maxSeats: plan.maxSeats,
         bucketLimit: plan.bucketLimit,
         fileLimit: plan.fileLimit,
         storageLimitBytes: plan.storageLimitBytes,
@@ -147,7 +239,7 @@ async function main() {
       },
       create: { ...plan, stripePriceId },
     })
-    console.log(`  Upserted plan: ${plan.slug}${stripePriceId ? ` (price: ${stripePriceId})` : ""}`)
+    console.log(`  Upserted plan: ${plan.slug} (${plan.type})${stripePriceId ? ` (price: ${stripePriceId})` : ""}`)
   }
 
   console.log("Seeding complete.")

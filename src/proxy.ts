@@ -94,6 +94,14 @@ const cloudMiddleware = auth((req) => {
     return NextResponse.redirect(new URL("/dashboard", req.url))
   }
 
+  // Resolve org context from cookie and forward as request header
+  const orgSlug = req.cookies.get("s3a-org")?.value
+  if (orgSlug) {
+    const requestHeaders = new Headers(req.headers)
+    requestHeaders.set("x-org-slug", orgSlug)
+    return NextResponse.next({ request: { headers: requestHeaders } })
+  }
+
   return NextResponse.next()
 })
 
@@ -106,13 +114,16 @@ export const config = {
     "/dashboard/:path*",
     "/settings/:path*",
     "/billing/:path*",
+    "/teams/:path*",
     "/api/s3/:path*",
     "/api/tasks/:path*",
+    "/api/teams/:path*",
     "/api/analytics/:path*",
     "/api/audit/:path*",
     "/admin/:path*",
     "/api/admin/:path*",
     "/demo/:path*",
     "/api/demo/:path*",
+    "/invite/:path*",
   ],
 }
