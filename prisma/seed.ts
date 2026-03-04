@@ -187,7 +187,43 @@ const teamPlans = [
   },
 ]
 
-const defaultPlans = [...individualPlans, ...teamPlans]
+// ── Dynamic Pricing Template Plans (FK anchors, not shown to users) ──
+const customPlans = [
+  {
+    slug: "custom-individual",
+    name: "Custom Individual",
+    type: "individual" as const,
+    priceMonthly: 0,
+    seatPriceMonthly: null,
+    maxSeats: null,
+    bucketLimit: 100,
+    fileLimit: 0,
+    storageLimitBytes: BigInt(0),
+    auditLogs: true,
+    thumbnailCache: true,
+    features: [],
+    sortOrder: 99,
+    isActive: false,
+  },
+  {
+    slug: "custom-team",
+    name: "Custom Team",
+    type: "team" as const,
+    priceMonthly: 0,
+    seatPriceMonthly: null,
+    maxSeats: null,
+    bucketLimit: 100,
+    fileLimit: 0,
+    storageLimitBytes: BigInt(0),
+    auditLogs: true,
+    thumbnailCache: true,
+    features: [],
+    sortOrder: 99,
+    isActive: false,
+  },
+]
+
+const defaultPlans = [...individualPlans, ...teamPlans, ...customPlans]
 
 async function main() {
   const stripe = isCommunity ? null : getStripe()
@@ -235,6 +271,7 @@ async function main() {
         thumbnailCache: plan.thumbnailCache,
         features: plan.features,
         sortOrder: plan.sortOrder,
+        ...("isActive" in plan ? { isActive: plan.isActive } : {}),
         ...(stripePriceId && !existing?.stripePriceId ? { stripePriceId } : {}),
       },
       create: { ...plan, stripePriceId },

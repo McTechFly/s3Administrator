@@ -291,6 +291,12 @@ model Subscription {
   cancelAtPeriodEnd    Boolean   @default(false)
   canceledAt           DateTime?
 
+  // Dynamic pricing config (null = legacy fixed plan, falls back to Plan)
+  customFileLimit         Int?
+  customStorageLimitBytes BigInt?
+  customBucketLimit       Int?
+  dynamicStripePriceId    String?
+
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
   plan Plan @relation(fields: [planId], references: [id])
 
@@ -391,6 +397,14 @@ model OrganizationSubscription {
   currentPeriodEnd     DateTime
   cancelAtPeriodEnd    Boolean   @default(false)
   canceledAt           DateTime?
+
+  // Dynamic pricing config (null = legacy fixed plan, falls back to Plan)
+  customFileLimit         Int?
+  customStorageLimitBytes BigInt?
+  customBucketLimit       Int?
+  dynamicStripePriceId    String?
+  baseFileLimit           Int?    // per-seat base before seat multiplication
+  baseStorageLimitGb      Int?    // per-seat base before seat multiplication
 
   organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   plan         Plan         @relation(fields: [planId], references: [id])
