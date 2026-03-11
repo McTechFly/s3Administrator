@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server"
 import { Prisma } from "@prisma/client"
 import { auth } from "@/lib/auth"
 import { prisma } from "@/lib/db"
+import { rateLimitByUser, rateLimitResponse } from "@/lib/rate-limit"
 
 export async function GET(
   request: NextRequest,
@@ -10,6 +11,16 @@ export async function GET(
   const session = await auth()
   if (!session?.user?.id) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
+  }
+
+  const { success, retryAfterSeconds } = rateLimitByUser(
+    session.user.id,
+    "task-events-list",
+    30,
+    60_000
+  )
+  if (!success) {
+    return rateLimitResponse(retryAfterSeconds)
   }
 
   const { taskId } = await params

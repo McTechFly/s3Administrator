@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server"
 import { auth } from "@/lib/auth"
 import { prisma } from "@/lib/db"
+import { rateLimitByUser, rateLimitResponse } from "@/lib/rate-limit"
 import { getTaskMissedScheduleGraceSeconds } from "@/lib/task-engine-config"
 import { getUpcomingRunDates, normalizeExecutionHistory } from "@/lib/task-plans"
 import {
@@ -17,6 +18,16 @@ export async function GET(request: NextRequest) {
     const session = await auth()
     if (!session?.user?.id) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
+    }
+
+    const { success, retryAfterSeconds } = rateLimitByUser(
+      session.user.id,
+      "tasks-list",
+      30,
+      60_000
+    )
+    if (!success) {
+      return rateLimitResponse(retryAfterSeconds)
     }
 
     const scope = request.nextUrl.searchParams.get("scope") ?? "ongoing"

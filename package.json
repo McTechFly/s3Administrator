@@ -10,7 +10,7 @@
     "build": "node scripts/next-with-env.mjs build",
     "start": "node scripts/next-with-env.mjs start",
     "task-worker": "tsx src/worker/task-worker.ts",
-    "lint": "node scripts/validate-no-private-deps.mjs && node scripts/ensure-edition-stubs.mjs && eslint",
+    "lint": "node scripts/validate-no-private-deps.mjs && node scripts/validate-no-cloud-imports.mjs && node scripts/ensure-edition-stubs.mjs && eslint",
     "validate:edition-sync": "node scripts/validate-edition-sync.mjs",
     "validate:no-private-deps": "node scripts/validate-no-private-deps.mjs"
   },

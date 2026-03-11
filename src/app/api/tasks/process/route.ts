@@ -8,9 +8,11 @@ import {
   GetObjectCommand,
   HeadObjectCommand,
   type S3Client,
+  UploadPartCommand,
   UploadPartCopyCommand,
 } from "@aws-sdk/client-s3"
 import { Upload } from "@aws-sdk/lib-storage"
+import { PassThrough, Transform, type TransformCallback } from "node:stream"
 import { Prisma } from "@prisma/client"
 import { auth } from "@/lib/auth"
 import { prisma } from "@/lib/db"
@@ -35,6 +37,12 @@ import {
   getTaskTransferPreferServerCopySameBackend,
   getTaskTransferRelayPartSizeMb,
   getTaskTransferRelayQueueSize,
+  getTaskTransferItemRetryMaxAttempts,
+  getTaskTransferItemRetryBaseDelayMs,
+  getTaskTransferVerifyChecksum,
+  getTaskTransferBandwidthLimitMbps,
+  getTaskTransferParallelChunkedDownloadThresholdMb,
+  getTaskTransferParallelDownloadStreams,
   getTaskWorkerUserBudgetMs,
 } from "@/lib/task-engine-config"
 import {
@@ -50,7 +58,7 @@ import {
 import { isDestinationUpToDateForSync } from "@/lib/transfer-delta"
 
 export const runtime = "nodejs"
-export const maxDuration = 60
+export const maxDuration = 300
 
 const LOCK_SECONDS = 45
 const SYNC_POLL_INTERVAL_SECONDS = 60
@@ -64,6 +72,18 @@ const MAX_MULTIPART_PARTS = 10_000
 const MAX_RELAY_BUFFERED_BYTES = 512 * ONE_MEBIBYTE_BYTES
 const SINGLE_REQUEST_COPY_MAX_BYTES = BigInt(5 * 1024 * 1024 * 1024)
 const TRANSFER_PROGRESS_MILESTONES = [25, 50, 75, 90, 100] as const
+const TRANSIENT_S3_ERROR_CODES = new Set([
+  "SlowDown",
+  "ServiceUnavailable",
+  "InternalError",
+  "RequestTimeout",
+  "RequestTimeTooSkewed",
+  "OperationAborted",
+  "500",
+  "502",
+  "503",
+  "504",
+])
 
 interface BulkDeleteTaskPayload {
   query: string
@@ -666,6 +686,154 @@ function isCopyAuthFallbackError(error: unknown): boolean {
     message.includes("authorization") ||
     message.includes("signature")
   )
+}
+
+function isTransientS3Error(error: unknown): boolean {
+  const code = getS3ErrorCode(error)
+  if (TRANSIENT_S3_ERROR_CODES.has(code)) return true
+
+  if (error && typeof error === "object") {
+    const candidate = error as { $metadata?: { httpStatusCode?: unknown } }
+    const status = candidate.$metadata?.httpStatusCode
+    if (typeof status === "number" && (status === 429 || status >= 500)) return true
+  }
+
+  if (error instanceof Error) {
+    const message = error.message.toLowerCase()
+    if (
+      message.includes("econnreset") ||
+      message.includes("econnrefused") ||
+      message.includes("etimedout") ||
+      message.includes("epipe") ||
+      message.includes("socket hang up") ||
+      message.includes("network")
+    ) {
+      return true
+    }
+  }
+
+  return false
+}
+
+function computeRetryDelayMs(attempt: number, baseDelayMs: number): number {
+  const delay = baseDelayMs * Math.pow(2, attempt)
+  const jitter = delay * 0.2 * Math.random()
+  return Math.floor(delay + jitter)
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+class BandwidthThrottleTransform extends Transform {
+  private readonly bytesPerSecond: number
+  private tokenBucket: number
+  private lastRefillTime: number
+
+  constructor(bytesPerSecond: number) {
+    super()
+    this.bytesPerSecond = bytesPerSecond
+    this.tokenBucket = bytesPerSecond
+    this.lastRefillTime = Date.now()
+  }
+
+  _transform(chunk: Buffer, _encoding: BufferEncoding, callback: TransformCallback): void {
+    void this._throttledWrite(chunk, callback)
+  }
+
+  private async _throttledWrite(chunk: Buffer, callback: TransformCallback): Promise<void> {
+    let offset = 0
+    while (offset < chunk.length) {
+      this.refillTokens()
+      if (this.tokenBucket <= 0) {
+        await sleep(50)
+        continue
+      }
+      const bytesToSend = Math.min(chunk.length - offset, Math.floor(this.tokenBucket))
+      this.tokenBucket -= bytesToSend
+      this.push(chunk.subarray(offset, offset + bytesToSend))
+      offset += bytesToSend
+    }
+    callback()
+  }
+
+  private refillTokens(): void {
+    const now = Date.now()
+    const elapsed = (now - this.lastRefillTime) / 1000
+    this.lastRefillTime = now
+    this.tokenBucket = Math.min(
+      this.bytesPerSecond,
+      this.tokenBucket + elapsed * this.bytesPerSecond
+    )
+  }
+}
+
+function createThrottledStream(
+  source: NodeJS.ReadableStream,
+  bandwidthLimitMbps: number
+): NodeJS.ReadableStream {
+  if (bandwidthLimitMbps <= 0) return source
+  const bytesPerSecond = bandwidthLimitMbps * 1024 * 1024
+  const throttle = new BandwidthThrottleTransform(bytesPerSecond)
+  return (source as import("stream").Readable).pipe(throttle)
+}
+
+async function parallelChunkedDownload(params: {
+  sourceClient: S3Client
+  sourceBucket: string
+  sourceKey: string
+  totalBytes: bigint
+  streams: number
+  onProgress?: (downloadedBytes: bigint) => void
+}): Promise<NodeJS.ReadableStream> {
+  const { sourceClient, sourceBucket, sourceKey, totalBytes, streams } = params
+  const chunkSize = totalBytes / BigInt(streams)
+  const passThrough = new PassThrough()
+
+  const ranges: Array<{ start: bigint; end: bigint }> = []
+  for (let i = 0; i < streams; i++) {
+    const start = chunkSize * BigInt(i)
+    const end = i === streams - 1 ? totalBytes - BigInt(1) : start + chunkSize - BigInt(1)
+    ranges.push({ start, end })
+  }
+
+  // Download chunks sequentially and pipe in order to preserve byte order,
+  // but fetch the next chunk header concurrently with the current stream.
+  void (async () => {
+    let totalDownloaded = BigInt(0)
+    try {
+      for (const range of ranges) {
+        const response = await sourceClient.send(
+          new GetObjectCommand({
+            Bucket: sourceBucket,
+            Key: sourceKey,
+            Range: `bytes=${range.start.toString()}-${range.end.toString()}`,
+          })
+        )
+        if (!response.Body) {
+          throw new Error(`Missing body for range ${range.start}-${range.end}`)
+        }
+        const readable = response.Body as import("stream").Readable
+        await new Promise<void>((resolve, reject) => {
+          readable.on("data", (chunk: Buffer) => {
+            totalDownloaded += BigInt(chunk.length)
+            params.onProgress?.(totalDownloaded)
+            if (!passThrough.write(chunk)) {
+              readable.pause()
+              passThrough.once("drain", () => readable.resume())
+            }
+          })
+          readable.on("end", resolve)
+          readable.on("error", reject)
+        })
+      }
+      passThrough.end()
+    } catch (error) {
+      passThrough.destroy(error instanceof Error ? error : new Error(String(error)))
+    }
+  })()
+
+  return passThrough
 }
 
 function isSameS3Backend(params: {
@@ -1292,49 +1460,161 @@ async function copyObjectAcrossLocations(params: {
   ): Promise<void> {
     await emitStage(strategy, "copying")
 
-    const sourceObject = await params.sourceClient.send(
-      new GetObjectCommand({
-        Bucket: params.sourceBucket,
-        Key: params.sourceKey,
-      })
-    )
+    const bandwidthLimitMbps = getTaskTransferBandwidthLimitMbps()
+    const parallelDownloadThresholdBytes =
+      BigInt(getTaskTransferParallelChunkedDownloadThresholdMb()) * ONE_MEBIBYTE_BIGINT
+    const parallelDownloadStreams = getTaskTransferParallelDownloadStreams()
 
-    if (!sourceObject.Body) {
-      throw new Error(`Missing source object body for key '${params.sourceKey}'`)
+    // Determine source size from head or expected content length
+    const headDetails = await readSourceObjectHeadDetails({
+      sourceClient: params.sourceClient,
+      sourceBucket: params.sourceBucket,
+      sourceKey: params.sourceKey,
+      expectedContentLength: params.expectedContentLength,
+    })
+    const totalBytes = headDetails.sizeBytes ?? sourceSizeBytes
+    const contentLength = totalBytes !== null ? Number(totalBytes) : null
+
+    // Choose download method: parallel chunked for large files, streaming for others
+    const useParallelDownload =
+      parallelDownloadThresholdBytes > BigInt(0) &&
+      totalBytes !== null &&
+      totalBytes >= parallelDownloadThresholdBytes &&
+      parallelDownloadStreams > 1
+
+    let sourceBody: NodeJS.ReadableStream
+
+    if (useParallelDownload && totalBytes !== null) {
+      sourceBody = await parallelChunkedDownload({
+        sourceClient: params.sourceClient,
+        sourceBucket: params.sourceBucket,
+        sourceKey: params.sourceKey,
+        totalBytes,
+        streams: parallelDownloadStreams,
+      })
+    } else {
+      const sourceObject = await params.sourceClient.send(
+        new GetObjectCommand({
+          Bucket: params.sourceBucket,
+          Key: params.sourceKey,
+        })
+      )
+      if (!sourceObject.Body) {
+        throw new Error(`Missing source object body for key '${params.sourceKey}'`)
+      }
+      sourceBody = sourceObject.Body as unknown as NodeJS.ReadableStream
     }
 
-    const contentLength =
-      toValidContentLength(sourceObject.ContentLength) ??
-      toValidContentLength(params.expectedContentLength)
-    const totalBytes = contentLength === null ? sourceSizeBytes : BigInt(contentLength)
+    // Apply bandwidth throttling if configured
+    const throttledBody = createThrottledStream(sourceBody, bandwidthLimitMbps)
 
-    const upload = new Upload({
-      client: params.destinationClient,
-      params: {
+    // Start a resumable multipart upload manually so we can track and resume
+    const createResponse = await params.destinationClient.send(
+      new CreateMultipartUploadCommand({
         Bucket: params.destinationBucket,
         Key: params.destinationKey,
-        Body: sourceObject.Body,
-        ContentType: sourceObject.ContentType,
-        CacheControl: sourceObject.CacheControl,
-        ...(contentLength !== null ? { ContentLength: contentLength } : {}),
-      },
-      queueSize: relayQueueSize,
-      partSize: relayPartSizeBytes,
-      leavePartsOnError: false,
-    })
+        ...(headDetails.contentType ? { ContentType: headDetails.contentType } : {}),
+        ...(headDetails.cacheControl ? { CacheControl: headDetails.cacheControl } : {}),
+      })
+    )
+    const uploadId = createResponse.UploadId
+    if (!uploadId) {
+      throw new Error(`Failed to start multipart relay upload for key '${params.destinationKey}'`)
+    }
 
-    upload.on("httpUploadProgress", (progressEvent) => {
-      const loaded =
-        typeof progressEvent.loaded === "number" && Number.isFinite(progressEvent.loaded)
-          ? BigInt(Math.max(0, Math.floor(progressEvent.loaded)))
-          : null
-      if (loaded === null) return
-      void emitProgress(strategy, loaded, totalBytes, "copying")
-    })
+    try {
+      const partSize = relayPartSizeBytes
+      const completedParts: Array<{ ETag: string; PartNumber: number }> = []
+      let partNumber = 1
+      let uploadedBytes = BigInt(0)
 
-    await upload.done()
-    if (totalBytes !== null) {
-      await emitProgress(strategy, totalBytes, totalBytes, "finalizing")
+      // Read the source stream in partSize chunks and upload each part
+      const readable = throttledBody as import("stream").Readable
+      let currentBuffer = Buffer.alloc(0)
+
+      const uploadPart = async (body: Buffer, partNum: number): Promise<void> => {
+        const response = await params.destinationClient.send(
+          new UploadPartCommand({
+            Bucket: params.destinationBucket,
+            Key: params.destinationKey,
+            UploadId: uploadId,
+            PartNumber: partNum,
+            Body: body,
+            ContentLength: body.length,
+          })
+        )
+        const etag = response.ETag
+        if (!etag) {
+          throw new Error(`Relay upload part ${partNum} did not return an ETag`)
+        }
+        completedParts.push({ ETag: etag, PartNumber: partNum })
+        uploadedBytes += BigInt(body.length)
+        void emitProgress(strategy, uploadedBytes, totalBytes, "copying")
+      }
+
+      // Collect concurrent uploads up to relayQueueSize
+      const uploadQueue: Promise<void>[] = []
+
+      for await (const chunk of readable) {
+        currentBuffer = Buffer.concat([currentBuffer, chunk as Buffer])
+
+        while (currentBuffer.length >= partSize) {
+          const partBody = currentBuffer.subarray(0, partSize)
+          currentBuffer = currentBuffer.subarray(partSize)
+          const currentPartNumber = partNumber++
+
+          const uploadPromise = uploadPart(Buffer.from(partBody), currentPartNumber)
+          uploadQueue.push(uploadPromise)
+
+          if (uploadQueue.length >= relayQueueSize) {
+            await Promise.all(uploadQueue)
+            uploadQueue.length = 0
+          }
+        }
+      }
+
+      // Upload remaining data as the final part
+      if (currentBuffer.length > 0) {
+        const currentPartNumber = partNumber++
+        const uploadPromise = uploadPart(Buffer.from(currentBuffer), currentPartNumber)
+        uploadQueue.push(uploadPromise)
+      }
+
+      // Wait for remaining uploads
+      if (uploadQueue.length > 0) {
+        await Promise.all(uploadQueue)
+      }
+
+      if (completedParts.length === 0) {
+        // Edge case: empty file — upload a single empty part
+        await uploadPart(Buffer.alloc(0), 1)
+      }
+
+      completedParts.sort((a, b) => a.PartNumber - b.PartNumber)
+
+      await emitStage(strategy, "finalizing")
+      await params.destinationClient.send(
+        new CompleteMultipartUploadCommand({
+          Bucket: params.destinationBucket,
+          Key: params.destinationKey,
+          UploadId: uploadId,
+          MultipartUpload: { Parts: completedParts },
+        })
+      )
+
+      if (totalBytes !== null) {
+        await emitProgress(strategy, totalBytes, totalBytes, "finalizing")
+      }
+    } catch (error) {
+      // Abort the multipart upload on failure to avoid orphaned parts
+      await params.destinationClient.send(
+        new AbortMultipartUploadCommand({
+          Bucket: params.destinationBucket,
+          Key: params.destinationKey,
+          UploadId: uploadId,
+        })
+      ).catch(() => {})
+      throw error
     }
   }
 
@@ -1495,7 +1775,32 @@ async function copyObjectAcrossLocations(params: {
     }
   }
 
+  async function verifyPostCopyIntegrity(): Promise<void> {
+    if (!getTaskTransferVerifyChecksum()) return
+    if (sourceSizeBytes === null) return
+
+    const destSnapshot = await readRemoteObjectSnapshot({
+      client: params.destinationClient,
+      bucket: params.destinationBucket,
+      key: params.destinationKey,
+    })
+
+    if (!destSnapshot) {
+      throw new Error(
+        `Post-copy verification failed: destination object '${params.destinationKey}' not found`
+      )
+    }
+
+    if (destSnapshot.size !== null && destSnapshot.size !== sourceSizeBytes) {
+      throw new Error(
+        `Post-copy verification failed: size mismatch for '${params.destinationKey}' ` +
+        `(source=${sourceSizeBytes.toString()}, destination=${destSnapshot.size.toString()})`
+      )
+    }
+  }
+
   const complete = async (strategy: TransferStrategy) => {
+    await verifyPostCopyIntegrity()
     await emitStage(strategy, "completed")
     await emitFinish(strategy, "completed")
   }
@@ -3152,56 +3457,80 @@ export async function POST(request: Request) {
           actionable.push(item)
         }
 
+        const retryMaxAttempts = getTaskTransferItemRetryMaxAttempts()
+        const retryBaseDelayMs = getTaskTransferItemRetryBaseDelayMs()
+
         let results = await Promise.all(
           actionable.map(async (item): Promise<TransferItemResult> => {
-            try {
-              await copyObjectAcrossLocations({
-                sourceClient,
-                destinationClient,
-                sameCredential,
-                sourceEndpoint: sourceClientInfo.credential.endpoint,
-                destinationEndpoint: destinationClientInfo.credential.endpoint,
-                sourceRegion: sourceClientInfo.credential.region,
-                destinationRegion: destinationClientInfo.credential.region,
-                sourceProvider: sourceClientInfo.credential.provider,
-                destinationProvider: destinationClientInfo.credential.provider,
-                sourceBucket: activeTransferPayload.sourceBucket,
-                sourceKey: item.sourceFile.key,
-                destinationBucket: activeTransferPayload.destinationBucket,
-                destinationKey: item.destinationKey,
-                expectedContentLength: item.sourceFile.size,
-                telemetry: transferTelemetryHooks,
-              })
+            let lastError: unknown = null
 
-              return {
-                status: "copied",
-                sourceId: item.sourceFile.id,
-                sourceKey: item.sourceFile.key,
-                destinationKey: item.destinationKey,
-                extension: item.sourceFile.extension,
-                size: item.sourceFile.size,
-                lastModified: item.sourceFile.lastModified,
-                createsNewDestination: item.createsNewDestination,
-                sourceDeleteRequired:
-                  activeTransferPayload.operation === "move" ||
-                  activeTransferPayload.operation === "migrate",
-                errorMessage: null,
+            for (let attempt = 0; attempt <= retryMaxAttempts; attempt++) {
+              try {
+                if (attempt > 0) {
+                  const delay = computeRetryDelayMs(attempt - 1, retryBaseDelayMs)
+                  await sleep(delay)
+                }
+
+                await copyObjectAcrossLocations({
+                  sourceClient,
+                  destinationClient,
+                  sameCredential,
+                  sourceEndpoint: sourceClientInfo.credential.endpoint,
+                  destinationEndpoint: destinationClientInfo.credential.endpoint,
+                  sourceRegion: sourceClientInfo.credential.region,
+                  destinationRegion: destinationClientInfo.credential.region,
+                  sourceProvider: sourceClientInfo.credential.provider,
+                  destinationProvider: destinationClientInfo.credential.provider,
+                  sourceBucket: activeTransferPayload.sourceBucket,
+                  sourceKey: item.sourceFile.key,
+                  destinationBucket: activeTransferPayload.destinationBucket,
+                  destinationKey: item.destinationKey,
+                  expectedContentLength: item.sourceFile.size,
+                  telemetry: transferTelemetryHooks,
+                })
+
+                return {
+                  status: "copied",
+                  sourceId: item.sourceFile.id,
+                  sourceKey: item.sourceFile.key,
+                  destinationKey: item.destinationKey,
+                  extension: item.sourceFile.extension,
+                  size: item.sourceFile.size,
+                  lastModified: item.sourceFile.lastModified,
+                  createsNewDestination: item.createsNewDestination,
+                  sourceDeleteRequired:
+                    activeTransferPayload.operation === "move" ||
+                    activeTransferPayload.operation === "migrate",
+                  errorMessage: null,
+                }
+              } catch (itemError) {
+                lastError = itemError
+
+                // Don't retry non-transient errors or missing source
+                if (isS3MissingObjectError(itemError) || !isTransientS3Error(itemError)) {
+                  break
+                }
+
+                // Don't retry if we've exhausted attempts
+                if (attempt >= retryMaxAttempts) {
+                  break
+                }
               }
-            } catch (itemError) {
-              const errorCode = getS3ErrorCode(itemError)
-              const errorMessage = formatTaskProcessingError(itemError)
-              return {
-                status: errorCode === "NoSuchKey" ? "missing_source" : "failed",
-                sourceId: item.sourceFile.id,
-                sourceKey: item.sourceFile.key,
-                destinationKey: item.destinationKey,
-                extension: item.sourceFile.extension,
-                size: item.sourceFile.size,
-                lastModified: item.sourceFile.lastModified,
-                createsNewDestination: item.createsNewDestination,
-                sourceDeleteRequired: false,
-                errorMessage,
-              }
+            }
+
+            const errorCode = getS3ErrorCode(lastError)
+            const errorMessage = formatTaskProcessingError(lastError)
+            return {
+              status: errorCode === "NoSuchKey" ? "missing_source" : "failed",
+              sourceId: item.sourceFile.id,
+              sourceKey: item.sourceFile.key,
+              destinationKey: item.destinationKey,
+              extension: item.sourceFile.extension,
+              size: item.sourceFile.size,
+              lastModified: item.sourceFile.lastModified,
+              createsNewDestination: item.createsNewDestination,
+              sourceDeleteRequired: false,
+              errorMessage,
             }
           })
         )

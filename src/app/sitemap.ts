@@ -23,7 +23,9 @@ export default function sitemap(): MetadataRoute.Sitemap {
 
   const landingPages: MetadataRoute.Sitemap = seoLandingPages.map((page) => ({
     url: absoluteUrl(`/${page.category}/${page.slug}`),
-    lastModified: new Date(page.updatedAt),
+    ...("updatedAt" in page && page.updatedAt
+      ? { lastModified: new Date(page.updatedAt as string) }
+      : {}),
     changeFrequency: "weekly",
     priority: 0.7,
   }))

@@ -11,6 +11,10 @@ export function QueryProvider({ children }: { children: React.ReactNode }) {
           queries: {
             staleTime: 30 * 1000,
             refetchOnWindowFocus: false,
+            retry: (failureCount, error) => {
+              if (error instanceof Error && error.message.includes("429")) return false
+              return failureCount < 2
+            },
           },
         },
       })

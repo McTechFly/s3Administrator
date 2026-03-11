@@ -507,9 +507,9 @@ export default function TasksPage() {
     refetchInterval: (query) => {
       const data = query.state.data as { tasks?: TaskRow[] } | undefined
       const hasInProgressTask = (data?.tasks ?? []).some((task) => task.status === "in_progress")
-      return hasInProgressTask ? 2_500 : 10_000
+      return hasInProgressTask ? 5_000 : 15_000
     },
-    refetchIntervalInBackground: true,
+    refetchIntervalInBackground: false,
   })
 
   const availableOperations = scope === "folder" ? FOLDER_OPERATIONS : BUCKET_OPERATIONS
@@ -925,7 +925,7 @@ export default function TasksPage() {
           // Ignore transient poll errors in background refresh.
         }
       })()
-    }, 2_500)
+    }, 5_000)
 
     return () => {
       window.clearInterval(intervalId)

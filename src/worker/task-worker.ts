@@ -36,13 +36,22 @@ async function processUserOnce(userId: string, workerId: string, type?: string) 
   const url = `${baseUrl}/api/tasks/process?userId=${encodeURIComponent(userId)}${typeParam}`
 
   const startedAt = new Date()
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "x-task-engine-token": token,
-    },
-    redirect: "manual",
-  })
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), 5 * 60 * 1000)
+
+  let response: Response
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "x-task-engine-token": token,
+      },
+      redirect: "manual",
+      signal: controller.signal,
+    })
+  } finally {
+    clearTimeout(timeoutId)
+  }
   const finishedAt = new Date()
 
   if (response.status >= 300 && response.status < 400) {

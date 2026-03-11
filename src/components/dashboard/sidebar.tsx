@@ -29,7 +29,7 @@ import { cn } from "@/lib/utils"
 import { ThemeSwitcher } from "@/components/theme-switcher"
 import { BucketSettingsSheet } from "@/components/dashboard/bucket-settings-sheet"
 import { SidebarBucketList } from "@/components/dashboard/sidebar-bucket-list"
-import { OrgSwitcher } from "@s3administrator/cloud/teams/components/org-switcher"
+import { OrgSwitcher } from "@/lib/org-switcher"
 import { Building2, Users } from "lucide-react"
 
 interface BucketStatsItem {

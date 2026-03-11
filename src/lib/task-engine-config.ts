@@ -94,6 +94,30 @@ export function getTaskTransferProgressMaxEventsPerFile(): number {
   return parseIntegerEnv(process.env.TASK_TRANSFER_PROGRESS_MAX_EVENTS_PER_FILE, 200, 10, 2_000)
 }
 
+export function getTaskTransferItemRetryMaxAttempts(): number {
+  return parseIntegerEnv(process.env.TASK_TRANSFER_ITEM_RETRY_MAX_ATTEMPTS, 3, 0, 10)
+}
+
+export function getTaskTransferItemRetryBaseDelayMs(): number {
+  return parseIntegerEnv(process.env.TASK_TRANSFER_ITEM_RETRY_BASE_DELAY_MS, 1_000, 100, 30_000)
+}
+
+export function getTaskTransferVerifyChecksum(): boolean {
+  return parseBooleanEnv(process.env.TASK_TRANSFER_VERIFY_CHECKSUM, true)
+}
+
+export function getTaskTransferBandwidthLimitMbps(): number {
+  return parseIntegerEnv(process.env.TASK_TRANSFER_BANDWIDTH_LIMIT_MBPS, 0, 0, 10_000)
+}
+
+export function getTaskTransferParallelChunkedDownloadThresholdMb(): number {
+  return parseIntegerEnv(process.env.TASK_TRANSFER_PARALLEL_DOWNLOAD_THRESHOLD_MB, 512, 0, 102_400)
+}
+
+export function getTaskTransferParallelDownloadStreams(): number {
+  return parseIntegerEnv(process.env.TASK_TRANSFER_PARALLEL_DOWNLOAD_STREAMS, 4, 1, 16)
+}
+
 export function getTaskBulkDeleteBatchSize(): number {
   return parseIntegerEnv(process.env.TASK_BULK_DELETE_BATCH_SIZE, 1_000, 100, 5_000)
 }

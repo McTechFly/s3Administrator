@@ -23,7 +23,7 @@ RUN --mount=type=cache,target=/root/.npm set -e; \
       npm install --no-save --no-package-lock "https://codeload.github.com/s3administrator/community-setup/tar.gz/refs/heads/main"; \
     fi; \
     if [ "$env_upper" = "CLOUD" ]; then \
-      npm install --no-save --no-package-lock "@s3administrator/cloud@1.6.4"; \
+      npm install --no-save --no-package-lock "@s3administrator/cloud@1.6.6"; \
     fi; \
     rm -f .npmrc
 
