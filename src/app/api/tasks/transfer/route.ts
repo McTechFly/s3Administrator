@@ -43,16 +43,24 @@ type TransferPreviewPhase = "source" | "cleanup" | "done"
 
 interface TransferTaskDetailedPreviewAction {
   phase: "transfer" | "sync_cleanup"
-  operation: "copy" | "delete_source" | "delete_destination"
+  operation: "copy" | "skip" | "delete_source" | "delete_destination"
   command: string
   sourceKey: string | null
   destinationKey: string | null
+  reason?: string
 }
 
 interface TransferTaskDetailedPreviewCursor {
   phase: "source" | "cleanup"
   sourceKey: string | null
   cleanupKey: string | null
+}
+
+interface TransferTaskDetailedPreviewActionCounts {
+  copy: number
+  skip: number
+  delete_source: number
+  delete_destination: number
 }
 
 interface TransferTaskDetailedPreviewPlan {
@@ -62,6 +70,8 @@ interface TransferTaskDetailedPreviewPlan {
   pageSize: number
   scannedSourceObjects: number
   scanLimitReached: boolean
+  actionCounts: TransferTaskDetailedPreviewActionCounts
+  totalCounts: TransferTaskDetailedPreviewActionCounts | null
 }
 
 interface DestinationMetadataPreviewRow {
@@ -185,6 +195,36 @@ function buildDeleteDestinationAction(params: {
   }
 }
 
+function buildSkipAction(params: {
+  sourceBucket: string
+  sourceKey: string
+  destinationBucket: string
+  destinationKey: string
+  reason: string
+}): TransferTaskDetailedPreviewAction {
+  return {
+    phase: "transfer",
+    operation: "skip",
+    command: `SKIP ${buildObjectPath(params.sourceBucket, params.sourceKey)} -> ${buildObjectPath(params.destinationBucket, params.destinationKey)} (${params.reason})`,
+    sourceKey: params.sourceKey,
+    destinationKey: params.destinationKey,
+    reason: params.reason,
+  }
+}
+
+function emptyActionCounts(): TransferTaskDetailedPreviewActionCounts {
+  return { copy: 0, skip: 0, delete_source: 0, delete_destination: 0 }
+}
+
+function incrementActionCount(
+  counts: TransferTaskDetailedPreviewActionCounts,
+  operation: TransferTaskDetailedPreviewAction["operation"]
+) {
+  if (operation in counts) {
+    counts[operation as keyof TransferTaskDetailedPreviewActionCounts]++
+  }
+}
+
 async function findSyncDestinationDriftPreviewBatch(params: {
   userId: string
   scope: TransferScope
@@ -246,6 +286,172 @@ async function findSyncDestinationDriftPreviewBatch(params: {
   `)
 }
 
+async function computeTransferPreviewTotalCounts(params: {
+  userId: string
+  scope: TransferScope
+  operation: TransferOperation
+  sourceCredentialId: string
+  sourceBucket: string
+  sourcePrefix: string
+  destinationCredentialId: string
+  destinationBucket: string
+  destinationPrefix: string
+}): Promise<TransferTaskDetailedPreviewActionCounts> {
+  const counts = emptyActionCounts()
+
+  const requiresDestinationComparison =
+    params.operation === "copy" || params.operation === "sync"
+
+  // Count source-phase actions (copy vs skip) by scanning all source files
+  let cursor: string | null = null
+  const BATCH_SIZE = 2000
+
+  while (true) {
+    const sourceKeyFilter: { startsWith?: string; gt?: string } = {}
+    if (params.scope === "folder" && params.sourcePrefix) {
+      sourceKeyFilter.startsWith = params.sourcePrefix
+    }
+    if (cursor) {
+      sourceKeyFilter.gt = cursor
+    }
+
+    const sourceRows = await prisma.fileMetadata.findMany({
+      where: {
+        userId: params.userId,
+        credentialId: params.sourceCredentialId,
+        bucket: params.sourceBucket,
+        isFolder: false,
+        ...(Object.keys(sourceKeyFilter).length > 0 ? { key: sourceKeyFilter } : {}),
+      },
+      orderBy: { key: "asc" },
+      take: BATCH_SIZE,
+      select: { key: true, size: true, lastModified: true },
+    })
+
+    if (sourceRows.length === 0) break
+
+    if (requiresDestinationComparison) {
+      const destinationKeys = sourceRows.map((row) =>
+        mapTransferPreviewDestinationKey({
+          scope: params.scope,
+          sourcePrefix: params.sourcePrefix,
+          destinationPrefix: params.destinationPrefix,
+          sourceKey: row.key,
+        })
+      )
+
+      const destinationRows = await prisma.fileMetadata.findMany({
+        where: {
+          userId: params.userId,
+          credentialId: params.destinationCredentialId,
+          bucket: params.destinationBucket,
+          isFolder: false,
+          key: { in: destinationKeys },
+        },
+        select: { key: true, size: true, lastModified: true },
+      })
+      const destByKey = new Map(destinationRows.map((r) => [r.key, r]))
+
+      for (const sourceRow of sourceRows) {
+        const destKey = mapTransferPreviewDestinationKey({
+          scope: params.scope,
+          sourcePrefix: params.sourcePrefix,
+          destinationPrefix: params.destinationPrefix,
+          sourceKey: sourceRow.key,
+        })
+        const destRow = destByKey.get(destKey)
+
+        if (params.operation === "copy") {
+          if (destRow) {
+            counts.skip++
+          } else {
+            counts.copy++
+          }
+        } else {
+          // sync
+          const shouldCopy =
+            !destRow || !isDestinationUpToDateForSync(sourceRow, destRow)
+          if (shouldCopy) {
+            counts.copy++
+          } else {
+            counts.skip++
+          }
+        }
+      }
+    } else {
+      // move / migrate — all source files are copied + deleted
+      counts.copy += sourceRows.length
+      counts.delete_source += sourceRows.length
+    }
+
+    cursor = sourceRows[sourceRows.length - 1].key
+    if (sourceRows.length < BATCH_SIZE) break
+  }
+
+  // Count sync cleanup (destination-only drift)
+  if (params.operation === "sync") {
+    const driftCount = await countSyncDestinationDrift(params)
+    counts.delete_destination = driftCount
+  }
+
+  return counts
+}
+
+async function countSyncDestinationDrift(params: {
+  userId: string
+  scope: TransferScope
+  sourceCredentialId: string
+  sourceBucket: string
+  sourcePrefix: string
+  destinationCredentialId: string
+  destinationBucket: string
+  destinationPrefix: string
+}): Promise<number> {
+  if (params.scope === "bucket") {
+    const result = await prisma.$queryRaw<[{ count: bigint }]>(Prisma.sql`
+      SELECT COUNT(*)::bigint as count
+      FROM "FileMetadata" d
+      WHERE d."userId" = ${params.userId}
+        AND d."credentialId" = ${params.destinationCredentialId}
+        AND d."bucket" = ${params.destinationBucket}
+        AND d."isFolder" = false
+        AND NOT EXISTS (
+          SELECT 1
+          FROM "FileMetadata" s
+          WHERE s."userId" = ${params.userId}
+            AND s."credentialId" = ${params.sourceCredentialId}
+            AND s."bucket" = ${params.sourceBucket}
+            AND s."isFolder" = false
+            AND s."key" = d."key"
+        )
+    `)
+    return Number(result[0]?.count ?? 0)
+  }
+
+  const destinationPrefixLength = params.destinationPrefix.length
+  const substringStart = destinationPrefixLength + 1
+
+  const result = await prisma.$queryRaw<[{ count: bigint }]>(Prisma.sql`
+    SELECT COUNT(*)::bigint as count
+    FROM "FileMetadata" d
+    WHERE d."userId" = ${params.userId}
+      AND d."credentialId" = ${params.destinationCredentialId}
+      AND d."bucket" = ${params.destinationBucket}
+      AND d."isFolder" = false
+      AND LEFT(d."key", ${destinationPrefixLength}) = ${params.destinationPrefix}
+      AND NOT EXISTS (
+        SELECT 1
+        FROM "FileMetadata" s
+        WHERE s."userId" = ${params.userId}
+          AND s."credentialId" = ${params.sourceCredentialId}
+          AND s."bucket" = ${params.sourceBucket}
+          AND s."isFolder" = false
+          AND s."key" = ${params.sourcePrefix} || substring(d."key" from ${substringStart})
+      )
+  `)
+  return Number(result[0]?.count ?? 0)
+}
+
 async function buildTransferDetailedPreviewPlan(params: {
   userId: string
   scope: TransferScope
@@ -260,6 +466,7 @@ async function buildTransferDetailedPreviewPlan(params: {
   cursor: TransferTaskDetailedPreviewCursor
 }): Promise<TransferTaskDetailedPreviewPlan> {
   const actions: TransferTaskDetailedPreviewAction[] = []
+  const actionCounts = emptyActionCounts()
   let scannedSourceObjects = 0
   let scanLimitReached = false
   let phase: TransferPreviewPhase = params.cursor.phase
@@ -383,6 +590,16 @@ async function buildTransferDetailedPreviewPlan(params: {
               destinationKey,
             })
           )
+        } else {
+          rowActions.push(
+            buildSkipAction({
+              sourceBucket: params.sourceBucket,
+              sourceKey: sourceRow.key,
+              destinationBucket: params.destinationBucket,
+              destinationKey,
+              reason: "already_exists",
+            })
+          )
         }
       } else {
         const shouldCopy =
@@ -395,6 +612,16 @@ async function buildTransferDetailedPreviewPlan(params: {
               sourceKey: sourceRow.key,
               destinationBucket: params.destinationBucket,
               destinationKey,
+            })
+          )
+        } else {
+          rowActions.push(
+            buildSkipAction({
+              sourceBucket: params.sourceBucket,
+              sourceKey: sourceRow.key,
+              destinationBucket: params.destinationBucket,
+              destinationKey,
+              reason: "up_to_date",
             })
           )
         }
@@ -410,6 +637,9 @@ async function buildTransferDetailedPreviewPlan(params: {
       }
 
       if (rowActions.length > 0) {
+        for (const action of rowActions) {
+          incrementActionCount(actionCounts, action.operation)
+        }
         actions.push(...rowActions)
       }
       sourceCursor = sourceRow.key
@@ -460,12 +690,12 @@ async function buildTransferDetailedPreviewPlan(params: {
     }
 
     for (const row of cleanupRows) {
-      actions.push(
-        buildDeleteDestinationAction({
-          destinationBucket: params.destinationBucket,
-          destinationKey: row.key,
-        })
-      )
+      const action = buildDeleteDestinationAction({
+        destinationBucket: params.destinationBucket,
+        destinationKey: row.key,
+      })
+      incrementActionCount(actionCounts, action.operation)
+      actions.push(action)
       cleanupCursor = row.key
     }
 
@@ -490,6 +720,8 @@ async function buildTransferDetailedPreviewPlan(params: {
       pageSize: params.pageSize,
       scannedSourceObjects,
       scanLimitReached,
+      actionCounts,
+      totalCounts: null,
     }
   }
 
@@ -505,6 +737,8 @@ async function buildTransferDetailedPreviewPlan(params: {
       pageSize: params.pageSize,
       scannedSourceObjects,
       scanLimitReached,
+      actionCounts,
+      totalCounts: null,
     }
   }
 
@@ -522,6 +756,8 @@ async function buildTransferDetailedPreviewPlan(params: {
     pageSize: params.pageSize,
     scannedSourceObjects,
     scanLimitReached,
+    actionCounts,
+    totalCounts: null,
   }
 }
 
@@ -553,6 +789,7 @@ function buildTransferPreview(params: {
 }): TransferTaskPreview {
   const isSync = params.operation === "sync"
   const isMoveLike = params.operation === "move" || params.operation === "migrate"
+  const displayCounts = params.detailedPlan.totalCounts ?? params.detailedPlan.actionCounts
 
   const summary = [
     `Operation: ${params.operation.toUpperCase()} (${params.scope === "folder" ? "folder-to-folder" : "bucket-to-bucket"})`,
@@ -563,12 +800,18 @@ function buildTransferPreview(params: {
       ? `Schedule: CRON (${params.scheduleCron}) UTC`
       : "Schedule: one-time run",
   ]
+  if (displayCounts.skip > 0) {
+    summary.push(`Planned skipped actions: ${displayCounts.skip.toLocaleString()}`)
+  }
 
   const commands = [
     "Read source objects from local metadata cache in chunks.",
     "Copy each source object to destination (CopyObject with stream fallback).",
     "Upsert destination metadata and persist checkpoint progress after each chunk.",
   ]
+  if (params.operation === "copy" || params.operation === "sync") {
+    commands.splice(2, 0, "Skip objects already present or up to date at destination.")
+  }
 
   if (isMoveLike) {
     commands.splice(2, 0, "Delete source object after successful copy.")
@@ -810,19 +1053,40 @@ export async function POST(request: NextRequest) {
     })
 
     if (previewOnly) {
-      const detailedPlan = await buildTransferDetailedPreviewPlan({
-        userId: session.user.id,
-        scope,
-        operation,
-        sourceCredentialId: sourceCredential.id,
-        sourceBucket,
-        sourcePrefix: normalizedSourcePrefix,
-        destinationCredentialId: destinationCredential.id,
-        destinationBucket,
-        destinationPrefix: normalizedDestinationPrefix,
-        pageSize: previewLimit,
-        cursor: previewCursor,
-      })
+      const isInitialRequest = isInitialTransferPreviewRequest(previewCursor)
+
+      const [detailedPlan, totalCounts] = await Promise.all([
+        buildTransferDetailedPreviewPlan({
+          userId: session.user.id,
+          scope,
+          operation,
+          sourceCredentialId: sourceCredential.id,
+          sourceBucket,
+          sourcePrefix: normalizedSourcePrefix,
+          destinationCredentialId: destinationCredential.id,
+          destinationBucket,
+          destinationPrefix: normalizedDestinationPrefix,
+          pageSize: previewLimit,
+          cursor: previewCursor,
+        }),
+        isInitialRequest
+          ? computeTransferPreviewTotalCounts({
+            userId: session.user.id,
+            scope,
+            operation,
+            sourceCredentialId: sourceCredential.id,
+            sourceBucket,
+            sourcePrefix: normalizedSourcePrefix,
+            destinationCredentialId: destinationCredential.id,
+            destinationBucket,
+            destinationPrefix: normalizedDestinationPrefix,
+          })
+          : Promise.resolve(null),
+      ])
+
+      if (totalCounts) {
+        detailedPlan.totalCounts = totalCounts
+      }
 
       return NextResponse.json({
         preview: buildTransferPreview({
@@ -876,6 +1140,17 @@ export async function POST(request: NextRequest) {
           failed: 0,
           remaining: sourceCachedFileCount,
           cursorKey: null,
+          currentFileKey: null,
+          currentFileSizeBytes: null,
+          currentFileTransferredBytes: null,
+          currentFileStage: null,
+          transferStrategy: null,
+          fallbackReason: null,
+          bytesProcessedTotal: "0",
+          bytesEstimatedTotal: null,
+          throughputBytesPerSec: null,
+          etaSeconds: null,
+          lastProgressAt: null,
         },
       },
       select: {

@@ -498,6 +498,17 @@ export async function PATCH(
             failed: 0,
             remaining: total,
             cursorKey: null,
+            currentFileKey: null,
+            currentFileSizeBytes: null,
+            currentFileTransferredBytes: null,
+            currentFileStage: null,
+            transferStrategy: null,
+            fallbackReason: null,
+            bytesProcessedTotal: "0",
+            bytesEstimatedTotal: null,
+            throughputBytesPerSec: null,
+            etaSeconds: null,
+            lastProgressAt: null,
           } as Prisma.InputJsonObject,
           executionHistory: retryFailedOnly
             ? ([] as Prisma.InputJsonArray)

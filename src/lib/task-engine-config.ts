@@ -62,6 +62,38 @@ export function getTaskTransferBatchSize(): number {
   return parseIntegerEnv(process.env.TASK_TRANSFER_BATCH_SIZE, community ? 200 : 100, 10, 1_000)
 }
 
+export function getTaskTransferMultipartCopyPartConcurrency(): number {
+  return parseIntegerEnv(process.env.TASK_TRANSFER_MULTIPART_COPY_PART_CONCURRENCY, 8, 1, 32)
+}
+
+export function getTaskTransferRelayQueueSize(): number {
+  return parseIntegerEnv(process.env.TASK_TRANSFER_RELAY_QUEUE_SIZE, 8, 1, 32)
+}
+
+export function getTaskTransferRelayPartSizeMb(): number {
+  return parseIntegerEnv(process.env.TASK_TRANSFER_RELAY_PART_SIZE_MB, 32, 5, 256)
+}
+
+export function getTaskTransferPreferServerCopySameBackend(): boolean {
+  return parseBooleanEnv(process.env.TASK_TRANSFER_PREFER_SERVER_COPY_SAME_BACKEND, true)
+}
+
+export function getTaskTransferProgressMinFileSizeMb(): number {
+  return parseIntegerEnv(process.env.TASK_TRANSFER_PROGRESS_MIN_FILE_SIZE_MB, 100, 1, 102_400)
+}
+
+export function getTaskTransferProgressSampleIntervalMs(): number {
+  return parseIntegerEnv(process.env.TASK_TRANSFER_PROGRESS_SAMPLE_INTERVAL_MS, 2_000, 250, 30_000)
+}
+
+export function getTaskTransferProgressSampleDeltaMb(): number {
+  return parseIntegerEnv(process.env.TASK_TRANSFER_PROGRESS_SAMPLE_DELTA_MB, 64, 1, 1_024)
+}
+
+export function getTaskTransferProgressMaxEventsPerFile(): number {
+  return parseIntegerEnv(process.env.TASK_TRANSFER_PROGRESS_MAX_EVENTS_PER_FILE, 200, 10, 2_000)
+}
+
 export function getTaskBulkDeleteBatchSize(): number {
   return parseIntegerEnv(process.env.TASK_BULK_DELETE_BATCH_SIZE, 1_000, 100, 5_000)
 }

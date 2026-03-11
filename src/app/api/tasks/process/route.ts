@@ -27,6 +27,14 @@ import {
   getTaskMissedScheduleGraceSeconds,
   getTaskTransferBatchSize,
   getTaskTransferItemConcurrency,
+  getTaskTransferMultipartCopyPartConcurrency,
+  getTaskTransferProgressMaxEventsPerFile,
+  getTaskTransferProgressMinFileSizeMb,
+  getTaskTransferProgressSampleDeltaMb,
+  getTaskTransferProgressSampleIntervalMs,
+  getTaskTransferPreferServerCopySameBackend,
+  getTaskTransferRelayPartSizeMb,
+  getTaskTransferRelayQueueSize,
   getTaskWorkerUserBudgetMs,
 } from "@/lib/task-engine-config"
 import {
@@ -53,8 +61,9 @@ const ONE_MEBIBYTE_BIGINT = BigInt(ONE_MEBIBYTE_BYTES)
 const DEFAULT_MULTIPART_PART_SIZE_BYTES = 64 * ONE_MEBIBYTE_BYTES
 const DEFAULT_MULTIPART_PART_SIZE_BIGINT = BigInt(DEFAULT_MULTIPART_PART_SIZE_BYTES)
 const MAX_MULTIPART_PARTS = 10_000
-const RELAY_UPLOAD_QUEUE_SIZE = 4
+const MAX_RELAY_BUFFERED_BYTES = 512 * ONE_MEBIBYTE_BYTES
 const SINGLE_REQUEST_COPY_MAX_BYTES = BigInt(5 * 1024 * 1024 * 1024)
+const TRANSFER_PROGRESS_MILESTONES = [25, 50, 75, 90, 100] as const
 
 interface BulkDeleteTaskPayload {
   query: string
@@ -96,6 +105,17 @@ interface ObjectTransferTaskProgress {
   failed: number
   remaining: number
   cursorKey: string | null
+  currentFileKey: string | null
+  currentFileSizeBytes: string | null
+  currentFileTransferredBytes: string | null
+  currentFileStage: TransferProgressStage | null
+  transferStrategy: TransferStrategy | null
+  fallbackReason: string | null
+  bytesProcessedTotal: string | null
+  bytesEstimatedTotal: string | null
+  throughputBytesPerSec: number | null
+  etaSeconds: number | null
+  lastProgressAt: string | null
 }
 
 interface WorkerTaskSnapshot {
@@ -136,6 +156,7 @@ interface PreparedTransferItem {
   destinationKey: string
   createsNewDestination: boolean
   skip: boolean
+  skipReason: TransferSkipReason | null
 }
 
 interface TransferItemResult {
@@ -155,6 +176,61 @@ type TransferStrategy =
   | "single_request_server_copy"
   | "multipart_server_copy"
   | "multipart_relay_upload"
+
+type TransferProgressStage =
+  | "queued"
+  | "copying"
+  | "deleting_source"
+  | "finalizing"
+  | "completed"
+  | "failed"
+
+type TransferProgressSampleReason =
+  | "interval"
+  | "delta"
+  | "milestone"
+  | "stage_change"
+
+interface TransferTelemetryHooks {
+  start?: (params: {
+    sourceKey: string
+    destinationKey: string
+    strategy: TransferStrategy
+    totalBytes: bigint | null
+  }) => void | Promise<void>
+  progress?: (params: {
+    sourceKey: string
+    destinationKey: string
+    strategy: TransferStrategy
+    transferredBytes: bigint
+    totalBytes: bigint | null
+    stage?: TransferProgressStage
+  }) => void | Promise<void>
+  stage?: (params: {
+    sourceKey: string
+    destinationKey: string
+    strategy: TransferStrategy | null
+    stage: TransferProgressStage
+  }) => void | Promise<void>
+  fallback?: (params: {
+    sourceKey: string
+    destinationKey: string
+    reason: string
+    nextStrategy: TransferStrategy
+  }) => void | Promise<void>
+  finish?: (params: {
+    sourceKey: string
+    destinationKey: string
+    strategy: TransferStrategy | null
+    status: "completed" | "failed"
+  }) => void | Promise<void>
+}
+
+type TransferSkipReason =
+  | "already_exists"
+  | "up_to_date"
+  | "same_source_and_destination"
+  | "cache_limit_reached"
 
 interface ClaimedTaskControlState {
   status: string
@@ -319,6 +395,17 @@ function parseObjectTransferProgress(
       failed: 0,
       remaining: totalFallback,
       cursorKey: null,
+      currentFileKey: null,
+      currentFileSizeBytes: null,
+      currentFileTransferredBytes: null,
+      currentFileStage: null,
+      transferStrategy: null,
+      fallbackReason: null,
+      bytesProcessedTotal: null,
+      bytesEstimatedTotal: null,
+      throughputBytesPerSec: null,
+      etaSeconds: null,
+      lastProgressAt: null,
     }
   }
 
@@ -333,6 +420,17 @@ function parseObjectTransferProgress(
     failed?: unknown
     remaining?: unknown
     cursorKey?: unknown
+    currentFileKey?: unknown
+    currentFileSizeBytes?: unknown
+    currentFileTransferredBytes?: unknown
+    currentFileStage?: unknown
+    transferStrategy?: unknown
+    fallbackReason?: unknown
+    bytesProcessedTotal?: unknown
+    bytesEstimatedTotal?: unknown
+    throughputBytesPerSec?: unknown
+    etaSeconds?: unknown
+    lastProgressAt?: unknown
   }
 
   const total =
@@ -363,6 +461,58 @@ function parseObjectTransferProgress(
     cursorKey: typeof progress.cursorKey === "string" && progress.cursorKey.length > 0
       ? progress.cursorKey
       : null,
+    currentFileKey:
+      typeof progress.currentFileKey === "string" && progress.currentFileKey.length > 0
+        ? progress.currentFileKey
+        : null,
+    currentFileSizeBytes:
+      typeof progress.currentFileSizeBytes === "string" && progress.currentFileSizeBytes.length > 0
+        ? progress.currentFileSizeBytes
+        : null,
+    currentFileTransferredBytes:
+      typeof progress.currentFileTransferredBytes === "string" &&
+      progress.currentFileTransferredBytes.length > 0
+        ? progress.currentFileTransferredBytes
+        : null,
+    currentFileStage:
+      progress.currentFileStage === "queued" ||
+      progress.currentFileStage === "copying" ||
+      progress.currentFileStage === "deleting_source" ||
+      progress.currentFileStage === "finalizing" ||
+      progress.currentFileStage === "completed" ||
+      progress.currentFileStage === "failed"
+        ? progress.currentFileStage
+        : null,
+    transferStrategy:
+      progress.transferStrategy === "single_request_server_copy" ||
+      progress.transferStrategy === "multipart_server_copy" ||
+      progress.transferStrategy === "multipart_relay_upload"
+        ? progress.transferStrategy
+        : null,
+    fallbackReason:
+      typeof progress.fallbackReason === "string" && progress.fallbackReason.length > 0
+        ? progress.fallbackReason
+        : null,
+    bytesProcessedTotal:
+      typeof progress.bytesProcessedTotal === "string" && progress.bytesProcessedTotal.length > 0
+        ? progress.bytesProcessedTotal
+        : null,
+    bytesEstimatedTotal:
+      typeof progress.bytesEstimatedTotal === "string" && progress.bytesEstimatedTotal.length > 0
+        ? progress.bytesEstimatedTotal
+        : null,
+    throughputBytesPerSec:
+      typeof progress.throughputBytesPerSec === "number" && Number.isFinite(progress.throughputBytesPerSec)
+        ? Math.max(0, progress.throughputBytesPerSec)
+        : null,
+    etaSeconds:
+      typeof progress.etaSeconds === "number" && Number.isFinite(progress.etaSeconds)
+        ? Math.max(0, Math.floor(progress.etaSeconds))
+        : null,
+    lastProgressAt:
+      typeof progress.lastProgressAt === "string" && progress.lastProgressAt.length > 0
+        ? progress.lastProgressAt
+        : null,
   }
 }
 
@@ -383,12 +533,13 @@ function mapTransferDestinationKey(
 }
 
 function buildCopySource(bucket: string, key: string): string {
-  const encodedBucket = encodeURIComponent(bucket)
-  const encodedKey = key
-    .split("/")
-    .map((segment) => encodeURIComponent(segment))
-    .join("/")
-  return `${encodedBucket}/${encodedKey}`
+  // AWS SDK v3 does NOT correctly encode the x-amz-copy-source header
+  // for keys with special characters (spaces, parentheses, non-ASCII).
+  // See: https://github.com/aws/aws-sdk-js-v3/issues/6596
+  //
+  // encodeURI encodes spaces/special chars but preserves '/' separators,
+  // unlike encodeURIComponent which also encodes '/' and breaks the format.
+  return encodeURI(`${bucket}/${key}`)
 }
 
 function toValidContentLength(value: unknown): number | null {
@@ -410,6 +561,45 @@ function toValidContentLength(value: unknown): number | null {
   }
 
   return null
+}
+
+function parseProgressBigint(value: unknown): bigint | null {
+  if (typeof value === "bigint") {
+    return value >= BigInt(0) ? value : null
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || value < 0) return null
+    return BigInt(Math.floor(value))
+  }
+  if (typeof value === "string" && value.trim()) {
+    try {
+      const parsed = BigInt(value)
+      return parsed >= BigInt(0) ? parsed : null
+    } catch {
+      return null
+    }
+  }
+  return null
+}
+
+function bigintToNumberLossy(value: bigint): number {
+  if (value <= BigInt(Number.MAX_SAFE_INTEGER)) {
+    return Number(value)
+  }
+  return Number.MAX_SAFE_INTEGER
+}
+
+function buildTransferFallbackReason(prefix: string, error: unknown): string {
+  const code = getS3ErrorCode(error)
+  const status = getS3ErrorStatus(error)
+  const message = getS3ErrorMessage(error).trim()
+  const details = [
+    code ? `code=${code}` : null,
+    status !== null ? `status=${status}` : null,
+    message ? `message=${message.slice(0, 180)}` : null,
+  ].filter((value): value is string => Boolean(value))
+  if (details.length === 0) return prefix
+  return `${prefix} (${details.join(", ")})`
 }
 
 function getS3ErrorStatus(error: unknown): number | null {
@@ -452,6 +642,32 @@ function isCopyCompatibilityFallbackError(error: unknown): boolean {
   return code.includes("NotImplemented") || code.includes("InvalidRequest")
 }
 
+function isCopyAuthFallbackError(error: unknown): boolean {
+  const status = getS3ErrorStatus(error)
+  if (status === 401 || status === 403) return true
+
+  const code = getS3ErrorCode(error)
+  if (
+    code.includes("AccessDenied") ||
+    code.includes("Signature") ||
+    code.includes("Authorization") ||
+    code.includes("InvalidAccessKeyId") ||
+    code.includes("ExpiredToken") ||
+    code.includes("InvalidToken") ||
+    code.includes("AuthFailure")
+  ) {
+    return true
+  }
+
+  const message = getS3ErrorMessage(error).toLowerCase()
+  return (
+    message.includes("access denied") ||
+    message.includes("forbidden") ||
+    message.includes("authorization") ||
+    message.includes("signature")
+  )
+}
+
 function isSameS3Backend(params: {
   sourceEndpoint: string
   destinationEndpoint: string
@@ -469,6 +685,7 @@ function isSameS3Backend(params: {
 
 function selectTransferStrategy(params: {
   sameCredential: boolean
+  preferServerCopySameBackend: boolean
   sourceSizeBytes: bigint | null
   sourceEndpoint: string
   destinationEndpoint: string
@@ -477,16 +694,19 @@ function selectTransferStrategy(params: {
   sourceProvider: string
   destinationProvider: string
 }): TransferStrategy {
+  const sameBackend = isSameS3Backend({
+    sourceEndpoint: params.sourceEndpoint,
+    destinationEndpoint: params.destinationEndpoint,
+    sourceRegion: params.sourceRegion,
+    destinationRegion: params.destinationRegion,
+    sourceProvider: params.sourceProvider,
+    destinationProvider: params.destinationProvider,
+  })
+  const canUseServerCopy =
+    sameBackend && (params.sameCredential || params.preferServerCopySameBackend)
+
   if (
-    params.sameCredential &&
-    isSameS3Backend({
-      sourceEndpoint: params.sourceEndpoint,
-      destinationEndpoint: params.destinationEndpoint,
-      sourceRegion: params.sourceRegion,
-      destinationRegion: params.destinationRegion,
-      sourceProvider: params.sourceProvider,
-      destinationProvider: params.destinationProvider,
-    })
+    canUseServerCopy
   ) {
     if (params.sourceSizeBytes !== null && params.sourceSizeBytes > SINGLE_REQUEST_COPY_MAX_BYTES) {
       return "multipart_server_copy"
@@ -659,6 +879,13 @@ function formatTaskProcessingError(error: unknown): string {
   if (name && name !== baseMessage && name !== code) details.push(`name ${name}`)
 
   return details.length > 0 ? `${baseMessage} (${details.join(", ")})` : baseMessage
+}
+
+function formatTransferSkipReason(reason: TransferSkipReason): string {
+  if (reason === "already_exists") return "already exists at destination"
+  if (reason === "up_to_date") return "destination is up to date"
+  if (reason === "same_source_and_destination") return "source and destination are identical"
+  return "cache limit reached"
 }
 
 function addTaskHistoryEntry(
@@ -973,8 +1200,98 @@ async function copyObjectAcrossLocations(params: {
   destinationBucket: string
   destinationKey: string
   expectedContentLength?: unknown
+  telemetry?: TransferTelemetryHooks
 }) {
-  async function multipartRelayObjectAcrossLocations(): Promise<void> {
+  const relayPartSizeBytes = getTaskTransferRelayPartSizeMb() * ONE_MEBIBYTE_BYTES
+  const relayQueueSizeConfigured = getTaskTransferRelayQueueSize()
+  const relayQueueMemoryCap = Math.max(
+    1,
+    Math.floor(MAX_RELAY_BUFFERED_BYTES / relayPartSizeBytes)
+  )
+  const relayQueueSize = Math.max(
+    1,
+    Math.min(relayQueueSizeConfigured, relayQueueMemoryCap)
+  )
+
+  const sourceSizeBytes = (() => {
+    const contentLength = toValidContentLength(params.expectedContentLength)
+    return contentLength === null ? null : BigInt(contentLength)
+  })()
+
+  const initialStrategy = selectTransferStrategy({
+    sameCredential: params.sameCredential,
+    preferServerCopySameBackend: getTaskTransferPreferServerCopySameBackend(),
+    sourceSizeBytes,
+    sourceEndpoint: params.sourceEndpoint,
+    destinationEndpoint: params.destinationEndpoint,
+    sourceRegion: params.sourceRegion,
+    destinationRegion: params.destinationRegion,
+    sourceProvider: params.sourceProvider,
+    destinationProvider: params.destinationProvider,
+  })
+
+  async function emitStart(strategy: TransferStrategy, totalBytes: bigint | null) {
+    if (!params.telemetry?.start) return
+    await params.telemetry.start({
+      sourceKey: params.sourceKey,
+      destinationKey: params.destinationKey,
+      strategy,
+      totalBytes,
+    })
+  }
+
+  async function emitProgress(
+    strategy: TransferStrategy,
+    transferredBytes: bigint,
+    totalBytes: bigint | null,
+    stage?: TransferProgressStage
+  ) {
+    if (!params.telemetry?.progress) return
+    await params.telemetry.progress({
+      sourceKey: params.sourceKey,
+      destinationKey: params.destinationKey,
+      strategy,
+      transferredBytes,
+      totalBytes,
+      stage,
+    })
+  }
+
+  async function emitStage(strategy: TransferStrategy | null, stage: TransferProgressStage) {
+    if (!params.telemetry?.stage) return
+    await params.telemetry.stage({
+      sourceKey: params.sourceKey,
+      destinationKey: params.destinationKey,
+      strategy,
+      stage,
+    })
+  }
+
+  async function emitFallback(reason: string, nextStrategy: TransferStrategy) {
+    if (!params.telemetry?.fallback) return
+    await params.telemetry.fallback({
+      sourceKey: params.sourceKey,
+      destinationKey: params.destinationKey,
+      reason,
+      nextStrategy,
+    })
+  }
+
+  async function emitFinish(strategy: TransferStrategy | null, status: "completed" | "failed") {
+    if (!params.telemetry?.finish) return
+    await params.telemetry.finish({
+      sourceKey: params.sourceKey,
+      destinationKey: params.destinationKey,
+      strategy,
+      status,
+    })
+  }
+
+  async function multipartRelayObjectAcrossLocations(
+    strategy: TransferStrategy = "multipart_relay_upload"
+  ): Promise<void> {
+    await emitStage(strategy, "copying")
+
     const sourceObject = await params.sourceClient.send(
       new GetObjectCommand({
         Bucket: params.sourceBucket,
@@ -989,6 +1306,7 @@ async function copyObjectAcrossLocations(params: {
     const contentLength =
       toValidContentLength(sourceObject.ContentLength) ??
       toValidContentLength(params.expectedContentLength)
+    const totalBytes = contentLength === null ? sourceSizeBytes : BigInt(contentLength)
 
     const upload = new Upload({
       client: params.destinationClient,
@@ -1000,15 +1318,31 @@ async function copyObjectAcrossLocations(params: {
         CacheControl: sourceObject.CacheControl,
         ...(contentLength !== null ? { ContentLength: contentLength } : {}),
       },
-      queueSize: RELAY_UPLOAD_QUEUE_SIZE,
-      partSize: DEFAULT_MULTIPART_PART_SIZE_BYTES,
+      queueSize: relayQueueSize,
+      partSize: relayPartSizeBytes,
       leavePartsOnError: false,
     })
 
+    upload.on("httpUploadProgress", (progressEvent) => {
+      const loaded =
+        typeof progressEvent.loaded === "number" && Number.isFinite(progressEvent.loaded)
+          ? BigInt(Math.max(0, Math.floor(progressEvent.loaded)))
+          : null
+      if (loaded === null) return
+      void emitProgress(strategy, loaded, totalBytes, "copying")
+    })
+
     await upload.done()
+    if (totalBytes !== null) {
+      await emitProgress(strategy, totalBytes, totalBytes, "finalizing")
+    }
   }
 
-  async function multipartCopyObjectWithinBackend(): Promise<boolean> {
+  async function multipartCopyObjectWithinBackend(
+    strategy: TransferStrategy = "multipart_server_copy"
+  ): Promise<boolean> {
+    await emitStage(strategy, "copying")
+
     const headDetails = await readSourceObjectHeadDetails({
       sourceClient: params.sourceClient,
       sourceBucket: params.sourceBucket,
@@ -1019,6 +1353,7 @@ async function copyObjectAcrossLocations(params: {
     if (!headDetails.sizeBytes || headDetails.sizeBytes <= BigInt(0)) {
       return false
     }
+    const sourceSizeForCopy = headDetails.sizeBytes
 
     const createResponse = await params.destinationClient.send(
       new CreateMultipartUploadCommand({
@@ -1034,45 +1369,108 @@ async function copyObjectAcrossLocations(params: {
       throw new Error(`Failed to start multipart copy for key '${params.destinationKey}'`)
     }
 
-    const completedParts: Array<{ ETag: string; PartNumber: number }> = []
-    const partSizeBytes = computeMultipartPartSizeBytes(headDetails.sizeBytes)
+    const partSizeBytes = computeMultipartPartSizeBytes(sourceSizeForCopy)
+    const copySourceHeader = buildCopySource(params.sourceBucket, params.sourceKey)
+    const partRanges: Array<{ partNumber: number; rangeStart: bigint; rangeEnd: bigint }> = []
     let offset = BigInt(0)
     let partNumber = 1
+    while (offset < sourceSizeForCopy) {
+      const nextOffset = offset + partSizeBytes < sourceSizeForCopy
+        ? offset + partSizeBytes
+        : sourceSizeForCopy
+      const rangeEnd = nextOffset - BigInt(1)
+      partRanges.push({
+        partNumber,
+        rangeStart: offset,
+        rangeEnd,
+      })
+      offset = nextOffset
+      partNumber += 1
+    }
+
+    if (partRanges.length === 0) {
+      return false
+    }
 
     try {
-      while (offset < headDetails.sizeBytes) {
-        const nextOffset = offset + partSizeBytes < headDetails.sizeBytes
-          ? offset + partSizeBytes
-          : headDetails.sizeBytes
-        const rangeEnd = nextOffset - BigInt(1)
+      const concurrency = Math.max(
+        1,
+        Math.min(getTaskTransferMultipartCopyPartConcurrency(), partRanges.length)
+      )
+      let copiedBytes = BigInt(0)
+      const partResults: Array<{ ETag: string; PartNumber: number } | null> = new Array(
+        partRanges.length
+      ).fill(null)
+      let nextPartIndex = 0
+      let firstError: unknown = null
 
-        const partResponse = await params.destinationClient.send(
-          new UploadPartCopyCommand({
-            Bucket: params.destinationBucket,
-            Key: params.destinationKey,
-            UploadId: uploadId,
-            PartNumber: partNumber,
-            CopySource: buildCopySource(params.sourceBucket, params.sourceKey),
-            CopySourceRange: `bytes=${offset.toString()}-${rangeEnd.toString()}`,
-          })
-        )
+      const workers = Array.from({ length: concurrency }, async () => {
+        while (true) {
+          if (firstError) return
 
-        const etag = partResponse.CopyPartResult?.ETag
-        if (!etag) {
-          throw new Error(
-            `Multipart copy part ${partNumber} did not return an ETag for key '${params.destinationKey}'`
-          )
+          const currentIndex = nextPartIndex
+          nextPartIndex += 1
+          if (currentIndex >= partRanges.length) {
+            return
+          }
+
+          const currentPart = partRanges[currentIndex]
+          try {
+            const partResponse = await params.destinationClient.send(
+              new UploadPartCopyCommand({
+                Bucket: params.destinationBucket,
+                Key: params.destinationKey,
+                UploadId: uploadId,
+                PartNumber: currentPart.partNumber,
+                CopySource: copySourceHeader,
+                CopySourceRange:
+                  `bytes=${currentPart.rangeStart.toString()}-${currentPart.rangeEnd.toString()}`,
+              })
+            )
+
+            const etag = partResponse.CopyPartResult?.ETag
+            if (!etag) {
+              throw new Error(
+                `Multipart copy part ${currentPart.partNumber} did not return an ETag for key '${params.destinationKey}'`
+              )
+            }
+
+            partResults[currentIndex] = {
+              ETag: etag,
+              PartNumber: currentPart.partNumber,
+            }
+
+            copiedBytes += currentPart.rangeEnd - currentPart.rangeStart + BigInt(1)
+            await emitProgress(
+              strategy,
+              copiedBytes > sourceSizeForCopy ? sourceSizeForCopy : copiedBytes,
+              sourceSizeForCopy,
+              "copying"
+            )
+          } catch (error) {
+            if (!firstError) {
+              firstError = error
+            }
+            return
+          }
         }
+      })
 
-        completedParts.push({
-          ETag: etag,
-          PartNumber: partNumber,
-        })
-
-        offset = nextOffset
-        partNumber += 1
+      await Promise.all(workers)
+      if (firstError) {
+        throw firstError
       }
 
+      const completedParts = partResults
+        .filter((value): value is { ETag: string; PartNumber: number } => Boolean(value))
+        .sort((a, b) => a.PartNumber - b.PartNumber)
+      if (completedParts.length !== partRanges.length) {
+        throw new Error(
+          `Multipart copy did not produce all parts for key '${params.destinationKey}'`
+        )
+      }
+
+      await emitStage(strategy, "finalizing")
       await params.destinationClient.send(
         new CompleteMultipartUploadCommand({
           Bucket: params.destinationBucket,
@@ -1097,57 +1495,156 @@ async function copyObjectAcrossLocations(params: {
     }
   }
 
-  const sourceSizeBytes = (() => {
-    const contentLength = toValidContentLength(params.expectedContentLength)
-    return contentLength === null ? null : BigInt(contentLength)
-  })()
-
-  const strategy = selectTransferStrategy({
-    sameCredential: params.sameCredential,
-    sourceSizeBytes,
-    sourceEndpoint: params.sourceEndpoint,
-    destinationEndpoint: params.destinationEndpoint,
-    sourceRegion: params.sourceRegion,
-    destinationRegion: params.destinationRegion,
-    sourceProvider: params.sourceProvider,
-    destinationProvider: params.destinationProvider,
-  })
-
-  if (strategy === "multipart_server_copy") {
-    const copied = await multipartCopyObjectWithinBackend()
-    if (copied) return
-    await multipartRelayObjectAcrossLocations()
-    return
+  const complete = async (strategy: TransferStrategy) => {
+    await emitStage(strategy, "completed")
+    await emitFinish(strategy, "completed")
   }
 
-  if (strategy === "single_request_server_copy") {
-    try {
-      await params.destinationClient.send(
-        new CopyObjectCommand({
-          Bucket: params.destinationBucket,
-          CopySource: buildCopySource(params.sourceBucket, params.sourceKey),
-          Key: params.destinationKey,
-        })
-      )
-      return
-    } catch (error) {
-      if (isEntityTooLargeError(error)) {
-        const copied = await multipartCopyObjectWithinBackend()
-        if (copied) return
-        await multipartRelayObjectAcrossLocations()
-        return
-      }
+  try {
+    await emitStart(initialStrategy, sourceSizeBytes)
+    await emitStage(initialStrategy, "queued")
 
-      if (isCopyCompatibilityFallbackError(error)) {
-        await multipartRelayObjectAcrossLocations()
-        return
-      }
+    if (initialStrategy === "multipart_server_copy") {
+      try {
+        const copied = await multipartCopyObjectWithinBackend("multipart_server_copy")
+        if (copied) {
+          await complete("multipart_server_copy")
+          return
+        }
 
-      throw error
+        await emitFallback(
+          "multipart_server_copy produced no copyable byte ranges",
+          "multipart_relay_upload"
+        )
+        await multipartRelayObjectAcrossLocations("multipart_relay_upload")
+        await complete("multipart_relay_upload")
+        return
+      } catch (error) {
+        if (
+          isCopyCompatibilityFallbackError(error) ||
+          isCopyAuthFallbackError(error) ||
+          isS3MissingObjectError(error)
+        ) {
+          // Some S3-compatible providers can return NoSuchKey for CopySource
+          // parsing issues even when the source exists. Relay upload avoids
+          // CopySource and still preserves true missing-source behavior.
+          await emitFallback(
+            buildTransferFallbackReason(
+              "multipart_server_copy failed; retrying via multipart_relay_upload",
+              error
+            ),
+            "multipart_relay_upload"
+          )
+          await multipartRelayObjectAcrossLocations("multipart_relay_upload")
+          await complete("multipart_relay_upload")
+          return
+        }
+        throw error
+      }
     }
-  }
 
-  await multipartRelayObjectAcrossLocations()
+    if (initialStrategy === "single_request_server_copy") {
+      try {
+        await emitStage("single_request_server_copy", "copying")
+        await params.destinationClient.send(
+          new CopyObjectCommand({
+            Bucket: params.destinationBucket,
+            CopySource: buildCopySource(params.sourceBucket, params.sourceKey),
+            Key: params.destinationKey,
+          })
+        )
+        if (sourceSizeBytes !== null) {
+          await emitProgress(
+            "single_request_server_copy",
+            sourceSizeBytes,
+            sourceSizeBytes,
+            "finalizing"
+          )
+        }
+        await complete("single_request_server_copy")
+        return
+      } catch (error) {
+        if (isEntityTooLargeError(error)) {
+          await emitFallback(
+            buildTransferFallbackReason(
+              "single_request_server_copy exceeded size limit; retrying multipart",
+              error
+            ),
+            "multipart_server_copy"
+          )
+          try {
+            const copied = await multipartCopyObjectWithinBackend("multipart_server_copy")
+            if (copied) {
+              await complete("multipart_server_copy")
+              return
+            }
+          } catch (multipartError) {
+            if (
+              isCopyCompatibilityFallbackError(multipartError) ||
+              isCopyAuthFallbackError(multipartError) ||
+              isS3MissingObjectError(multipartError)
+            ) {
+              await emitFallback(
+                buildTransferFallbackReason(
+                  "multipart_server_copy failed after single_request_server_copy fallback; retrying relay",
+                  multipartError
+                ),
+                "multipart_relay_upload"
+              )
+              await multipartRelayObjectAcrossLocations("multipart_relay_upload")
+              await complete("multipart_relay_upload")
+              return
+            }
+            throw multipartError
+          }
+
+          await emitFallback(
+            "multipart_server_copy produced no copyable byte ranges after single-request fallback",
+            "multipart_relay_upload"
+          )
+          await multipartRelayObjectAcrossLocations("multipart_relay_upload")
+          await complete("multipart_relay_upload")
+          return
+        }
+
+        if (isCopyCompatibilityFallbackError(error) || isCopyAuthFallbackError(error)) {
+          await emitFallback(
+            buildTransferFallbackReason(
+              "single_request_server_copy rejected by backend; retrying relay",
+              error
+            ),
+            "multipart_relay_upload"
+          )
+          await multipartRelayObjectAcrossLocations("multipart_relay_upload")
+          await complete("multipart_relay_upload")
+          return
+        }
+
+        if (isS3MissingObjectError(error)) {
+          await emitFallback(
+            buildTransferFallbackReason(
+              "single_request_server_copy returned missing source; retrying relay verification",
+              error
+            ),
+            "multipart_relay_upload"
+          )
+          // Same fallback rationale as multipart_server_copy above.
+          await multipartRelayObjectAcrossLocations("multipart_relay_upload")
+          await complete("multipart_relay_upload")
+          return
+        }
+
+        throw error
+      }
+    }
+
+    await multipartRelayObjectAcrossLocations("multipart_relay_upload")
+    await complete("multipart_relay_upload")
+  } catch (error) {
+    await emitStage(null, "failed")
+    await emitFinish(null, "failed")
+    throw error
+  }
 }
 
 async function deleteKeysFromBucket(
@@ -1787,12 +2284,38 @@ export async function POST(request: Request) {
       }
 
       const progress = parseObjectTransferProgress(candidate.progress)
+      const sourceScopeBaseWhere = {
+        userId: actorUserId,
+        credentialId: activeTransferPayload.sourceCredentialId,
+        bucket: activeTransferPayload.sourceBucket,
+        isFolder: false,
+        ...(activeTransferPayload.scope === "folder" && activeTransferPayload.sourcePrefix
+          ? { key: { startsWith: activeTransferPayload.sourcePrefix } }
+          : {}),
+      }
       const sourceKeyFilter: { startsWith?: string; gt?: string } = {}
       if (activeTransferPayload.scope === "folder" && activeTransferPayload.sourcePrefix) {
         sourceKeyFilter.startsWith = activeTransferPayload.sourcePrefix
       }
       if (progress.cursorKey) {
         sourceKeyFilter.gt = progress.cursorKey
+      }
+
+      const persistedEstimatedBytes = parseProgressBigint(progress.bytesEstimatedTotal)
+      const sourceEstimatedBytesAggregate =
+        persistedEstimatedBytes === null
+          ? await prisma.fileMetadata.aggregate({
+            where: sourceScopeBaseWhere,
+            _sum: {
+              size: true,
+            },
+          })
+          : null
+      const bytesEstimatedTotal =
+        persistedEstimatedBytes ?? sourceEstimatedBytesAggregate?._sum.size ?? null
+      let bytesProcessedCompleted = parseProgressBigint(progress.bytesProcessedTotal) ?? BigInt(0)
+      if (bytesEstimatedTotal !== null && bytesProcessedCompleted > bytesEstimatedTotal) {
+        bytesProcessedCompleted = bytesEstimatedTotal
       }
 
       const sourceBatch = await prisma.fileMetadata.findMany({
@@ -1883,6 +2406,17 @@ export async function POST(request: Request) {
                 failed: 0,
                 remaining: 0,
                 cursorKey: null,
+                currentFileKey: null,
+                currentFileSizeBytes: null,
+                currentFileTransferredBytes: null,
+                currentFileStage: null,
+                transferStrategy: null,
+                fallbackReason: null,
+                bytesProcessedTotal: null,
+                bytesEstimatedTotal: null,
+                throughputBytesPerSec: null,
+                etaSeconds: null,
+                lastProgressAt: null,
               } as Prisma.InputJsonObject,
               lastError: null,
               executionHistory: addTaskHistoryEntry(taskExecutionHistory, {
@@ -1968,6 +2502,18 @@ export async function POST(request: Request) {
               ...cycleProgress,
               total,
               remaining: 0,
+              cursorKey: null,
+              currentFileKey: null,
+              currentFileSizeBytes: null,
+              currentFileTransferredBytes: null,
+              currentFileStage: null,
+              transferStrategy: null,
+              fallbackReason: null,
+              bytesProcessedTotal: bytesProcessedCompleted.toString(),
+              bytesEstimatedTotal: bytesEstimatedTotal?.toString() ?? null,
+              throughputBytesPerSec: null,
+              etaSeconds: null,
+              lastProgressAt: null,
             } as Prisma.InputJsonObject,
             lastError: finalTransferError,
             executionHistory: addTaskHistoryEntry(taskExecutionHistory, {
@@ -2108,8 +2654,363 @@ export async function POST(request: Request) {
       let lastProcessedCursorKey = progress.cursorKey
       let timeBudgetReached = false
       let batchLastError: string | null = null
+      const staleDestinationKeys: string[] = []
       const batchStartedAt = Date.now()
       const transferItemConcurrency = getTaskTransferItemConcurrency()
+      const claimedTaskId = candidate.id
+      const claimedRunCount = candidate.runCount + 1
+      const transferProgressMinFileSizeBytes =
+        BigInt(getTaskTransferProgressMinFileSizeMb()) * ONE_MEBIBYTE_BIGINT
+      const transferProgressSampleIntervalMs = getTaskTransferProgressSampleIntervalMs()
+      const transferProgressSampleDeltaBytes =
+        BigInt(getTaskTransferProgressSampleDeltaMb()) * ONE_MEBIBYTE_BIGINT
+      const transferProgressMaxEventsPerFile = getTaskTransferProgressMaxEventsPerFile()
+
+      interface LiveTransferTelemetryState {
+        sourceKey: string
+        destinationKey: string
+        strategy: TransferStrategy | null
+        stage: TransferProgressStage | null
+        fallbackReason: string | null
+        totalBytes: bigint | null
+        transferredBytes: bigint
+        throughputBytesPerSec: number | null
+        etaSeconds: number | null
+        lastProgressAtMs: number | null
+        lastSpeedSampleAtMs: number | null
+        lastSpeedSampleBytes: bigint
+        lastSampleAtMs: number | null
+        lastSampleBytes: bigint
+        lastSampleStage: TransferProgressStage | null
+        emittedMilestones: Set<number>
+        sampledEvents: number
+      }
+
+      const transferTelemetryByFile = new Map<string, LiveTransferTelemetryState>()
+      let activeTransferTelemetryKey: string | null = null
+      let telemetryWriteQueue = Promise.resolve()
+      let lastTelemetryProgressPersistAt = 0
+
+      function getTelemetryStateKey(sourceKey: string, destinationKey: string): string {
+        return `${sourceKey}::${destinationKey}`
+      }
+
+      function getOrCreateTelemetryState(
+        sourceKey: string,
+        destinationKey: string
+      ): LiveTransferTelemetryState {
+        const key = getTelemetryStateKey(sourceKey, destinationKey)
+        const existing = transferTelemetryByFile.get(key)
+        if (existing) return existing
+
+        const created: LiveTransferTelemetryState = {
+          sourceKey,
+          destinationKey,
+          strategy: null,
+          stage: null,
+          fallbackReason: null,
+          totalBytes: null,
+          transferredBytes: BigInt(0),
+          throughputBytesPerSec: null,
+          etaSeconds: null,
+          lastProgressAtMs: null,
+          lastSpeedSampleAtMs: null,
+          lastSpeedSampleBytes: BigInt(0),
+          lastSampleAtMs: null,
+          lastSampleBytes: BigInt(0),
+          lastSampleStage: null,
+          emittedMilestones: new Set<number>(),
+          sampledEvents: 0,
+        }
+        transferTelemetryByFile.set(key, created)
+        return created
+      }
+
+      function getActiveTelemetryState(): LiveTransferTelemetryState | null {
+        if (!activeTransferTelemetryKey) return null
+        return transferTelemetryByFile.get(activeTransferTelemetryKey) ?? null
+      }
+
+      function buildLiveTransferProgressSnapshot(): ObjectTransferTaskProgress {
+        const activeTelemetryState = getActiveTelemetryState()
+        const activeTransferredBytes = activeTelemetryState?.transferredBytes ?? BigInt(0)
+        const bytesProcessedWithCurrent = bytesProcessedCompleted + activeTransferredBytes
+        const boundedBytesProcessed =
+          bytesEstimatedTotal !== null && bytesProcessedWithCurrent > bytesEstimatedTotal
+            ? bytesEstimatedTotal
+            : bytesProcessedWithCurrent
+
+        return {
+          phase: "transfer",
+          total: sourceTotal,
+          processed: progress.processed + processedInBatch,
+          copied: progress.copied + copiedInBatch,
+          moved: progress.moved + movedInBatch,
+          deleted: progress.deleted + deletedInBatch,
+          skipped: progress.skipped + skippedInBatch,
+          failed: progress.failed + failedInBatch,
+          remaining: Math.max(0, sourceTotal - (progress.processed + processedInBatch)),
+          cursorKey: lastProcessedCursorKey,
+          currentFileKey: activeTelemetryState?.sourceKey ?? null,
+          currentFileSizeBytes: activeTelemetryState?.totalBytes?.toString() ?? null,
+          currentFileTransferredBytes: activeTelemetryState
+            ? activeTelemetryState.transferredBytes.toString()
+            : null,
+          currentFileStage: activeTelemetryState?.stage ?? null,
+          transferStrategy: activeTelemetryState?.strategy ?? null,
+          fallbackReason: activeTelemetryState?.fallbackReason ?? null,
+          bytesProcessedTotal: boundedBytesProcessed.toString(),
+          bytesEstimatedTotal: bytesEstimatedTotal?.toString() ?? null,
+          throughputBytesPerSec: activeTelemetryState?.throughputBytesPerSec ?? null,
+          etaSeconds: activeTelemetryState?.etaSeconds ?? null,
+          lastProgressAt: activeTelemetryState?.lastProgressAtMs
+            ? new Date(activeTelemetryState.lastProgressAtMs).toISOString()
+            : null,
+        }
+      }
+
+      function queueTelemetryWrite(operation: () => Promise<void>) {
+        telemetryWriteQueue = telemetryWriteQueue
+          .then(operation)
+          .catch(() => {
+            // Telemetry writes are best effort and should not fail task processing.
+          })
+      }
+
+      function persistLiveProgressSnapshot(force = false) {
+        const nowMs = Date.now()
+        if (!force && nowMs - lastTelemetryProgressPersistAt < transferProgressSampleIntervalMs) {
+          return
+        }
+        lastTelemetryProgressPersistAt = nowMs
+        const snapshot = buildLiveTransferProgressSnapshot()
+        queueTelemetryWrite(async () => {
+          await prisma.backgroundTask.updateMany({
+            where: {
+              id: claimedTaskId,
+              userId: actorUserId,
+              runCount: claimedRunCount,
+              status: "in_progress",
+            },
+            data: {
+              progress: snapshot as unknown as Prisma.InputJsonObject,
+              nextRunAt: new Date(Date.now() + LOCK_SECONDS * 1000),
+            },
+          })
+        })
+      }
+
+      function emitSampledProgressEvent(
+        state: LiveTransferTelemetryState,
+        sampleReason: TransferProgressSampleReason
+      ) {
+        if (state.sampledEvents >= transferProgressMaxEventsPerFile) return
+        if (state.totalBytes === null || state.totalBytes < transferProgressMinFileSizeBytes) return
+
+        const percent =
+          state.totalBytes && state.totalBytes > BigInt(0)
+            ? Math.min(100, Math.floor((bigintToNumberLossy(state.transferredBytes) * 100) / Math.max(1, bigintToNumberLossy(state.totalBytes))))
+            : null
+        const throughputLabel =
+          state.throughputBytesPerSec !== null
+            ? `${Math.max(0, Math.round(state.throughputBytesPerSec))} B/s`
+            : "n/a"
+        const etaLabel =
+          state.etaSeconds !== null
+            ? `${Math.max(0, Math.floor(state.etaSeconds))}s`
+            : "n/a"
+        const message = [
+          `PROGRESS ${activeTransferPayload.sourceBucket}/${state.sourceKey} -> ${activeTransferPayload.destinationBucket}/${state.destinationKey}`,
+          percent !== null ? `${percent}%` : "size unknown",
+          `stage=${state.stage ?? "copying"}`,
+          `speed=${throughputLabel}`,
+          `eta=${etaLabel}`,
+        ].join(" ")
+
+        state.sampledEvents += 1
+        queueTelemetryWrite(async () => {
+          await prisma.backgroundTaskEvent.create({
+            data: {
+              taskId: claimedTaskId,
+              userId: actorUserId,
+              eventType: "file_progress",
+              message,
+              metadata: {
+                sourceKey: state.sourceKey,
+                destinationKey: state.destinationKey,
+                stage: state.stage,
+                strategy: state.strategy,
+                transferredBytes: state.transferredBytes.toString(),
+                totalBytes: state.totalBytes?.toString() ?? null,
+                throughputBytesPerSec: state.throughputBytesPerSec,
+                etaSeconds: state.etaSeconds,
+                sampleReason,
+              },
+            },
+          })
+        })
+      }
+
+      function markReachedMilestones(state: LiveTransferTelemetryState) {
+        if (!state.totalBytes || state.totalBytes <= BigInt(0)) return
+        for (const milestone of TRANSFER_PROGRESS_MILESTONES) {
+          const threshold = (state.totalBytes * BigInt(milestone)) / BigInt(100)
+          if (state.transferredBytes >= threshold) {
+            state.emittedMilestones.add(milestone)
+          }
+        }
+      }
+
+      function maybeEmitProgressSample(
+        state: LiveTransferTelemetryState,
+        nowMs: number,
+        stageChanged: boolean
+      ) {
+        if (state.sampledEvents >= transferProgressMaxEventsPerFile) return
+        if (state.totalBytes === null || state.totalBytes < transferProgressMinFileSizeBytes) return
+
+        const reachedNewMilestone =
+          state.totalBytes && state.totalBytes > BigInt(0)
+            ? TRANSFER_PROGRESS_MILESTONES.some((milestone) => {
+              if (state.emittedMilestones.has(milestone)) return false
+              const threshold = (state.totalBytes! * BigInt(milestone)) / BigInt(100)
+              return state.transferredBytes >= threshold
+            })
+            : false
+
+        const intervalTriggered =
+          state.lastSampleAtMs === null || nowMs - state.lastSampleAtMs >= transferProgressSampleIntervalMs
+        const deltaTriggered =
+          state.transferredBytes - state.lastSampleBytes >= transferProgressSampleDeltaBytes
+
+        let reason: TransferProgressSampleReason | null = null
+        if (stageChanged) {
+          reason = "stage_change"
+        } else if (reachedNewMilestone) {
+          reason = "milestone"
+        } else if (deltaTriggered) {
+          reason = "delta"
+        } else if (intervalTriggered) {
+          reason = "interval"
+        }
+
+        if (!reason) return
+
+        emitSampledProgressEvent(state, reason)
+        state.lastSampleAtMs = nowMs
+        state.lastSampleBytes = state.transferredBytes
+        state.lastSampleStage = state.stage
+        markReachedMilestones(state)
+      }
+
+      function updateTelemetryProgressSpeed(state: LiveTransferTelemetryState, nowMs: number) {
+        if (state.lastSpeedSampleAtMs === null) {
+          state.lastSpeedSampleAtMs = nowMs
+          state.lastSpeedSampleBytes = state.transferredBytes
+          return
+        }
+
+        const deltaMs = nowMs - state.lastSpeedSampleAtMs
+        const deltaBytes = state.transferredBytes - state.lastSpeedSampleBytes
+        if (deltaMs <= 0 || deltaBytes < BigInt(0)) {
+          return
+        }
+
+        const instantBytesPerSecond = (bigintToNumberLossy(deltaBytes) * 1000) / deltaMs
+        if (Number.isFinite(instantBytesPerSecond) && instantBytesPerSecond >= 0) {
+          state.throughputBytesPerSec =
+            state.throughputBytesPerSec === null
+              ? instantBytesPerSecond
+              : state.throughputBytesPerSec * 0.7 + instantBytesPerSecond * 0.3
+        }
+
+        state.lastSpeedSampleAtMs = nowMs
+        state.lastSpeedSampleBytes = state.transferredBytes
+
+        if (
+          state.totalBytes !== null &&
+          state.totalBytes > BigInt(0) &&
+          state.throughputBytesPerSec &&
+          state.throughputBytesPerSec > 0 &&
+          state.transferredBytes <= state.totalBytes
+        ) {
+          const remainingBytes = state.totalBytes - state.transferredBytes
+          state.etaSeconds = Math.ceil(
+            bigintToNumberLossy(remainingBytes) / state.throughputBytesPerSec
+          )
+        } else {
+          state.etaSeconds = null
+        }
+      }
+
+      const transferTelemetryHooks: TransferTelemetryHooks = {
+        start: ({ sourceKey, destinationKey, strategy, totalBytes }) => {
+          const state = getOrCreateTelemetryState(sourceKey, destinationKey)
+          state.strategy = strategy
+          state.totalBytes = totalBytes ?? state.totalBytes
+          state.stage = "queued"
+          state.fallbackReason = null
+          state.transferredBytes = BigInt(0)
+          state.throughputBytesPerSec = null
+          state.etaSeconds = null
+          const nowMs = Date.now()
+          state.lastProgressAtMs = nowMs
+          state.lastSpeedSampleAtMs = null
+          state.lastSpeedSampleBytes = BigInt(0)
+          activeTransferTelemetryKey = getTelemetryStateKey(sourceKey, destinationKey)
+          persistLiveProgressSnapshot(true)
+          maybeEmitProgressSample(state, nowMs, true)
+        },
+        progress: ({ sourceKey, destinationKey, strategy, transferredBytes, totalBytes, stage }) => {
+          const state = getOrCreateTelemetryState(sourceKey, destinationKey)
+          const previousStage = state.stage
+          state.strategy = strategy
+          state.totalBytes = totalBytes ?? state.totalBytes
+          state.transferredBytes = transferredBytes < BigInt(0) ? BigInt(0) : transferredBytes
+          if (state.totalBytes !== null && state.transferredBytes > state.totalBytes) {
+            state.transferredBytes = state.totalBytes
+          }
+          state.stage = stage ?? state.stage ?? "copying"
+          const nowMs = Date.now()
+          state.lastProgressAtMs = nowMs
+          updateTelemetryProgressSpeed(state, nowMs)
+          activeTransferTelemetryKey = getTelemetryStateKey(sourceKey, destinationKey)
+          maybeEmitProgressSample(state, nowMs, previousStage !== state.stage)
+          persistLiveProgressSnapshot(false)
+        },
+        stage: ({ sourceKey, destinationKey, strategy, stage }) => {
+          const state = getOrCreateTelemetryState(sourceKey, destinationKey)
+          const previousStage = state.stage
+          state.strategy = strategy ?? state.strategy
+          state.stage = stage
+          const nowMs = Date.now()
+          state.lastProgressAtMs = nowMs
+          activeTransferTelemetryKey = getTelemetryStateKey(sourceKey, destinationKey)
+          maybeEmitProgressSample(state, nowMs, previousStage !== stage)
+          persistLiveProgressSnapshot(true)
+        },
+        fallback: ({ sourceKey, destinationKey, reason, nextStrategy }) => {
+          const state = getOrCreateTelemetryState(sourceKey, destinationKey)
+          state.fallbackReason = reason
+          state.strategy = nextStrategy
+          state.lastProgressAtMs = Date.now()
+          activeTransferTelemetryKey = getTelemetryStateKey(sourceKey, destinationKey)
+          persistLiveProgressSnapshot(true)
+        },
+        finish: ({ sourceKey, destinationKey, strategy, status }) => {
+          const state = getOrCreateTelemetryState(sourceKey, destinationKey)
+          const previousStage = state.stage
+          state.strategy = strategy ?? state.strategy
+          state.stage = status === "completed" ? "completed" : "failed"
+          if (status === "completed" && state.totalBytes !== null) {
+            state.transferredBytes = state.totalBytes
+          }
+          const nowMs = Date.now()
+          state.lastProgressAtMs = nowMs
+          maybeEmitProgressSample(state, nowMs, previousStage !== state.stage)
+          persistLiveProgressSnapshot(true)
+        },
+      }
 
       for (let index = 0; index < mappedBatch.length; index += transferItemConcurrency) {
         if (
@@ -2133,6 +3034,7 @@ export async function POST(request: Request) {
                 destinationKey,
                 createsNewDestination: false,
                 skip: true,
+                skipReason: "same_source_and_destination",
               }
             }
 
@@ -2167,7 +3069,7 @@ export async function POST(request: Request) {
             const shouldSkipForExistingDestination =
               activeTransferPayload.operation === "copy" &&
               (destinationExisting || destinationExistsRemotely)
-            const shouldSkipForUpToDateSync =
+            let shouldSkipForUpToDateSync =
               activeTransferPayload.operation === "sync" &&
               destinationExisting &&
               isDestinationUpToDateForSync(
@@ -2178,20 +3080,58 @@ export async function POST(request: Request) {
                 destinationExisting
               )
 
+            // When sync would skip based on cached metadata, verify the
+            // destination object actually exists in S3. The cache can be stale
+            // if files were deleted outside the app (lifecycle rules, external
+            // tools, etc.), causing the sync to incorrectly skip missing files.
+            if (shouldSkipForUpToDateSync && !destinationExistsRemotely) {
+              try {
+                const verifySnapshot = await readRemoteObjectSnapshot({
+                  client: destinationClient,
+                  bucket: activeTransferPayload.destinationBucket,
+                  key: destinationKey,
+                })
+                if (!verifySnapshot) {
+                  shouldSkipForUpToDateSync = false
+                  destinationByKey.delete(destinationKey)
+                  staleDestinationKeys.push(destinationKey)
+                }
+              } catch {
+                // Verification failed — be safe, proceed with copy.
+                shouldSkipForUpToDateSync = false
+              }
+            }
+
             return {
               sourceFile,
               destinationKey,
-              createsNewDestination,
+              createsNewDestination: !destinationExisting && !destinationExistsRemotely,
               skip: Boolean(shouldSkipForExistingDestination || shouldSkipForUpToDateSync),
+              skipReason:
+                shouldSkipForExistingDestination
+                  ? "already_exists"
+                  : shouldSkipForUpToDateSync
+                    ? "up_to_date"
+                    : null,
             }
           })
         )
 
         const actionable: PreparedTransferItem[] = []
+        const skippedForResults: Array<{
+          sourceFile: TransferSourceRow
+          destinationKey: string
+          reason: TransferSkipReason
+        }> = []
         for (const item of prepared) {
           if (item.skip) {
             skippedInBatch++
             processedInBatch++
+            skippedForResults.push({
+              sourceFile: item.sourceFile,
+              destinationKey: item.destinationKey,
+              reason: item.skipReason ?? "up_to_date",
+            })
             continue
           }
 
@@ -2199,6 +3139,11 @@ export async function POST(request: Request) {
             if (remainingCacheSlots <= 0) {
               skippedInBatch++
               processedInBatch++
+              skippedForResults.push({
+                sourceFile: item.sourceFile,
+                destinationKey: item.destinationKey,
+                reason: "cache_limit_reached",
+              })
               continue
             }
             remainingCacheSlots -= 1
@@ -2225,6 +3170,7 @@ export async function POST(request: Request) {
                 destinationBucket: activeTransferPayload.destinationBucket,
                 destinationKey: item.destinationKey,
                 expectedContentLength: item.sourceFile.size,
+                telemetry: transferTelemetryHooks,
               })
 
               return {
@@ -2300,6 +3246,17 @@ export async function POST(request: Request) {
           (activeTransferPayload.operation === "move" || activeTransferPayload.operation === "migrate") &&
           copiedRows.length > 0
         ) {
+          await Promise.all(
+            copiedRows.map((result) =>
+              transferTelemetryHooks.stage?.({
+                sourceKey: result.sourceKey,
+                destinationKey: result.destinationKey,
+                strategy: null,
+                stage: "deleting_source",
+              })
+            )
+          )
+
           const deletedSourceKeys = await deleteKeysFromBucket(
             sourceClient,
             activeTransferPayload.sourceBucket,
@@ -2354,29 +3311,94 @@ export async function POST(request: Request) {
             remainingCacheSlots += 1
           }
 
-          if (!batchLastError && result.errorMessage) {
+          // missing_source items are handled gracefully (stale source cache
+          // entries cleaned up), so don't surface their error as a task-level error.
+          if (!batchLastError && result.errorMessage && result.status !== "missing_source") {
             batchLastError = result.errorMessage
           }
 
           processedInBatch++
           if (result.status === "copied") {
             copiedInBatch++
-            continue
-          }
-          if (result.status === "moved") {
+            bytesProcessedCompleted += result.size
+          } else if (result.status === "moved") {
             movedInBatch++
             deletedInBatch++
-            continue
-          }
-          if (result.status === "skipped" || result.status === "missing_source") {
+            bytesProcessedCompleted += result.size
+          } else if (result.status === "skipped" || result.status === "missing_source") {
             skippedInBatch++
-            continue
+          } else {
+            if (result.status === "failed" && result.sourceDeleteRequired) {
+              bytesProcessedCompleted += result.size
+            }
+            failedInBatch++
           }
-          failedInBatch++
+
+          const telemetryStateKey = getTelemetryStateKey(result.sourceKey, result.destinationKey)
+          transferTelemetryByFile.delete(telemetryStateKey)
+          if (activeTransferTelemetryKey === telemetryStateKey) {
+            activeTransferTelemetryKey = transferTelemetryByFile.keys().next().value ?? null
+          }
+        }
+
+        persistLiveProgressSnapshot(true)
+
+        // Record per-file events for this slice
+        const fileEvents: Prisma.BackgroundTaskEventCreateManyInput[] = []
+        for (const skippedItem of skippedForResults) {
+          const reasonLabel = formatTransferSkipReason(skippedItem.reason)
+          fileEvents.push({
+            taskId: candidate.id,
+            userId: actorUserId,
+            eventType: "file_skipped",
+            message: `SKIP ${activeTransferPayload.sourceBucket}/${skippedItem.sourceFile.key} -> ${activeTransferPayload.destinationBucket}/${skippedItem.destinationKey} (${reasonLabel})`,
+            metadata: {
+              sourceKey: skippedItem.sourceFile.key,
+              destinationKey: skippedItem.destinationKey,
+              size: skippedItem.sourceFile.size.toString(),
+              reason: skippedItem.reason,
+            },
+          })
+        }
+        for (const result of results) {
+          fileEvents.push({
+            taskId: candidate.id,
+            userId: actorUserId,
+            eventType: `file_${result.status}`,
+            message: `${result.status.toUpperCase()} ${activeTransferPayload.sourceBucket}/${result.sourceKey} -> ${activeTransferPayload.destinationBucket}/${result.destinationKey}`,
+            metadata: {
+              sourceKey: result.sourceKey,
+              destinationKey: result.destinationKey,
+              size: result.size.toString(),
+              error: result.errorMessage ?? undefined,
+            },
+          })
+        }
+        if (fileEvents.length > 0) {
+          try {
+            await prisma.backgroundTaskEvent.createMany({ data: fileEvents })
+          } catch {
+            // Non-critical: don't fail the task if event recording fails
+          }
         }
 
         lastProcessedCursorKey = slice[slice.length - 1]?.sourceFile.key ?? lastProcessedCursorKey
       }
+
+      // Clean up stale destination metadata entries discovered during sync
+      // verification. These are cache entries for files no longer in S3.
+      if (staleDestinationKeys.length > 0) {
+        await prisma.fileMetadata.deleteMany({
+          where: {
+            userId: actorUserId,
+            credentialId: activeTransferPayload.destinationCredentialId,
+            bucket: activeTransferPayload.destinationBucket,
+            key: { in: staleDestinationKeys },
+          },
+        })
+      }
+
+      await telemetryWriteQueue
 
       const total = sourceTotal
       const nextProcessed = progress.processed + processedInBatch
@@ -2391,6 +3413,17 @@ export async function POST(request: Request) {
         failed: progress.failed + failedInBatch,
         remaining: Math.max(0, total - nextProcessed),
         cursorKey: lastProcessedCursorKey,
+        currentFileKey: null,
+        currentFileSizeBytes: null,
+        currentFileTransferredBytes: null,
+        currentFileStage: null,
+        transferStrategy: null,
+        fallbackReason: null,
+        bytesProcessedTotal: bytesProcessedCompleted.toString(),
+        bytesEstimatedTotal: bytesEstimatedTotal?.toString() ?? null,
+        throughputBytesPerSec: null,
+        etaSeconds: null,
+        lastProgressAt: null,
       }
 
       const transferCheckpoint = await persistClaimedTaskCheckpoint({
