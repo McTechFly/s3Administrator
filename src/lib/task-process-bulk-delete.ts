@@ -17,7 +17,9 @@ import {
   resolveTaskPlanPayload,
   addTaskHistoryEntry,
   buildProcessedResponse,
+  snapshotFromCheckpoint,
   persistClaimedTaskCheckpoint,
+  failTaskTerminal,
   deleteKeysFromBucket,
 } from "@/lib/task-process-shared"
 
@@ -48,40 +50,10 @@ export async function processBulkDeleteTask(
   const bulkPlanPayload = resolveTaskPlanPayload(candidate.executionPlan, candidate.payload)
   const payload = parsePayload(bulkPlanPayload)
   if (!payload) {
-    const nextAttempts = candidate.attempts + 1
-    const invalidBulkCheckpoint = await persistClaimedTaskCheckpoint({
-      taskId: candidate.id,
-      userId: actorUserId,
-      claimedRunCount: candidate.runCount + 1,
-      preferTerminal: true,
-      normalUpdate: {
-        status: "failed",
-        lifecycleState: "active",
-        attempts: nextAttempts,
-        lastError: "Invalid task payload",
-        completedAt: new Date(),
-        nextRunAt: new Date(),
-        executionHistory: addTaskHistoryEntry(taskExecutionHistory, {
-          status: "failed",
-          message: "Invalid task payload",
-        }),
-      },
+    return failTaskTerminal({
+      candidate, actorUserId, taskExecutionHistory,
+      errorMessage: "Invalid task payload",
     })
-    return buildProcessedResponse(
-      {
-        taskId: candidate.id,
-        taskType: candidate.type,
-        taskStatus: invalidBulkCheckpoint.finalStatus,
-        runCount: candidate.runCount + 1,
-        attempts: invalidBulkCheckpoint.appliedMode === "canceled" ? 0 : nextAttempts,
-        lastError: invalidBulkCheckpoint.appliedMode === "canceled" ? null : "Invalid task payload",
-        taskUserId: actorUserId,
-      },
-      {
-        done: true,
-        error: "Invalid task payload",
-      }
-    )
   }
 
   const whereClause = buildFileSearchSqlWhereClause({
@@ -160,15 +132,7 @@ export async function processBulkDeleteTask(
       })
 
       return buildProcessedResponse(
-        {
-          taskId: candidate.id,
-          taskType: candidate.type,
-          taskStatus: scheduledEmptyCheckpoint.finalStatus,
-          runCount: candidate.runCount + 1,
-          attempts: 0,
-          lastError: null,
-          taskUserId: actorUserId,
-        },
+        snapshotFromCheckpoint(candidate, actorUserId, scheduledEmptyCheckpoint),
         {
           done: scheduledEmptyCheckpoint.appliedMode === "canceled",
           recurring: scheduledEmptyCheckpoint.appliedMode === "normal",
@@ -209,18 +173,8 @@ export async function processBulkDeleteTask(
     })
 
     return buildProcessedResponse(
-      {
-        taskId: candidate.id,
-        taskType: candidate.type,
-        taskStatus: emptyCompletionCheckpoint.finalStatus,
-        runCount: candidate.runCount + 1,
-        attempts: 0,
-        lastError: null,
-        taskUserId: actorUserId,
-      },
-      {
-        done: true,
-      }
+      snapshotFromCheckpoint(candidate, actorUserId, emptyCompletionCheckpoint),
+      { done: true }
     )
   }
 
@@ -335,15 +289,7 @@ export async function processBulkDeleteTask(
     })
 
     return buildProcessedResponse(
-      {
-        taskId: candidate.id,
-        taskType: candidate.type,
-        taskStatus: scheduledRemainingCheckpoint.finalStatus,
-        runCount: candidate.runCount + 1,
-        attempts: 0,
-        lastError: null,
-        taskUserId: actorUserId,
-      },
+      snapshotFromCheckpoint(candidate, actorUserId, scheduledRemainingCheckpoint),
       {
         deletedInBatch: deletedIds.size,
         done: scheduledRemainingCheckpoint.appliedMode === "canceled",
@@ -390,15 +336,7 @@ export async function processBulkDeleteTask(
   })
 
   return buildProcessedResponse(
-    {
-      taskId: candidate.id,
-      taskType: candidate.type,
-      taskStatus: bulkCheckpoint.finalStatus,
-      runCount: candidate.runCount + 1,
-      attempts: bulkCheckpoint.appliedMode === "canceled" ? 0 : 0,
-      lastError: bulkCheckpoint.appliedMode === "canceled" ? null : null,
-      taskUserId: actorUserId,
-    },
+    snapshotFromCheckpoint(candidate, actorUserId, bulkCheckpoint),
     {
       deletedInBatch: deletedIds.size,
       done: remaining === 0 || bulkCheckpoint.appliedMode === "canceled",

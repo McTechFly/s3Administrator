@@ -23,6 +23,7 @@ import {
   SYNC_POLL_INTERVAL_SECONDS,
   addTaskHistoryEntry,
   buildProcessedResponse,
+  snapshotFromCheckpoint,
   formatTaskProcessingError,
   persistClaimedTaskCheckpoint,
   parseObjectTransferPayload,
@@ -343,18 +344,14 @@ export async function POST(request: Request) {
             }),
           },
         })
+        const canceled = failureCheckpoint.appliedMode === "canceled"
         return buildProcessedResponse(
+          snapshotFromCheckpoint(candidate, actorUserId, failureCheckpoint, {
+            attempts: canceled ? 0 : nextAttempts,
+            lastError: canceled ? null : message.slice(0, 500),
+          }),
           {
-            taskId: candidate.id,
-            taskType: candidate.type,
-            taskStatus: failureCheckpoint.finalStatus,
-            runCount: candidate.runCount + 1,
-            attempts: failureCheckpoint.appliedMode === "canceled" ? 0 : nextAttempts,
-            lastError: failureCheckpoint.appliedMode === "canceled" ? null : message.slice(0, 500),
-            taskUserId: actorUserId,
-          },
-          {
-            done: failureCheckpoint.appliedMode === "canceled",
+            done: canceled,
             error: message,
           }
         )
@@ -394,15 +391,7 @@ export async function POST(request: Request) {
         },
       })
       return buildProcessedResponse(
-        {
-          taskId: candidate.id,
-          taskType: candidate.type,
-          taskStatus: successCheckpoint.finalStatus,
-          runCount: candidate.runCount + 1,
-          attempts: 0,
-          lastError: null,
-          taskUserId: actorUserId,
-        },
+        snapshotFromCheckpoint(candidate, actorUserId, successCheckpoint),
         {
           done: !nextScheduledRunAt,
           type: "database_backup",

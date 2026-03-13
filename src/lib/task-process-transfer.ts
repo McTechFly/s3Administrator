@@ -93,10 +93,13 @@ import {
   formatTransferSkipReason,
   addTaskHistoryEntry,
   buildProcessedResponse,
+  snapshotFromCheckpoint,
   persistClaimedTaskCheckpoint,
+  failTaskTerminal,
   upsertFileMetadataBatch,
   resolveTaskPlanPayload,
   deleteKeysFromBucket,
+  emptyTransferProgress,
 } from "@/lib/task-process-shared"
 
 export class BandwidthThrottleTransform extends Transform {
@@ -1053,84 +1056,20 @@ export async function processObjectTransferTask(
   const planPayload = resolveTaskPlanPayload(candidate.executionPlan, candidate.payload)
   transferPayload = parseObjectTransferPayload(planPayload)
   if (!transferPayload) {
-    const invalidPayloadCheckpoint = await persistClaimedTaskCheckpoint({
-      taskId: candidate.id,
-      userId: actorUserId,
-      claimedRunCount: candidate.runCount + 1,
-      preferTerminal: true,
-      normalUpdate: {
-        status: "failed",
-        lifecycleState: "active",
-        attempts: candidate.attempts + 1,
-        lastError: "Invalid object transfer payload",
-        completedAt: new Date(),
-        nextRunAt: new Date(),
-        executionHistory: addTaskHistoryEntry(taskExecutionHistory, {
-          status: "failed",
-          message: "Invalid object transfer payload",
-        }),
-      },
+    return failTaskTerminal({
+      candidate, actorUserId, taskExecutionHistory,
+      errorMessage: "Invalid object transfer payload",
+      extraResponseBody: { type: "object_transfer" },
     })
-    return buildProcessedResponse(
-      {
-        taskId: candidate.id,
-        taskType: candidate.type,
-        taskStatus: invalidPayloadCheckpoint.finalStatus,
-        runCount: candidate.runCount + 1,
-        attempts: invalidPayloadCheckpoint.appliedMode === "canceled" ? 0 : candidate.attempts + 1,
-        lastError:
-          invalidPayloadCheckpoint.appliedMode === "canceled"
-            ? null
-            : "Invalid object transfer payload",
-        taskUserId: actorUserId,
-      },
-      {
-        done: true,
-        type: "object_transfer",
-        error: "Invalid object transfer payload",
-      }
-    )
   }
 
   const entitlements = await getUserPlanEntitlements(actorUserId)
   if (!entitlements) {
-    const entitlementCheckpoint = await persistClaimedTaskCheckpoint({
-      taskId: candidate.id,
-      userId: actorUserId,
-      claimedRunCount: candidate.runCount + 1,
-      preferTerminal: true,
-      normalUpdate: {
-        status: "failed",
-        lifecycleState: "active",
-        attempts: candidate.attempts + 1,
-        completedAt: new Date(),
-        nextRunAt: new Date(),
-        lastError: "Failed to resolve plan entitlements",
-        executionHistory: addTaskHistoryEntry(taskExecutionHistory, {
-          status: "failed",
-          message: "Failed to resolve plan entitlements",
-        }),
-      },
+    return failTaskTerminal({
+      candidate, actorUserId, taskExecutionHistory,
+      errorMessage: "Failed to resolve plan entitlements",
+      extraResponseBody: { type: "object_transfer" },
     })
-    return buildProcessedResponse(
-      {
-        taskId: candidate.id,
-        taskType: candidate.type,
-        taskStatus: entitlementCheckpoint.finalStatus,
-        runCount: candidate.runCount + 1,
-        attempts: entitlementCheckpoint.appliedMode === "canceled" ? 0 : candidate.attempts + 1,
-        lastError:
-          entitlementCheckpoint.appliedMode === "canceled"
-            ? null
-            : "Failed to resolve plan entitlements",
-        taskUserId: actorUserId,
-      },
-      {
-        done: true,
-        type: "object_transfer",
-        error: "Failed to resolve plan entitlements",
-      }
-    )
   }
 
   const activeTransferPayload = transferPayload
@@ -1145,45 +1084,15 @@ export async function processObjectTransferTask(
       entitlements,
     })
     if (bucketLimitViolation) {
-      const bucketLimitCheckpoint = await persistClaimedTaskCheckpoint({
-        taskId: candidate.id,
-        userId: actorUserId,
-        claimedRunCount: candidate.runCount + 1,
-        preferTerminal: true,
-        normalUpdate: {
-          status: "failed",
-          lifecycleState: "active",
-          attempts: candidate.attempts + 1,
-          completedAt: new Date(),
-          nextRunAt: new Date(),
-          lastError: "Bucket limit reached for current plan",
-          executionHistory: addTaskHistoryEntry(taskExecutionHistory, {
-            status: "failed",
-            message: "Bucket limit reached for current plan",
-          }),
-        },
-      })
-
-      return buildProcessedResponse(
-        {
-          taskId: candidate.id,
-          taskType: candidate.type,
-          taskStatus: bucketLimitCheckpoint.finalStatus,
-          runCount: candidate.runCount + 1,
-          attempts: bucketLimitCheckpoint.appliedMode === "canceled" ? 0 : candidate.attempts + 1,
-          lastError:
-            bucketLimitCheckpoint.appliedMode === "canceled"
-              ? null
-              : "Bucket limit reached for current plan",
-          taskUserId: actorUserId,
-        },
-        {
-          done: true,
+      return failTaskTerminal({
+        candidate, actorUserId, taskExecutionHistory,
+        errorMessage: "Bucket limit reached for current plan",
+        extraResponseBody: {
           type: "object_transfer",
           skipped: "bucket_limit_reached",
           details: bucketLimitViolation,
-        }
-      )
+        },
+      })
     }
   }
 
@@ -1328,29 +1237,7 @@ export async function processObjectTransferTask(
           completedAt: null,
           nextRunAt,
           lastRunAt: new Date(),
-          progress: {
-            phase: "transfer",
-            total: 0,
-            processed: 0,
-            copied: 0,
-            moved: 0,
-            deleted: 0,
-            skipped: 0,
-            failed: 0,
-            remaining: 0,
-            cursorKey: null,
-            currentFileKey: null,
-            currentFileSizeBytes: null,
-            currentFileTransferredBytes: null,
-            currentFileStage: null,
-            transferStrategy: null,
-            fallbackReason: null,
-            bytesProcessedTotal: null,
-            bytesEstimatedTotal: null,
-            throughputBytesPerSec: null,
-            etaSeconds: null,
-            lastProgressAt: null,
-          } as Prisma.InputJsonObject,
+          progress: emptyTransferProgress() as unknown as Prisma.InputJsonObject,
           lastError: null,
           executionHistory: addTaskHistoryEntry(taskExecutionHistory, {
             status: cycleProgress.failed > 0 ? "failed" : "succeeded",
@@ -1392,15 +1279,7 @@ export async function processObjectTransferTask(
       })
 
       return buildProcessedResponse(
-        {
-          taskId: candidate.id,
-          taskType: candidate.type,
-          taskStatus: scheduledCycleCheckpoint.finalStatus,
-          runCount: candidate.runCount + 1,
-          attempts: scheduledCycleCheckpoint.appliedMode === "canceled" ? 0 : 0,
-          lastError: scheduledCycleCheckpoint.appliedMode === "canceled" ? null : null,
-          taskUserId: actorUserId,
-        },
+        snapshotFromCheckpoint(candidate, actorUserId, scheduledCycleCheckpoint),
         {
           done: scheduledCycleCheckpoint.appliedMode === "canceled",
           type: "object_transfer",
@@ -1498,15 +1377,9 @@ export async function processObjectTransferTask(
     })
 
     return buildProcessedResponse(
-      {
-        taskId: candidate.id,
-        taskType: candidate.type,
-        taskStatus: finalTransferCheckpoint.finalStatus,
-        runCount: candidate.runCount + 1,
-        attempts: 0,
+      snapshotFromCheckpoint(candidate, actorUserId, finalTransferCheckpoint, {
         lastError: finalTransferError,
-        taskUserId: actorUserId,
-      },
+      }),
       {
         done: true,
         type: "object_transfer",
@@ -1645,15 +1518,7 @@ export async function processObjectTransferTask(
     })
     if (ffCheckpoint.appliedMode !== "normal") {
       return buildProcessedResponse(
-        {
-          taskId: candidate.id,
-          taskType: candidate.type,
-          taskStatus: ffCheckpoint.finalStatus,
-          runCount: candidate.runCount + 1,
-          attempts: 0,
-          lastError: null,
-          taskUserId: actorUserId,
-        },
+        snapshotFromCheckpoint(candidate, actorUserId, ffCheckpoint),
         {
           done: true,
           type: "object_transfer",
@@ -1805,15 +1670,7 @@ export async function processObjectTransferTask(
     })
 
     return buildProcessedResponse(
-      {
-        taskId: candidate.id,
-        taskType: candidate.type,
-        taskStatus: ffFinalCheckpoint.finalStatus,
-        runCount: candidate.runCount + 1,
-        attempts: 0,
-        lastError: null,
-        taskUserId: actorUserId,
-      },
+      snapshotFromCheckpoint(candidate, actorUserId, ffFinalCheckpoint),
       {
         done: ffFinalCheckpoint.appliedMode === "canceled",
         type: "object_transfer",
@@ -2647,12 +2504,7 @@ export async function processObjectTransferTask(
   })
 
   return buildProcessedResponse(
-    {
-      taskId: candidate.id,
-      taskType: candidate.type,
-      taskStatus: transferCheckpoint.finalStatus,
-      runCount: candidate.runCount + 1,
-      attempts: transferCheckpoint.appliedMode === "canceled" ? 0 : 0,
+    snapshotFromCheckpoint(candidate, actorUserId, transferCheckpoint, {
       lastError:
         transferCheckpoint.appliedMode === "canceled"
           ? null
@@ -2660,8 +2512,7 @@ export async function processObjectTransferTask(
             (nextProgress.failed > 0
               ? candidate.lastError ?? "One or more objects failed during transfer"
               : null),
-      taskUserId: actorUserId,
-    },
+    }),
     {
       done: transferCheckpoint.appliedMode === "canceled",
       type: "object_transfer",

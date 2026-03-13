@@ -412,27 +412,9 @@ export function parseObjectTransferProgress(
 ): ObjectTransferTaskProgress {
   if (!raw || typeof raw !== "object") {
     return {
-      phase: "transfer",
+      ...emptyTransferProgress(),
       total: totalFallback,
-      processed: 0,
-      copied: 0,
-      moved: 0,
-      deleted: 0,
-      skipped: 0,
-      failed: 0,
       remaining: totalFallback,
-      cursorKey: null,
-      currentFileKey: null,
-      currentFileSizeBytes: null,
-      currentFileTransferredBytes: null,
-      currentFileStage: null,
-      transferStrategy: null,
-      fallbackReason: null,
-      bytesProcessedTotal: null,
-      bytesEstimatedTotal: null,
-      throughputBytesPerSec: null,
-      etaSeconds: null,
-      lastProgressAt: null,
     }
   }
 
@@ -540,6 +522,32 @@ export function parseObjectTransferProgress(
       typeof progress.lastProgressAt === "string" && progress.lastProgressAt.length > 0
         ? progress.lastProgressAt
         : null,
+  }
+}
+
+export function emptyTransferProgress(): ObjectTransferTaskProgress {
+  return {
+    phase: "transfer",
+    total: 0,
+    processed: 0,
+    copied: 0,
+    moved: 0,
+    deleted: 0,
+    skipped: 0,
+    failed: 0,
+    remaining: 0,
+    cursorKey: null,
+    currentFileKey: null,
+    currentFileSizeBytes: null,
+    currentFileTransferredBytes: null,
+    currentFileStage: null,
+    transferStrategy: null,
+    fallbackReason: null,
+    bytesProcessedTotal: null,
+    bytesEstimatedTotal: null,
+    throughputBytesPerSec: null,
+    etaSeconds: null,
+    lastProgressAt: null,
   }
 }
 
@@ -839,6 +847,23 @@ export function buildProcessedResponse(
   })
 }
 
+export function snapshotFromCheckpoint(
+  candidate: { id: string; type: string; runCount: number },
+  actorUserId: string,
+  checkpoint: PersistClaimedTaskCheckpointResult,
+  overrides?: { attempts?: number; lastError?: string | null }
+): WorkerTaskSnapshot {
+  return {
+    taskId: candidate.id,
+    taskType: candidate.type,
+    taskStatus: checkpoint.finalStatus,
+    runCount: candidate.runCount + 1,
+    attempts: overrides?.attempts ?? 0,
+    lastError: overrides?.lastError ?? null,
+    taskUserId: actorUserId,
+  }
+}
+
 export function getBackgroundTaskStringFieldValue(
   value: string | Prisma.StringFieldUpdateOperationsInput | undefined
 ): string | null {
@@ -974,6 +999,46 @@ export async function persistClaimedTaskCheckpoint(
         : "normal",
     finalStatus: current?.status ?? normalStatus,
   }
+}
+
+export async function failTaskTerminal(params: {
+  candidate: { id: string; type: string; runCount: number; attempts: number }
+  actorUserId: string
+  taskExecutionHistory: TaskExecutionHistoryEntry[]
+  errorMessage: string
+  extraResponseBody?: Record<string, unknown>
+}): Promise<NextResponse> {
+  const nextAttempts = params.candidate.attempts + 1
+  const checkpoint = await persistClaimedTaskCheckpoint({
+    taskId: params.candidate.id,
+    userId: params.actorUserId,
+    claimedRunCount: params.candidate.runCount + 1,
+    preferTerminal: true,
+    normalUpdate: {
+      status: "failed",
+      lifecycleState: "active",
+      attempts: nextAttempts,
+      lastError: params.errorMessage,
+      completedAt: new Date(),
+      nextRunAt: new Date(),
+      executionHistory: addTaskHistoryEntry(params.taskExecutionHistory, {
+        status: "failed",
+        message: params.errorMessage,
+      }),
+    },
+  })
+  const canceled = checkpoint.appliedMode === "canceled"
+  return buildProcessedResponse(
+    snapshotFromCheckpoint(params.candidate, params.actorUserId, checkpoint, {
+      attempts: canceled ? 0 : nextAttempts,
+      lastError: canceled ? null : params.errorMessage,
+    }),
+    {
+      done: true,
+      error: params.errorMessage,
+      ...params.extraResponseBody,
+    }
+  )
 }
 
 export async function upsertFileMetadataBatch(rows: TransferMetadataUpsertRow[]): Promise<void> {
