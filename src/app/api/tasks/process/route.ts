@@ -2176,6 +2176,30 @@ export async function POST(request: Request) {
       })
     }
 
+    // Recover tasks stuck in cancel-transition: lifecycleState was set to
+    // "canceled" while the task was in_progress, but the worker never
+    // finalised the status (crash, timeout, etc.).  Once the lock
+    // (nextRunAt) has expired we know no worker is actively processing
+    // the task, so we can safely move it to its terminal state.
+    await prisma.backgroundTask.updateMany({
+      where: {
+        userId: actorUserId,
+        status: "in_progress",
+        lifecycleState: "canceled",
+        nextRunAt: { lte: now },
+      },
+      data: {
+        status: "canceled",
+        attempts: 0,
+        lastError: null,
+        completedAt: now,
+        nextRunAt: now,
+        isRecurring: false,
+        scheduleCron: null,
+        scheduleIntervalSeconds: null,
+      },
+    })
+
     const staleScheduleGraceMs = getTaskMissedScheduleGraceSeconds() * 1000
     const realignedFutureSchedule = await realignFutureRecurringRun({
       userId: actorUserId,
@@ -2623,7 +2647,40 @@ export async function POST(request: Request) {
         bytesProcessedCompleted = bytesEstimatedTotal
       }
 
-      const sourceBatch = await prisma.fileMetadata.findMany({
+      const [sourceClientInfo, destinationClientInfo] = await Promise.all([
+        getS3Client(actorUserId, activeTransferPayload.sourceCredentialId, {
+          trafficClass: "background",
+        }),
+        getS3Client(actorUserId, activeTransferPayload.destinationCredentialId, {
+          trafficClass: "background",
+        }),
+      ])
+      const sourceClient = sourceClientInfo.client
+      const destinationClient = destinationClientInfo.client
+
+      const sameCredential =
+        activeTransferPayload.sourceCredentialId === activeTransferPayload.destinationCredentialId
+      const requiresDestinationComparison =
+        activeTransferPayload.operation === "copy" || activeTransferPayload.operation === "sync"
+
+      let remainingCacheSlots: number | null = null
+      if (
+        activeTransferPayload.operation === "copy" ||
+        activeTransferPayload.operation === "sync"
+      ) {
+        if (Number.isFinite(entitlements.fileLimit)) {
+          const currentCachedFileCount = await prisma.fileMetadata.count({
+            where: {
+              userId: actorUserId,
+              isFolder: false,
+            },
+          })
+          remainingCacheSlots = Math.max(0, entitlements.fileLimit - currentCachedFileCount)
+        }
+      }
+
+      const batchSize = getTaskTransferBatchSize()
+      let sourceBatch = await prisma.fileMetadata.findMany({
         where: {
           userId: actorUserId,
           credentialId: activeTransferPayload.sourceCredentialId,
@@ -2632,7 +2689,7 @@ export async function POST(request: Request) {
           ...(Object.keys(sourceKeyFilter).length > 0 ? { key: sourceKeyFilter } : {}),
         },
         orderBy: { key: "asc" },
-        take: getTaskTransferBatchSize(),
+        take: batchSize,
         select: {
           id: true,
           key: true,
@@ -2661,10 +2718,6 @@ export async function POST(request: Request) {
         let syncCleanupFailed = 0
 
         if (activeTransferPayload.operation === "sync") {
-          const { client: destinationClient } = await getS3Client(
-            actorUserId,
-            activeTransferPayload.destinationCredentialId
-          )
           const cleanupResult = await cleanupSyncDestinationDrift({
             userId: actorUserId,
             payload: activeTransferPayload,
@@ -2887,18 +2940,7 @@ export async function POST(request: Request) {
         )
       }
 
-      const [sourceClientInfo, destinationClientInfo] = await Promise.all([
-        getS3Client(actorUserId, activeTransferPayload.sourceCredentialId),
-        getS3Client(actorUserId, activeTransferPayload.destinationCredentialId),
-      ])
-      const sourceClient = sourceClientInfo.client
-      const destinationClient = destinationClientInfo.client
-
-      const sameCredential =
-        activeTransferPayload.sourceCredentialId === activeTransferPayload.destinationCredentialId
-      const requiresDestinationComparison =
-        activeTransferPayload.operation === "copy" || activeTransferPayload.operation === "sync"
-      const mappedBatch = sourceBatch.map((sourceFile) => ({
+      let mappedBatch = sourceBatch.map((sourceFile) => ({
         sourceFile,
         destinationKey: mapTransferDestinationKey(
           activeTransferPayload,
@@ -2934,28 +2976,288 @@ export async function POST(request: Request) {
         )
       }
 
-      let remainingCacheSlots: number | null = null
-      if (
-        activeTransferPayload.operation === "copy" ||
-        activeTransferPayload.operation === "sync"
-      ) {
-        if (Number.isFinite(entitlements.fileLimit)) {
-          const currentCachedFileCount = await prisma.fileMetadata.count({
-            where: {
+      // Bulk-skip: split the batch into files skippable from cached metadata
+      // vs files that need actual transfer processing. Skippable files are
+      // counted immediately so we never iterate through them in the loop.
+      let bulkSkipReasons: Record<string, number> = {}
+      let actionableBatch: typeof mappedBatch = []
+      for (const item of mappedBatch) {
+        let skipReason: TransferSkipReason | null = null
+
+        if (
+          sameCredential &&
+          activeTransferPayload.sourceBucket === activeTransferPayload.destinationBucket &&
+          item.sourceFile.key === item.destinationKey
+        ) {
+          skipReason = "same_source_and_destination"
+        } else if (requiresDestinationComparison) {
+          const dest = destinationByKey.get(item.destinationKey)
+          if (dest) {
+            if (activeTransferPayload.operation === "copy") {
+              skipReason = "already_exists"
+            } else if (
+              activeTransferPayload.operation === "sync" &&
+              isDestinationUpToDateForSync(
+                { size: item.sourceFile.size, lastModified: item.sourceFile.lastModified },
+                dest
+              )
+            ) {
+              skipReason = "up_to_date"
+            }
+          }
+        }
+
+        if (skipReason) {
+          bulkSkipReasons[skipReason] = (bulkSkipReasons[skipReason] ?? 0) + 1
+        } else {
+          actionableBatch.push(item)
+        }
+      }
+
+      let bulkSkippedCount = Object.values(bulkSkipReasons).reduce((a, b) => a + b, 0)
+
+      // Emit a single summary event for all bulk-skipped files
+      if (bulkSkippedCount > 0) {
+        const reasonParts = Object.entries(bulkSkipReasons)
+          .map(([reason, count]) => `${count} ${formatTransferSkipReason(reason as TransferSkipReason)}`)
+          .join(", ")
+        try {
+          await prisma.backgroundTaskEvent.create({
+            data: {
+              taskId: candidate.id,
               userId: actorUserId,
-              isFolder: false,
+              eventType: "batch_skipped",
+              message: `Skipped ${bulkSkippedCount} files (${reasonParts})`,
+              metadata: {
+                count: bulkSkippedCount,
+                reasons: bulkSkipReasons,
+              },
             },
           })
-          remainingCacheSlots = Math.max(0, entitlements.fileLimit - currentCachedFileCount)
+        } catch {
+          // Non-critical
         }
+      }
+
+      // Fast-forward: when the entire batch was bulk-skipped, load subsequent
+      // batches immediately instead of returning to the worker poll loop.
+      // This avoids wasting one HTTP round-trip per skip-only batch.
+      while (
+        actionableBatch.length === 0 &&
+        sourceBatch.length >= batchSize
+      ) {
+        // Advance progress past the skipped batch
+        const lastSkippedKey = mappedBatch[mappedBatch.length - 1]!.sourceFile.key
+        progress.processed += bulkSkippedCount
+        progress.skipped += bulkSkippedCount
+        progress.cursorKey = lastSkippedKey
+        progress.remaining = Math.max(0, sourceTotal - progress.processed)
+        sourceKeyFilter.gt = lastSkippedKey
+
+        // Persist checkpoint so the UI reflects progress and cancel/pause is honoured
+        const ffCheckpoint = await persistClaimedTaskCheckpoint({
+          taskId: candidate.id,
+          userId: actorUserId,
+          claimedRunCount: candidate.runCount + 1,
+          normalUpdate: {
+            status: "in_progress",
+            attempts: 0,
+            nextRunAt: new Date(Date.now() + LOCK_SECONDS * 1000),
+            progress: progress as unknown as Prisma.InputJsonObject,
+            lastError: null,
+            completedAt: null,
+          },
+        })
+        if (ffCheckpoint.appliedMode !== "normal") {
+          return buildProcessedResponse(
+            {
+              taskId: candidate.id,
+              taskType: candidate.type,
+              taskStatus: ffCheckpoint.finalStatus,
+              runCount: candidate.runCount + 1,
+              attempts: 0,
+              lastError: null,
+              taskUserId: actorUserId,
+            },
+            {
+              done: true,
+              type: "object_transfer",
+              processedInBatch: bulkSkippedCount,
+              copiedInBatch: 0,
+              movedInBatch: 0,
+              skippedInBatch: bulkSkippedCount,
+              failedInBatch: 0,
+              timeBudgetReached: false,
+            }
+          )
+        }
+
+        // Load next batch
+        sourceBatch = await prisma.fileMetadata.findMany({
+          where: {
+            userId: actorUserId,
+            credentialId: activeTransferPayload.sourceCredentialId,
+            bucket: activeTransferPayload.sourceBucket,
+            isFolder: false,
+            ...(Object.keys(sourceKeyFilter).length > 0 ? { key: sourceKeyFilter } : {}),
+          },
+          orderBy: { key: "asc" },
+          take: batchSize,
+          select: {
+            id: true,
+            key: true,
+            extension: true,
+            size: true,
+            lastModified: true,
+          },
+        })
+
+        if (sourceBatch.length === 0) break
+
+        // Rebuild mapped batch and destination metadata
+        mappedBatch = sourceBatch.map((sourceFile) => ({
+          sourceFile,
+          destinationKey: mapTransferDestinationKey(activeTransferPayload, sourceFile.key),
+        }))
+
+        if (requiresDestinationComparison) {
+          const destinationRows = await prisma.fileMetadata.findMany({
+            where: {
+              userId: actorUserId,
+              credentialId: activeTransferPayload.destinationCredentialId,
+              bucket: activeTransferPayload.destinationBucket,
+              isFolder: false,
+              key: { in: mappedBatch.map((item) => item.destinationKey) },
+            },
+            select: {
+              key: true,
+              size: true,
+              lastModified: true,
+            },
+          })
+          destinationByKey = new Map(
+            destinationRows.map((row) => [
+              row.key,
+              { size: row.size, lastModified: row.lastModified },
+            ])
+          )
+        }
+
+        // Re-run bulk-skip on the new batch
+        bulkSkipReasons = {}
+        actionableBatch = []
+        for (const item of mappedBatch) {
+          let skipReason: TransferSkipReason | null = null
+
+          if (
+            sameCredential &&
+            activeTransferPayload.sourceBucket === activeTransferPayload.destinationBucket &&
+            item.sourceFile.key === item.destinationKey
+          ) {
+            skipReason = "same_source_and_destination"
+          } else if (requiresDestinationComparison) {
+            const dest = destinationByKey.get(item.destinationKey)
+            if (dest) {
+              if (activeTransferPayload.operation === "copy") {
+                skipReason = "already_exists"
+              } else if (
+                activeTransferPayload.operation === "sync" &&
+                isDestinationUpToDateForSync(
+                  { size: item.sourceFile.size, lastModified: item.sourceFile.lastModified },
+                  dest
+                )
+              ) {
+                skipReason = "up_to_date"
+              }
+            }
+          }
+
+          if (skipReason) {
+            bulkSkipReasons[skipReason] = (bulkSkipReasons[skipReason] ?? 0) + 1
+          } else {
+            actionableBatch.push(item)
+          }
+        }
+
+        bulkSkippedCount = Object.values(bulkSkipReasons).reduce((a, b) => a + b, 0)
+
+        if (bulkSkippedCount > 0) {
+          const reasonParts = Object.entries(bulkSkipReasons)
+            .map(([reason, count]) => `${count} ${formatTransferSkipReason(reason as TransferSkipReason)}`)
+            .join(", ")
+          try {
+            await prisma.backgroundTaskEvent.create({
+              data: {
+                taskId: candidate.id,
+                userId: actorUserId,
+                eventType: "batch_skipped",
+                message: `Skipped ${bulkSkippedCount} files (${reasonParts})`,
+                metadata: {
+                  count: bulkSkippedCount,
+                  reasons: bulkSkipReasons,
+                },
+              },
+            })
+          } catch {
+            // Non-critical
+          }
+        }
+      }
+
+      // If fast-forward exhausted all source files, persist the final skip
+      // progress and return. The next worker poll will see an empty sourceBatch
+      // and run the original completion handler (sync cleanup, audit, etc.).
+      if (sourceBatch.length === 0 || (sourceBatch.length < batchSize && actionableBatch.length === 0)) {
+        if (bulkSkippedCount > 0 && actionableBatch.length === 0) {
+          progress.processed += bulkSkippedCount
+          progress.skipped += bulkSkippedCount
+          progress.cursorKey = mappedBatch[mappedBatch.length - 1]?.sourceFile.key ?? progress.cursorKey
+          progress.remaining = Math.max(0, sourceTotal - progress.processed)
+        }
+
+        const ffFinalCheckpoint = await persistClaimedTaskCheckpoint({
+          taskId: candidate.id,
+          userId: actorUserId,
+          claimedRunCount: candidate.runCount + 1,
+          normalUpdate: {
+            status: "in_progress",
+            attempts: 0,
+            nextRunAt: new Date(),
+            progress: progress as unknown as Prisma.InputJsonObject,
+            lastError: null,
+            completedAt: null,
+          },
+        })
+
+        return buildProcessedResponse(
+          {
+            taskId: candidate.id,
+            taskType: candidate.type,
+            taskStatus: ffFinalCheckpoint.finalStatus,
+            runCount: candidate.runCount + 1,
+            attempts: 0,
+            lastError: null,
+            taskUserId: actorUserId,
+          },
+          {
+            done: ffFinalCheckpoint.appliedMode === "canceled",
+            type: "object_transfer",
+            processedInBatch: progress.processed,
+            copiedInBatch: 0,
+            movedInBatch: 0,
+            skippedInBatch: progress.skipped,
+            failedInBatch: 0,
+            timeBudgetReached: false,
+          }
+        )
       }
 
       let copiedInBatch = 0
       let movedInBatch = 0
       let deletedInBatch = 0
-      let skippedInBatch = 0
+      let skippedInBatch = bulkSkippedCount
       let failedInBatch = 0
-      let processedInBatch = 0
+      let processedInBatch = bulkSkippedCount
       let lastProcessedCursorKey = progress.cursorKey
       let timeBudgetReached = false
       let batchLastError: string | null = null
@@ -3317,7 +3619,7 @@ export async function POST(request: Request) {
         },
       }
 
-      for (let index = 0; index < mappedBatch.length; index += transferItemConcurrency) {
+      for (let index = 0; index < actionableBatch.length; index += transferItemConcurrency) {
         if (
           processedInBatch > 0 &&
           Date.now() - batchStartedAt >= getTaskWorkerUserBudgetMs()
@@ -3326,23 +3628,9 @@ export async function POST(request: Request) {
           break
         }
 
-        const slice = mappedBatch.slice(index, index + transferItemConcurrency)
+        const slice = actionableBatch.slice(index, index + transferItemConcurrency)
         const prepared = await Promise.all(
           slice.map(async ({ sourceFile, destinationKey }): Promise<PreparedTransferItem> => {
-            if (
-              sameCredential &&
-              activeTransferPayload.sourceBucket === activeTransferPayload.destinationBucket &&
-              sourceFile.key === destinationKey
-            ) {
-              return {
-                sourceFile,
-                destinationKey,
-                createsNewDestination: false,
-                skip: true,
-                skipReason: "same_source_and_destination",
-              }
-            }
-
             let destinationExisting = requiresDestinationComparison
               ? destinationByKey.get(destinationKey)
               : undefined
@@ -3714,6 +4002,16 @@ export async function POST(request: Request) {
         lastProcessedCursorKey = slice[slice.length - 1]?.sourceFile.key ?? lastProcessedCursorKey
       }
 
+      // When the actionable loop completed fully (no time budget break),
+      // advance cursor to the end of the original batch so bulk-skipped
+      // files at the tail are not re-fetched in the next batch call.
+      if (!timeBudgetReached && bulkSkippedCount > 0 && mappedBatch.length > 0) {
+        const lastBatchKey = mappedBatch[mappedBatch.length - 1]!.sourceFile.key
+        if (!lastProcessedCursorKey || lastBatchKey > lastProcessedCursorKey) {
+          lastProcessedCursorKey = lastBatchKey
+        }
+      }
+
       // Clean up stale destination metadata entries discovered during sync
       // verification. These are cache entries for files no longer in S3.
       if (staleDestinationKeys.length > 0) {
@@ -4003,7 +4301,9 @@ export async function POST(request: Request) {
     for (const group of grouped.values()) {
       let client = clients.get(group.credentialId)
       if (!client) {
-        const response = await getS3Client(actorUserId, group.credentialId)
+        const response = await getS3Client(actorUserId, group.credentialId, {
+          trafficClass: "background",
+        })
         client = response.client
         clients.set(group.credentialId, client)
       }

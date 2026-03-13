@@ -170,6 +170,7 @@ function DashboardContent() {
       return (payload?.buckets ?? []) as BucketRef[]
     },
     enabled: !bucket,
+    retry: false,
   })
 
   // Check versioning status for the current bucket

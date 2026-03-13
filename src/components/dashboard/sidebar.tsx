@@ -90,6 +90,7 @@ export function Sidebar({
       const data = await res.json()
       return data.buckets ?? []
     },
+    retry: false,
   })
 
   const { data: credentials = [] } = useQuery<Credential[]>({

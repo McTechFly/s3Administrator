@@ -128,7 +128,9 @@ export async function GET() {
             const existingClientPromise = clientPromiseByCredential.get(target.credentialId)
             const clientPromise =
               existingClientPromise ??
-              getS3Client(userId, target.credentialId)
+              getS3Client(userId, target.credentialId, {
+                trafficClass: "background",
+              })
 
             if (!existingClientPromise) {
               clientPromiseByCredential.set(target.credentialId, clientPromise)

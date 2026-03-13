@@ -30,6 +30,20 @@ interface UserCredentialRef {
   provider: string
 }
 
+type S3ClientInstance = Awaited<ReturnType<typeof getS3Client>>["client"]
+
+const LIST_BUCKETS_TIMEOUT_MS = 8_000
+const BUCKET_LIST_CACHE_TTL_MS = 30_000
+const BUCKET_LIST_STALE_TTL_MS = 5 * 60 * 1000
+
+interface CachedBucketListEntry {
+  freshUntil: number
+  staleUntil: number
+  buckets: ListedBucket[]
+}
+
+const bucketListCache = new Map<string, CachedBucketListEntry>()
+
 function getS3ErrorCode(error: unknown): string {
   if (!error || typeof error !== "object") return ""
   const candidate = error as { Code?: unknown; code?: unknown; name?: unknown }
@@ -47,25 +61,121 @@ function getS3ErrorMessage(error: unknown): string {
   return "S3 operation failed"
 }
 
+function buildBucketListCacheKey(userId: string, scope: string): string {
+  return `${userId}:${scope}`
+}
+
+function readCachedBucketList(
+  cacheKey: string,
+  now: number,
+  allowStale = false
+): ListedBucket[] | null {
+  const cached = bucketListCache.get(cacheKey)
+  if (!cached) return null
+  if (cached.freshUntil > now) return cached.buckets
+  if (allowStale && cached.staleUntil > now) return cached.buckets
+  bucketListCache.delete(cacheKey)
+  return null
+}
+
+function writeCachedBucketList(cacheKey: string, buckets: ListedBucket[]): ListedBucket[] {
+  const now = Date.now()
+  bucketListCache.set(cacheKey, {
+    freshUntil: now + BUCKET_LIST_CACHE_TTL_MS,
+    staleUntil: now + BUCKET_LIST_STALE_TTL_MS,
+    buckets,
+  })
+  return buckets
+}
+
+function invalidateCachedBucketLists(userId: string) {
+  const prefix = `${userId}:`
+  for (const cacheKey of bucketListCache.keys()) {
+    if (cacheKey.startsWith(prefix)) {
+      bucketListCache.delete(cacheKey)
+    }
+  }
+}
+
+function isTimeoutStyleS3Error(error: unknown): boolean {
+  const code = getS3ErrorCode(error)
+  if (code === "ETIMEDOUT" || code === "TimeoutError" || code === "AbortError") {
+    return true
+  }
+
+  const message = getS3ErrorMessage(error).toLowerCase()
+  return (
+    message.includes("timed out") ||
+    message.includes("timeout") ||
+    message.includes("aborterror")
+  )
+}
+
+async function listBucketsWithTimeout(client: S3ClientInstance) {
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), LIST_BUCKETS_TIMEOUT_MS)
+
+  try {
+    return await client.send(new ListBucketsCommand({}), {
+      abortSignal: controller.signal,
+    })
+  } finally {
+    clearTimeout(timeoutId)
+  }
+}
+
 async function listBucketsForCredential(params: {
   userId: string
   credential: UserCredentialRef
+  client?: S3ClientInstance
+  bypassCache?: boolean
 }): Promise<ListedBucket[]> {
-  const { client } = await getS3Client(params.userId, params.credential.id)
-  const response = await client.send(new ListBucketsCommand({}))
+  const cacheKey = buildBucketListCacheKey(params.userId, `credential:${params.credential.id}`)
+  const now = Date.now()
+  if (!params.bypassCache) {
+    const cached = readCachedBucketList(cacheKey, now)
+    if (cached) return cached
+  }
 
-  return (response.Buckets ?? [])
-    .map((bucket) => ({
-      name: bucket.Name ?? "",
-      creationDate: bucket.CreationDate?.toISOString() ?? null,
-      credentialId: params.credential.id,
-      credentialLabel: params.credential.label,
-      provider: params.credential.provider,
-    }))
-    .filter((bucket) => bucket.name.length > 0)
+  const client =
+    params.client ?? (await getS3Client(params.userId, params.credential.id)).client
+
+  try {
+    const response = await listBucketsWithTimeout(client)
+
+    return writeCachedBucketList(
+      cacheKey,
+      (response.Buckets ?? [])
+        .map((bucket) => ({
+          name: bucket.Name ?? "",
+          creationDate: bucket.CreationDate?.toISOString() ?? null,
+          credentialId: params.credential.id,
+          credentialLabel: params.credential.label,
+          provider: params.credential.provider,
+        }))
+        .filter((bucket) => bucket.name.length > 0)
+    )
+  } catch (error) {
+    const stale = params.bypassCache ? null : readCachedBucketList(cacheKey, now, true)
+    if (stale && isTimeoutStyleS3Error(error)) {
+      console.warn(`Using stale bucket cache for credential ${params.credential.id}:`, error)
+      return stale
+    }
+    throw error
+  }
 }
 
-async function listBucketsAcrossCredentials(userId: string): Promise<ListedBucket[]> {
+async function listBucketsAcrossCredentials(
+  userId: string,
+  options?: { bypassCache?: boolean }
+): Promise<ListedBucket[]> {
+  const cacheKey = buildBucketListCacheKey(userId, "all")
+  const now = Date.now()
+  if (!options?.bypassCache) {
+    const cached = readCachedBucketList(cacheKey, now)
+    if (cached) return cached
+  }
+
   const credentials = await prisma.s3Credential.findMany({
     where: { userId },
     select: {
@@ -78,25 +188,48 @@ async function listBucketsAcrossCredentials(userId: string): Promise<ListedBucke
 
   const allBuckets: ListedBucket[] = []
   const seenBucketNames = new Set<string>()
+  let successCount = 0
 
-  for (const credential of credentials) {
-    try {
-      const buckets = await listBucketsForCredential({
+  const results = await Promise.allSettled(
+    credentials.map((credential) =>
+      listBucketsForCredential({
         userId,
         credential,
+        bypassCache: options?.bypassCache,
       })
+    )
+  )
 
-      for (const bucket of buckets) {
-        if (seenBucketNames.has(bucket.name)) continue
-        seenBucketNames.add(bucket.name)
-        allBuckets.push(bucket)
-      }
-    } catch (error) {
-      console.warn(`Failed to list buckets for credential ${credential.id}:`, error)
+  for (const [index, result] of results.entries()) {
+    const credential = credentials[index]
+    if (!credential) continue
+
+    if (result.status !== "fulfilled") {
+      console.warn(`Failed to list buckets for credential ${credential.id}:`, result.reason)
+      continue
+    }
+
+    successCount += 1
+    for (const bucket of result.value) {
+      if (seenBucketNames.has(bucket.name)) continue
+      seenBucketNames.add(bucket.name)
+      allBuckets.push(bucket)
     }
   }
 
-  return allBuckets
+  if (successCount === 0) {
+    const stale = options?.bypassCache ? null : readCachedBucketList(cacheKey, now, true)
+    if (stale) {
+      console.warn(`Using stale bucket cache for user ${userId} after live bucket listing failed`)
+      return stale
+    }
+
+    if (credentials.length > 0) {
+      throw new Error("Failed to list buckets for every configured credential")
+    }
+  }
+
+  return writeCachedBucketList(cacheKey, allBuckets)
 }
 
 export async function GET(request: NextRequest) {
@@ -117,17 +250,15 @@ export async function GET(request: NextRequest) {
 
     if (credentialId || !all) {
       const { client, credential } = await getS3Client(session.user.id, credentialId || undefined)
-      const response = await client.send(new ListBucketsCommand({}))
-
-      const buckets: ListedBucket[] = (response.Buckets ?? [])
-        .map((bucket) => ({
-          name: bucket.Name ?? "",
-          creationDate: bucket.CreationDate?.toISOString() ?? null,
-          credentialId: credential.id,
-          credentialLabel: credential.label,
+      const buckets = await listBucketsForCredential({
+        userId: session.user.id,
+        credential: {
+          id: credential.id,
+          label: credential.label,
           provider: credential.provider,
-        }))
-        .filter((bucket) => bucket.name.length > 0)
+        },
+        client,
+      })
 
       return NextResponse.json({ buckets })
     }
@@ -175,7 +306,9 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Failed to resolve plan entitlements" }, { status: 403 })
     }
 
-    const existingBuckets = await listBucketsAcrossCredentials(session.user.id)
+    const existingBuckets = await listBucketsAcrossCredentials(session.user.id, {
+      bypassCache: true,
+    })
     if (
       Number.isFinite(entitlements.bucketLimit) &&
       !existingBuckets.some((item) => item.name === bucket) &&
@@ -205,6 +338,7 @@ export async function POST(request: NextRequest) {
     }
 
     await client.send(new CreateBucketCommand(createInput))
+    invalidateCachedBucketLists(session.user.id)
 
     await logUserAuditAction({
       userId: session.user.id,
@@ -321,6 +455,7 @@ export async function DELETE(request: NextRequest) {
     })
 
     await rebuildUserExtensionStats(session.user.id)
+    invalidateCachedBucketLists(session.user.id)
 
     await logUserAuditAction({
       userId: session.user.id,

@@ -1,7 +1,38 @@
+import { Agent as HttpAgent } from "node:http"
+import { Agent as HttpsAgent } from "node:https"
 import { S3Client } from "@aws-sdk/client-s3"
+import { NodeHttpHandler } from "@smithy/node-http-handler"
 import { prisma } from "@/lib/db"
 import { decrypt } from "@/lib/crypto"
 import { quietAwsLogger } from "@/lib/aws-logger"
+
+export type S3TrafficClass = "interactive" | "background"
+
+interface S3ClientOptions {
+  trafficClass?: S3TrafficClass
+}
+
+function createS3HttpHandler(maxSockets: number): NodeHttpHandler {
+  return new NodeHttpHandler({
+    connectionTimeout: 5_000,
+    requestTimeout: 0,
+    httpsAgent: new HttpsAgent({
+      maxSockets,
+      keepAlive: true,
+      keepAliveMsecs: 30_000,
+    }),
+    httpAgent: new HttpAgent({
+      maxSockets,
+      keepAlive: true,
+      keepAliveMsecs: 30_000,
+    }),
+  })
+}
+
+const s3HttpHandlerByTrafficClass: Record<S3TrafficClass, NodeHttpHandler> = {
+  interactive: createS3HttpHandler(24),
+  background: createS3HttpHandler(64),
+}
 
 const LOCAL_HOSTNAMES = new Set(["localhost", "127.0.0.1", "0.0.0.0", "::1"])
 const S3_CLIENT_CACHE_TTL_MS = 5 * 60 * 1000
@@ -93,11 +124,12 @@ export function createS3ClientFromConfig(config: {
   provider: string
   accessKeyId: string
   secretAccessKey: string
-}): {
+}, options?: S3ClientOptions): {
   client: S3Client
   endpoint: string
   region: string
 } {
+  const trafficClass = options?.trafficClass ?? "interactive"
   const endpoint = normalizeS3Endpoint(config.endpoint)
   const region = normalizeS3Region(config.provider, config.region)
   const signingRegion = getSigningRegion(config.provider, region)
@@ -114,6 +146,7 @@ export function createS3ClientFromConfig(config: {
     requestChecksumCalculation: "WHEN_REQUIRED",
     responseChecksumValidation: "WHEN_REQUIRED",
     logger: quietAwsLogger,
+    requestHandler: s3HttpHandlerByTrafficClass[trafficClass],
   })
 
   return { client, endpoint, region }
@@ -121,7 +154,8 @@ export function createS3ClientFromConfig(config: {
 
 export async function getS3Client(
   userId: string,
-  credentialId?: string
+  credentialId?: string,
+  options?: S3ClientOptions
 ): Promise<{
   client: S3Client
   credential: {
@@ -132,7 +166,10 @@ export async function getS3Client(
     label: string
   }
 }> {
-  const cacheKey = credentialId ? `${userId}:${credentialId}` : `${userId}:default`
+  const trafficClass = options?.trafficClass ?? "interactive"
+  const cacheKey = credentialId
+    ? `${userId}:${credentialId}:${trafficClass}`
+    : `${userId}:default:${trafficClass}`
   const now = Date.now()
   const cached = s3ClientCache.get(cacheKey)
   if (cached && cached.expiresAt > now) {
@@ -162,7 +199,7 @@ export async function getS3Client(
     provider: credential.provider,
     accessKeyId: accessKey,
     secretAccessKey: secretKey,
-  })
+  }, options)
 
   const value = {
     client,

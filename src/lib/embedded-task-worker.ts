@@ -5,7 +5,7 @@ import {
   getTaskWorkerScanIntervalSeconds,
 } from "@/lib/task-engine-config"
 import { taskReadyEmitter, TASK_READY_EVENT } from "@/lib/task-notify"
-const PORT = process.env.PORT || "3000"
+import { executeTaskForUser } from "@/lib/task-executor"
 
 const TASK_TYPES = ["bulk_delete", "object_transfer"] as const
 
@@ -29,16 +29,9 @@ async function findDueUserTypes(): Promise<DueUserType[]> {
 
 async function processOnce(userId: string, type?: string): Promise<boolean> {
   try {
-    const typeParam = type ? `&type=${encodeURIComponent(type)}` : ""
-    const res = await fetch(`http://localhost:${PORT}/api/tasks/process?userId=${encodeURIComponent(userId)}${typeParam}`, {
-      method: "POST",
-      headers: {
-        "x-task-engine-token": process.env.TASK_ENGINE_INTERNAL_TOKEN ?? "embedded-worker",
-      },
-    })
-    if (!res.ok) return false
-    const body = (await res.json()) as { processed?: boolean }
-    return Boolean(body.processed)
+    const token = process.env.TASK_ENGINE_INTERNAL_TOKEN ?? "embedded-worker"
+    const result = await executeTaskForUser(userId, token, type)
+    return Boolean(result.processed)
   } catch {
     return false
   }

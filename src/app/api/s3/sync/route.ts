@@ -38,7 +38,9 @@ export async function POST(request: NextRequest) {
     const fileLimit = entitlements.fileLimit
     const storageLimit = entitlements.storageLimitBytes
 
-    const { client, credential } = await getS3Client(session.user.id, credentialId)
+    const { client, credential } = await getS3Client(session.user.id, credentialId, {
+      trafficClass: "background",
+    })
     const bucketLimitViolation = await getBucketLimitViolation({
       userId: session.user.id,
       credentialId: credential.id,

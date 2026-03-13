@@ -1086,7 +1086,7 @@ export default function TasksPage() {
             {Object.entries(taskEvents.counts)
               .sort(([a], [b]) => a.localeCompare(b))
               .map(([eventType, count]) => {
-                const label = eventType.replace("file_", "")
+                const label = eventType.replace("file_", "").replace("batch_", "")
                 const isActive = taskEventsFilter === eventType
                 const displayCount =
                   eventType === "file_progress" ? progressFileCount : count
@@ -1099,7 +1099,7 @@ export default function TasksPage() {
                         ? "border-primary bg-primary text-primary-foreground"
                         : eventType === "file_copied" || eventType === "file_moved"
                           ? "border-green-300 bg-green-50 text-green-700 hover:bg-green-100 dark:border-green-700 dark:bg-green-950 dark:text-green-300"
-                          : eventType === "file_skipped"
+                          : eventType === "file_skipped" || eventType === "batch_skipped"
                             ? "border-gray-300 bg-gray-50 text-gray-600 hover:bg-gray-100 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-400"
                             : eventType === "file_progress"
                               ? "border-blue-300 bg-blue-50 text-blue-700 hover:bg-blue-100 dark:border-blue-700 dark:bg-blue-950 dark:text-blue-300"
@@ -1177,7 +1177,7 @@ export default function TasksPage() {
                 className={`break-all py-0.5 whitespace-normal ${
                   event.eventType === "file_copied" || event.eventType === "file_moved"
                     ? "text-green-700 dark:text-green-400"
-                    : event.eventType === "file_skipped"
+                    : event.eventType === "file_skipped" || event.eventType === "batch_skipped"
                       ? "text-muted-foreground"
                       : event.eventType === "file_failed" || event.eventType === "file_missing_source"
                         ? "text-red-600 dark:text-red-400"

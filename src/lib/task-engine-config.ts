@@ -31,19 +31,19 @@ export function isTaskEngineV2Enabled(): boolean {
 }
 
 export function getTaskWorkerConcurrency(): number {
-  return parseIntegerEnv(process.env.TASK_WORKER_CONCURRENCY, community ? 24 : 12, 1, 128)
+  return parseIntegerEnv(process.env.TASK_WORKER_CONCURRENCY, community ? 8 : 12, 1, 128)
 }
 
 export function getTaskMaxActivePerUser(): number {
-  return parseIntegerEnv(process.env.TASK_MAX_ACTIVE_PER_USER, community ? 8 : 4, 1, 32)
+  return parseIntegerEnv(process.env.TASK_MAX_ACTIVE_PER_USER, 4, 1, 32)
 }
 
 export function getTaskWorkerPerUserParallelism(): number {
-  return parseIntegerEnv(process.env.TASK_WORKER_PER_USER_PARALLELISM, community ? 16 : 8, 1, 32)
+  return parseIntegerEnv(process.env.TASK_WORKER_PER_USER_PARALLELISM, community ? 4 : 8, 1, 32)
 }
 
 export function getTaskWorkerUserBurst(): number {
-  return parseIntegerEnv(process.env.TASK_WORKER_USER_BURST, community ? 16 : 8, 1, 64)
+  return parseIntegerEnv(process.env.TASK_WORKER_USER_BURST, community ? 4 : 8, 1, 64)
 }
 
 export function getTaskWorkerUserBudgetMs(): number {
@@ -55,23 +55,23 @@ export function getTaskWorkerScanIntervalSeconds(): number {
 }
 
 export function getTaskTransferItemConcurrency(): number {
-  return parseIntegerEnv(process.env.TASK_TRANSFER_ITEM_CONCURRENCY, community ? 12 : 8, 1, 32)
+  return parseIntegerEnv(process.env.TASK_TRANSFER_ITEM_CONCURRENCY, community ? 4 : 8, 1, 32)
 }
 
 export function getTaskTransferBatchSize(): number {
-  return parseIntegerEnv(process.env.TASK_TRANSFER_BATCH_SIZE, community ? 200 : 100, 10, 1_000)
+  return parseIntegerEnv(process.env.TASK_TRANSFER_BATCH_SIZE, 100, 10, 1_000)
 }
 
 export function getTaskTransferMultipartCopyPartConcurrency(): number {
-  return parseIntegerEnv(process.env.TASK_TRANSFER_MULTIPART_COPY_PART_CONCURRENCY, 8, 1, 32)
+  return parseIntegerEnv(process.env.TASK_TRANSFER_MULTIPART_COPY_PART_CONCURRENCY, 4, 1, 32)
 }
 
 export function getTaskTransferRelayQueueSize(): number {
-  return parseIntegerEnv(process.env.TASK_TRANSFER_RELAY_QUEUE_SIZE, 8, 1, 32)
+  return parseIntegerEnv(process.env.TASK_TRANSFER_RELAY_QUEUE_SIZE, 2, 1, 32)
 }
 
 export function getTaskTransferRelayPartSizeMb(): number {
-  return parseIntegerEnv(process.env.TASK_TRANSFER_RELAY_PART_SIZE_MB, 32, 5, 256)
+  return parseIntegerEnv(process.env.TASK_TRANSFER_RELAY_PART_SIZE_MB, 16, 5, 256)
 }
 
 export function getTaskTransferPreferServerCopySameBackend(): boolean {
@@ -115,7 +115,7 @@ export function getTaskTransferParallelChunkedDownloadThresholdMb(): number {
 }
 
 export function getTaskTransferParallelDownloadStreams(): number {
-  return parseIntegerEnv(process.env.TASK_TRANSFER_PARALLEL_DOWNLOAD_STREAMS, 4, 1, 16)
+  return parseIntegerEnv(process.env.TASK_TRANSFER_PARALLEL_DOWNLOAD_STREAMS, 2, 1, 16)
 }
 
 export function getTaskBulkDeleteBatchSize(): number {

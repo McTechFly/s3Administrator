@@ -86,6 +86,12 @@ interface BucketRef {
   credentialId: string
 }
 
+interface OngoingTasksResponse {
+  tasks?: Array<{
+    status: "pending" | "in_progress" | "completed" | "failed" | "canceled"
+  }>
+}
+
 interface RefreshProgress {
   current: number
   total: number
@@ -138,6 +144,21 @@ export function DashboardOverview() {
       return res.json() as Promise<UsageResponse>
     },
   })
+
+  const { data: ongoingTasksData } = useQuery<OngoingTasksResponse>({
+    queryKey: ["ongoing-transfer-tasks"],
+    queryFn: async () => {
+      const res = await fetch("/api/tasks?scope=ongoing&type=object_transfer&limit=1")
+      if (!res.ok) return { tasks: [] }
+      return res.json() as Promise<OngoingTasksResponse>
+    },
+    staleTime: 30 * 1000,
+    refetchInterval: 30 * 1000,
+  })
+
+  const hasOngoingTransfers = (ongoingTasksData?.tasks ?? []).some(
+    (task) => task.status === "pending" || task.status === "in_progress"
+  )
 
   const runLiveRefresh = useCallback(async (trigger: "auto" | "manual") => {
     if (isRefreshingRef.current) return
@@ -220,6 +241,7 @@ export function DashboardOverview() {
   }, [queryClient])
 
   useEffect(() => {
+    if (hasOngoingTransfers) return
     if (autoRefreshStartedRef.current) return
     autoRefreshStartedRef.current = true
 
@@ -232,7 +254,7 @@ export function DashboardOverview() {
 
     localStorage.setItem(AUTO_SYNC_KEY, String(Date.now()))
     void runLiveRefresh("auto")
-  }, [runLiveRefresh])
+  }, [hasOngoingTransfers, runLiveRefresh])
 
   if (isLoading) {
     return (
