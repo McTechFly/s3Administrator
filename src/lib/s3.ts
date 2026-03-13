@@ -29,14 +29,25 @@ function createS3HttpHandler(maxSockets: number): NodeHttpHandler {
   })
 }
 
+function parseS3IntEnv(key: string, defaultValue: number, min: number, max: number): number {
+  const raw = process.env[key]
+  if (!raw) return defaultValue
+  const parsed = Number.parseInt(raw, 10)
+  if (!Number.isFinite(parsed)) return defaultValue
+  return Math.min(max, Math.max(min, parsed))
+}
+
+const S3_INTERACTIVE_MAX_SOCKETS = parseS3IntEnv("S3_INTERACTIVE_MAX_SOCKETS", 24, 4, 128)
+const S3_BACKGROUND_MAX_SOCKETS = parseS3IntEnv("S3_BACKGROUND_MAX_SOCKETS", 32, 4, 128)
+
 const s3HttpHandlerByTrafficClass: Record<S3TrafficClass, NodeHttpHandler> = {
-  interactive: createS3HttpHandler(24),
-  background: createS3HttpHandler(64),
+  interactive: createS3HttpHandler(S3_INTERACTIVE_MAX_SOCKETS),
+  background: createS3HttpHandler(S3_BACKGROUND_MAX_SOCKETS),
 }
 
 const LOCAL_HOSTNAMES = new Set(["localhost", "127.0.0.1", "0.0.0.0", "::1"])
 const S3_CLIENT_CACHE_TTL_MS = 5 * 60 * 1000
-const S3_CLIENT_CACHE_MAX_ENTRIES = 128
+const S3_CLIENT_CACHE_MAX_ENTRIES = parseS3IntEnv("S3_CLIENT_CACHE_MAX_ENTRIES", 48, 8, 256)
 
 interface CachedS3ClientEntry {
   expiresAt: number

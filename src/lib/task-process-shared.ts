@@ -17,7 +17,13 @@ import {
 // Constants
 // ---------------------------------------------------------------------------
 
-export const LOCK_SECONDS = 45
+export const LOCK_SECONDS = (() => {
+  const raw = process.env.TASK_LOCK_SECONDS
+  if (!raw) return 120
+  const parsed = Number.parseInt(raw, 10)
+  if (!Number.isFinite(parsed)) return 120
+  return Math.min(600, Math.max(30, parsed))
+})()
 export const SYNC_POLL_INTERVAL_SECONDS = 60
 export const PAUSE_HOLD_MS = 365 * 24 * 60 * 60 * 1000
 export const ONE_MEBIBYTE_BYTES = 1024 * 1024
@@ -27,6 +33,41 @@ export const DEFAULT_MULTIPART_PART_SIZE_BIGINT = BigInt(DEFAULT_MULTIPART_PART_
 export const MAX_MULTIPART_PARTS = 10_000
 export const MAX_RELAY_BUFFERED_BYTES = 512 * ONE_MEBIBYTE_BYTES
 export const SINGLE_REQUEST_COPY_MAX_BYTES = BigInt(5 * 1024 * 1024 * 1024)
+
+// ---------------------------------------------------------------------------
+// Global relay memory budget
+// ---------------------------------------------------------------------------
+// Caps the total bytes buffered across all concurrent relay uploads in this
+// process, preventing OOM when many large-file transfers run in parallel.
+// Default 2 GB; set TASK_RELAY_GLOBAL_MEMORY_BUDGET_MB to override.
+
+const RELAY_GLOBAL_BUDGET_BYTES = (() => {
+  const raw = process.env.TASK_RELAY_GLOBAL_MEMORY_BUDGET_MB
+  const defaultMb = 2_048
+  if (!raw) return defaultMb * ONE_MEBIBYTE_BYTES
+  const parsed = Number.parseInt(raw, 10)
+  if (!Number.isFinite(parsed)) return defaultMb * ONE_MEBIBYTE_BYTES
+  return Math.min(16_384, Math.max(128, parsed)) * ONE_MEBIBYTE_BYTES
+})()
+
+let relayGlobalBytesInUse = 0
+
+/**
+ * Try to reserve `bytes` from the global relay memory budget.
+ * Returns true if the reservation succeeded, false if it would exceed budget.
+ */
+export function tryReserveRelayMemory(bytes: number): boolean {
+  if (relayGlobalBytesInUse + bytes > RELAY_GLOBAL_BUDGET_BYTES) {
+    return false
+  }
+  relayGlobalBytesInUse += bytes
+  return true
+}
+
+/** Release previously reserved relay memory bytes. */
+export function releaseRelayMemory(bytes: number): void {
+  relayGlobalBytesInUse = Math.max(0, relayGlobalBytesInUse - bytes)
+}
 export const TRANSFER_PROGRESS_MILESTONES = [25, 50, 75, 90, 100] as const
 export const TRANSIENT_S3_ERROR_CODES = new Set([
   "SlowDown",
@@ -999,6 +1040,32 @@ export async function persistClaimedTaskCheckpoint(
         : "normal",
     finalStatus: current?.status ?? normalStatus,
   }
+}
+
+/**
+ * Extend the lock on a claimed task without writing a full checkpoint.
+ * Call this during long-running S3 operations (multipart relay/copy) to
+ * prevent lock expiration while the worker is still actively processing.
+ * Returns true if the lock was successfully extended.
+ */
+export async function refreshTaskLock(params: {
+  taskId: string
+  userId: string
+  claimedRunCount: number
+}): Promise<boolean> {
+  const lockUntil = new Date(Date.now() + LOCK_SECONDS * 1000)
+  const result = await prisma.backgroundTask.updateMany({
+    where: {
+      id: params.taskId,
+      userId: params.userId,
+      runCount: params.claimedRunCount,
+      status: "in_progress",
+    },
+    data: {
+      nextRunAt: lockUntil,
+    },
+  })
+  return result.count > 0
 }
 
 export async function failTaskTerminal(params: {

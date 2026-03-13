@@ -6,8 +6,19 @@ const globalForPrisma = globalThis as unknown as {
   prisma: PrismaClient | undefined
 }
 
+function getDbPoolMax(): number {
+  const raw = process.env.DATABASE_POOL_MAX
+  if (!raw) return 20
+  const parsed = Number.parseInt(raw, 10)
+  if (!Number.isFinite(parsed)) return 20
+  return Math.min(200, Math.max(1, parsed))
+}
+
 function createPrismaClient() {
-  const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL! })
+  const adapter = new PrismaPg({
+    connectionString: process.env.DATABASE_URL!,
+    max: getDbPoolMax(),
+  })
   const client = new PrismaClient({
     adapter,
     log: [

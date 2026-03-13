@@ -122,6 +122,10 @@ export function getTaskBulkDeleteBatchSize(): number {
   return parseIntegerEnv(process.env.TASK_BULK_DELETE_BATCH_SIZE, 1_000, 100, 5_000)
 }
 
+export function getTaskGlobalMaxActive(): number {
+  return parseIntegerEnv(process.env.TASK_GLOBAL_MAX_ACTIVE, 0, 0, 10_000)
+}
+
 export function getTaskMissedScheduleGraceSeconds(): number {
   return parseIntegerEnv(process.env.TASK_MISSED_SCHEDULE_GRACE_SECONDS, 120, 5, 86_400)
 }

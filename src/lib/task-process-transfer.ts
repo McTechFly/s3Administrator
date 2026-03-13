@@ -95,11 +95,14 @@ import {
   buildProcessedResponse,
   snapshotFromCheckpoint,
   persistClaimedTaskCheckpoint,
+  refreshTaskLock,
   failTaskTerminal,
   upsertFileMetadataBatch,
   resolveTaskPlanPayload,
   deleteKeysFromBucket,
   emptyTransferProgress,
+  tryReserveRelayMemory,
+  releaseRelayMemory,
 } from "@/lib/task-process-shared"
 
 export class BandwidthThrottleTransform extends Transform {
@@ -435,6 +438,16 @@ export async function copyObjectAcrossLocations(params: {
   async function multipartRelayObjectAcrossLocations(
     strategy: TransferStrategy = "multipart_relay_upload"
   ): Promise<void> {
+    // Reserve memory from the global relay budget before buffering.
+    // Use MAX_RELAY_BUFFERED_BYTES as worst-case reservation per relay.
+    const reservedBytes = MAX_RELAY_BUFFERED_BYTES
+    if (!tryReserveRelayMemory(reservedBytes)) {
+      throw new Error(
+        "Global relay memory budget exhausted — too many concurrent relay uploads"
+      )
+    }
+
+    try {
     await emitStage(strategy, "copying")
 
     const bandwidthLimitMbps = getTaskTransferBandwidthLimitMbps()
@@ -592,6 +605,9 @@ export async function copyObjectAcrossLocations(params: {
         })
       ).catch(() => {})
       throw error
+    }
+    } finally {
+      releaseRelayMemory(reservedBytes)
     }
   }
 
@@ -2059,6 +2075,14 @@ export async function processObjectTransferTask(
       timeBudgetReached = true
       break
     }
+
+    // Extend the task lock before each slice to prevent expiration during
+    // long-running S3 operations (multipart relay/copy of large files).
+    await refreshTaskLock({
+      taskId: candidate.id,
+      userId: actorUserId,
+      claimedRunCount: candidate.runCount + 1,
+    })
 
     const slice = actionableBatch.slice(index, index + transferItemConcurrency)
     const prepared = await Promise.all(

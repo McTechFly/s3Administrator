@@ -6,6 +6,7 @@ import { logUserAuditAction } from "@/lib/audit-logger"
 import {
   getTaskEngineInternalToken,
   getTaskMaxActivePerUser,
+  getTaskGlobalMaxActive,
   getTaskMissedScheduleGraceSeconds,
 } from "@/lib/task-engine-config"
 import {
@@ -113,29 +114,46 @@ export async function POST(request: Request) {
       })
     }
 
+    // Global throughput cap: when set, limit the total number of in_progress
+    // tasks across all users to prevent resource exhaustion under load.
+    const globalMax = getTaskGlobalMaxActive()
+    if (globalMax > 0) {
+      const globalLocked = await prisma.backgroundTask.count({
+        where: {
+          status: "in_progress",
+          lifecycleState: "active",
+          nextRunAt: { gt: now },
+        },
+      })
+      if (globalLocked >= globalMax) {
+        return NextResponse.json({
+          processed: false,
+          message: "Global task concurrency limit reached",
+        })
+      }
+    }
+
     // Recover tasks stuck in cancel-transition: lifecycleState was set to
     // "canceled" while the task was in_progress, but the worker never
     // finalised the status (crash, timeout, etc.).  Once the lock
     // (nextRunAt) has expired we know no worker is actively processing
     // the task, so we can safely move it to its terminal state.
-    await prisma.backgroundTask.updateMany({
-      where: {
-        userId: actorUserId,
-        status: "in_progress",
-        lifecycleState: "canceled",
-        nextRunAt: { lte: now },
-      },
-      data: {
-        status: "canceled",
-        attempts: 0,
-        lastError: null,
-        completedAt: now,
-        nextRunAt: now,
-        isRecurring: false,
-        scheduleCron: null,
-        scheduleIntervalSeconds: null,
-      },
-    })
+    // Uses NOW() for clock-skew-safe comparison.
+    await prisma.$executeRaw(Prisma.sql`
+      UPDATE "BackgroundTask"
+      SET "status" = 'canceled',
+          "attempts" = 0,
+          "lastError" = NULL,
+          "completedAt" = NOW(),
+          "nextRunAt" = NOW(),
+          "isRecurring" = false,
+          "scheduleCron" = NULL,
+          "scheduleIntervalSeconds" = NULL
+      WHERE "userId" = ${actorUserId}
+        AND "status" = 'in_progress'
+        AND "lifecycleState" = 'canceled'
+        AND "nextRunAt" <= NOW()
+    `)
 
     const staleScheduleGraceMs = getTaskMissedScheduleGraceSeconds() * 1000
     const realignedFutureSchedule = await realignFutureRecurringRun({
@@ -271,31 +289,32 @@ export async function POST(request: Request) {
       return NextResponse.json({ processed: false, message: "No pending tasks" })
     }
 
-    const lockUntil = new Date(Date.now() + LOCK_SECONDS * 1000)
-    const claimed = await prisma.backgroundTask.updateMany({
-      where: {
-        id: candidate.id,
-        userId: actorUserId,
-        lifecycleState: "active",
-        status: {
-          in: ["pending", "in_progress"],
-        },
-        nextRunAt: {
-          lte: now,
-        },
-      },
-      data: {
-        status: "in_progress",
-        startedAt: candidate.startedAt ?? now,
-        runCount: {
-          increment: 1,
-        },
-        lastRunAt: now,
-        nextRunAt: lockUntil,
-      },
-    })
+    // Atomically claim the candidate using FOR UPDATE SKIP LOCKED to
+    // prevent two workers from claiming the same task, and NOW() for
+    // clock-skew-safe timestamp comparisons.
+    const lockSeconds = LOCK_SECONDS
+    const claimedRows = await prisma.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+      WITH locked AS (
+        SELECT "id" FROM "BackgroundTask"
+        WHERE "id" = ${candidate.id}
+          AND "userId" = ${actorUserId}
+          AND "lifecycleState" = 'active'
+          AND "status" IN ('pending', 'in_progress')
+          AND "nextRunAt" <= NOW()
+        FOR UPDATE SKIP LOCKED
+      )
+      UPDATE "BackgroundTask" bt
+      SET "status" = 'in_progress',
+          "startedAt" = COALESCE(bt."startedAt", NOW()),
+          "runCount" = bt."runCount" + 1,
+          "lastRunAt" = NOW(),
+          "nextRunAt" = NOW() + make_interval(secs => ${lockSeconds})
+      FROM locked
+      WHERE bt."id" = locked."id"
+      RETURNING bt."id"
+    `)
 
-    if (claimed.count === 0) {
+    if (claimedRows.length === 0) {
       return NextResponse.json({ processed: false, message: "Task is already being processed" })
     }
     claimedTask = {
