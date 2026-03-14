@@ -520,7 +520,8 @@ export async function copyObjectAcrossLocations(params: {
 
       // Read the source stream in partSize chunks and upload each part
       const readable = throttledBody as import("stream").Readable
-      let currentBuffer = Buffer.alloc(0)
+      let chunks: Buffer[] = []
+      let chunksLength = 0
 
       const uploadPart = async (body: Buffer, partNum: number): Promise<void> => {
         const response = await params.destinationClient.send(
@@ -546,14 +547,19 @@ export async function copyObjectAcrossLocations(params: {
       const uploadQueue: Promise<void>[] = []
 
       for await (const chunk of readable) {
-        currentBuffer = Buffer.concat([currentBuffer, chunk as Buffer])
+        chunks.push(chunk as Buffer)
+        chunksLength += (chunk as Buffer).length
 
-        while (currentBuffer.length >= partSize) {
-          const partBody = currentBuffer.subarray(0, partSize)
-          currentBuffer = currentBuffer.subarray(partSize)
+        while (chunksLength >= partSize) {
+          const combined = Buffer.concat(chunks)
+          const partBody = combined.subarray(0, partSize)
+          const remainder = combined.subarray(partSize)
+
+          chunks = remainder.length > 0 ? [remainder] : []
+          chunksLength = remainder.length
+
           const currentPartNumber = partNumber++
-
-          const uploadPromise = uploadPart(Buffer.from(partBody), currentPartNumber)
+          const uploadPromise = uploadPart(partBody, currentPartNumber)
           uploadQueue.push(uploadPromise)
 
           if (uploadQueue.length >= relayQueueSize) {
@@ -564,9 +570,10 @@ export async function copyObjectAcrossLocations(params: {
       }
 
       // Upload remaining data as the final part
-      if (currentBuffer.length > 0) {
+      if (chunksLength > 0) {
+        const finalBuffer = Buffer.concat(chunks)
         const currentPartNumber = partNumber++
-        const uploadPromise = uploadPart(Buffer.from(currentBuffer), currentPartNumber)
+        const uploadPromise = uploadPart(finalBuffer, currentPartNumber)
         uploadQueue.push(uploadPromise)
       }
 

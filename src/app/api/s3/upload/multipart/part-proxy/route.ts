@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server"
+import { Readable } from "node:stream"
 import { UploadPartCommand } from "@aws-sdk/client-s3"
 import { auth } from "@/lib/auth"
 import { getS3Client } from "@/lib/s3"
@@ -31,7 +32,8 @@ export async function PUT(request: NextRequest) {
     }
 
     const { client } = await getS3Client(session.user.id, credentialId)
-    const bodyBuffer = Buffer.from(await request.arrayBuffer())
+    const contentLength = Number(request.headers.get("content-length") || 0)
+    const nodeStream = Readable.fromWeb(request.body as import("node:stream/web").ReadableStream)
 
     const response = await client.send(
       new UploadPartCommand({
@@ -39,8 +41,8 @@ export async function PUT(request: NextRequest) {
         Key: key,
         UploadId: uploadId,
         PartNumber: partNumber,
-        Body: bodyBuffer,
-        ContentLength: bodyBuffer.length,
+        Body: nodeStream,
+        ContentLength: contentLength,
       })
     )
 

@@ -1,5 +1,6 @@
-import { PutObjectCommand } from "@aws-sdk/client-s3"
 import { NextRequest, NextResponse } from "next/server"
+import { Readable } from "node:stream"
+import { Upload } from "@aws-sdk/lib-storage"
 import { auth } from "@/lib/auth"
 import { getS3Client } from "@/lib/s3"
 import { rateLimitByUser, rateLimitResponse } from "@/lib/rate-limit"
@@ -45,17 +46,21 @@ export async function PUT(request: NextRequest) {
 
     const { client } = await getS3Client(session.user.id, credentialId)
     const contentTypeHeader = request.headers.get("content-type")?.trim()
-    const bodyBuffer = Buffer.from(await request.arrayBuffer())
+    const contentLength = Number(request.headers.get("content-length") || 0)
+    const nodeStream = Readable.fromWeb(request.body as import("node:stream/web").ReadableStream)
 
-    await client.send(
-      new PutObjectCommand({
+    const upload = new Upload({
+      client,
+      params: {
         Bucket: bucket,
         Key: key,
-        Body: bodyBuffer,
+        Body: nodeStream,
         ContentType: contentTypeHeader || undefined,
-        ContentLength: bodyBuffer.length,
-      })
-    )
+        ...(contentLength > 0 ? { ContentLength: contentLength } : {}),
+      },
+    })
+
+    await upload.done()
 
     await logUserAuditAction({
       userId: session.user.id,
