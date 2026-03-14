@@ -1,22 +1,13 @@
 import { NextRequest, NextResponse } from "next/server"
 import { auth } from "@/lib/auth"
 import { getS3Client } from "@/lib/s3"
+import { extractFilename, toContentDispositionFilename } from "@/lib/key-utils"
 import { rateLimitByUser, rateLimitResponse } from "@/lib/rate-limit"
 import { getRequestContext, logUserAuditAction } from "@/lib/audit-logger"
 import { s3OperationSchema } from "@/lib/validations"
 import { GetObjectCommand } from "@aws-sdk/client-s3"
 
 export const runtime = "nodejs"
-
-function extractFilename(key: string): string {
-  const normalized = key.endsWith("/") ? key.slice(0, -1) : key
-  const filename = normalized.split("/").pop() || "download"
-  return filename || "download"
-}
-
-function toContentDispositionFilename(filename: string): string {
-  return filename.replace(/["\\]/g, "_")
-}
 
 export async function GET(request: NextRequest) {
   let userId: string | undefined

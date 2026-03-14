@@ -6,15 +6,12 @@ import {
 } from "@aws-sdk/client-s3"
 import { auth } from "@/lib/auth"
 import { getS3Client } from "@/lib/s3"
+import { isStoraderaProvider } from "@/lib/s3-provider"
 import { rateLimitByUser, rateLimitResponse } from "@/lib/rate-limit"
 
 const UPLOAD_CORS_RULE_ID = "s3-admin-browser-upload"
 const REQUIRED_METHODS = ["GET", "HEAD", "PUT", "POST", "DELETE"]
 const REQUIRED_EXPOSE_HEADERS = ["ETag", "x-amz-request-id", "x-amz-id-2", "x-amz-version-id"]
-
-function isCorsUnsupportedProvider(provider: string): boolean {
-  return provider.trim().toUpperCase() === "STORADERA"
-}
 
 function normalizeOrigin(value: string): string {
   return value.trim().replace(/\/+$/, "")
@@ -68,7 +65,7 @@ export async function POST(request: NextRequest) {
     }
 
     const { client, credential } = await getS3Client(session.user.id, credentialId)
-    if (isCorsUnsupportedProvider(credential.provider)) {
+    if (isStoraderaProvider(credential.provider)) {
       return NextResponse.json(
         { error: "Bucket CORS is not supported by this provider" },
         { status: 409 }

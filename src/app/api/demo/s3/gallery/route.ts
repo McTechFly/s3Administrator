@@ -2,23 +2,11 @@ import { NextRequest, NextResponse } from "next/server"
 import { ListObjectsV2Command, GetObjectCommand } from "@aws-sdk/client-s3"
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner"
 import { demoGuard, getDemoS3Client } from "@/lib/demo"
+import { isStoraderaProvider } from "@/lib/s3-provider"
+import { encodeCursor, decodeCursor } from "@/lib/pagination"
 import { getMediaTypeFromExtension, getPreviewType, isGallerySupportedExtension } from "@/lib/media"
 
 const PREVIEW_URL_TTL_SECONDS = 86400
-
-function encodeCursor(offset: number): string {
-  return Buffer.from(JSON.stringify({ offset }), "utf8").toString("base64url")
-}
-
-function decodeCursor(raw: string): { offset: number } | null {
-  try {
-    const parsed = JSON.parse(Buffer.from(raw, "base64url").toString("utf8"))
-    if (typeof parsed.offset !== "number" || parsed.offset < 0) return null
-    return { offset: Math.floor(parsed.offset) }
-  } catch {
-    return null
-  }
-}
 
 function getExtension(key: string): string {
   const dot = key.lastIndexOf(".")
@@ -43,7 +31,7 @@ export async function GET(request: NextRequest) {
     }
 
     const { client, credential } = getDemoS3Client()
-    const isStoradera = credential.provider.trim().toUpperCase() === "STORADERA"
+    const isStoradera = isStoraderaProvider(credential.provider)
     const cursorData = cursor ? decodeCursor(cursor) : { offset: 0 }
 
     if (!cursorData) {

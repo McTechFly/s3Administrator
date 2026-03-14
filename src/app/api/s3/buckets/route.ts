@@ -10,6 +10,7 @@ import {
 import { auth } from "@/lib/auth"
 import { prisma } from "@/lib/db"
 import { getS3Client } from "@/lib/s3"
+import { getS3ErrorCode, getS3ErrorMessage } from "@/lib/task-process-shared"
 import { rateLimitByUser, rateLimitResponse } from "@/lib/rate-limit"
 import { bucketManageSchema } from "@/lib/validations"
 import { getRequestContext, logUserAuditAction } from "@/lib/audit-logger"
@@ -43,23 +44,6 @@ interface CachedBucketListEntry {
 }
 
 const bucketListCache = new Map<string, CachedBucketListEntry>()
-
-function getS3ErrorCode(error: unknown): string {
-  if (!error || typeof error !== "object") return ""
-  const candidate = error as { Code?: unknown; code?: unknown; name?: unknown }
-  if (typeof candidate.Code === "string") return candidate.Code
-  if (typeof candidate.code === "string") return candidate.code
-  if (typeof candidate.name === "string") return candidate.name
-  return ""
-}
-
-function getS3ErrorMessage(error: unknown): string {
-  if (!error || typeof error !== "object") return "S3 operation failed"
-  const candidate = error as { message?: unknown; Message?: unknown }
-  if (typeof candidate.message === "string") return candidate.message
-  if (typeof candidate.Message === "string") return candidate.Message
-  return "S3 operation failed"
-}
 
 function buildBucketListCacheKey(userId: string, scope: string): string {
   return `${userId}:${scope}`

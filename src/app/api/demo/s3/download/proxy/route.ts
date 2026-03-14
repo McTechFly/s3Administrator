@@ -1,17 +1,9 @@
 import { NextRequest, NextResponse } from "next/server"
 import { GetObjectCommand } from "@aws-sdk/client-s3"
 import { demoGuard, getDemoS3Client } from "@/lib/demo"
+import { extractFilename, toContentDispositionFilename } from "@/lib/key-utils"
 
 export const runtime = "nodejs"
-
-function extractFilename(key: string): string {
-  const normalized = key.endsWith("/") ? key.slice(0, -1) : key
-  return normalized.split("/").pop() || "download"
-}
-
-function toContentDispositionFilename(filename: string): string {
-  return filename.replace(/["\\]/g, "_")
-}
 
 export async function GET(request: NextRequest) {
   const guard = demoGuard()

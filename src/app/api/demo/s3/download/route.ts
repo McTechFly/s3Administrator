@@ -2,19 +2,8 @@ import { NextRequest, NextResponse } from "next/server"
 import { GetObjectCommand } from "@aws-sdk/client-s3"
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner"
 import { demoGuard, getDemoS3Client } from "@/lib/demo"
-
-function extractFilename(key: string): string {
-  const normalized = key.endsWith("/") ? key.slice(0, -1) : key
-  return normalized.split("/").pop() || "download"
-}
-
-function toContentDispositionFilename(filename: string): string {
-  return filename.replace(/["\\]/g, "_")
-}
-
-function shouldUseProxyDownload(provider: string): boolean {
-  return provider.trim().toUpperCase() === "STORADERA"
-}
+import { isStoraderaProvider } from "@/lib/s3-provider"
+import { extractFilename, toContentDispositionFilename } from "@/lib/key-utils"
 
 export async function POST(request: NextRequest) {
   const guard = demoGuard()
@@ -32,7 +21,7 @@ export async function POST(request: NextRequest) {
     const filename = extractFilename(key)
 
     let url: string
-    if (shouldUseProxyDownload(credential.provider)) {
+    if (isStoraderaProvider(credential.provider)) {
       const params = new URLSearchParams({ bucket, key })
       url = `/api/demo/s3/download/proxy?${params.toString()}`
     } else {

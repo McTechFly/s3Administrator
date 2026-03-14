@@ -1,16 +1,12 @@
 import { NextRequest, NextResponse } from "next/server"
 import { auth } from "@/lib/auth"
 import { getS3Client } from "@/lib/s3"
+import { isStoraderaProvider } from "@/lib/s3-provider"
 import { rateLimitByUser, rateLimitResponse } from "@/lib/rate-limit"
 import { getRequestContext, logUserAuditAction } from "@/lib/audit-logger"
 import { s3OperationSchema } from "@/lib/validations"
 import { PutObjectCommand } from "@aws-sdk/client-s3"
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner"
-
-function shouldUseProxyUpload(provider: string): boolean {
-  const normalizedProvider = provider.trim().toUpperCase()
-  return normalizedProvider === "STORADERA"
-}
 
 export async function POST(request: NextRequest) {
   let userId: string | undefined
@@ -41,7 +37,7 @@ export async function POST(request: NextRequest) {
 
     let url: string
     let uploadMode: "direct" | "proxy" = "direct"
-    if (shouldUseProxyUpload(credential.provider)) {
+    if (isStoraderaProvider(credential.provider)) {
       const params = new URLSearchParams({
         bucket,
         key,

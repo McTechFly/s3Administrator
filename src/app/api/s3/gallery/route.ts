@@ -4,6 +4,8 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner"
 import { auth } from "@/lib/auth"
 import { prisma } from "@/lib/db"
 import { getS3Client } from "@/lib/s3"
+import { isStoraderaProvider } from "@/lib/s3-provider"
+import { encodeCursor, decodeCursor } from "@/lib/pagination"
 import { getMediaTypeFromExtension, getPreviewType, isGallerySupportedExtension, type MediaType, type PreviewType } from "@/lib/media"
 import { galleryListSchema } from "@/lib/validations"
 import { rateLimitByUser, rateLimitResponse } from "@/lib/rate-limit"
@@ -11,10 +13,6 @@ import { getRequestContext, logUserAuditAction } from "@/lib/audit-logger"
 import type { GalleryItem } from "@/types"
 
 const PREVIEW_URL_TTL_SECONDS = 86400 // 24 hours
-
-type CursorPayload = {
-  offset: number
-}
 
 type FolderCandidate = {
   kind: "folder"
@@ -34,25 +32,6 @@ type FileCandidate = {
   mediaType: MediaType | null
   previewType: PreviewType | null
   isVideo: boolean
-}
-
-function encodeCursor(offset: number): string {
-  return Buffer.from(JSON.stringify({ offset }), "utf8").toString("base64url")
-}
-
-function decodeCursor(raw: string): CursorPayload | null {
-  try {
-    const parsed = JSON.parse(Buffer.from(raw, "base64url").toString("utf8")) as {
-      offset?: unknown
-    }
-
-    if (typeof parsed.offset !== "number") return null
-    if (!Number.isFinite(parsed.offset) || parsed.offset < 0) return null
-
-    return { offset: Math.floor(parsed.offset) }
-  } catch {
-    return null
-  }
 }
 
 function compareCandidates(a: FolderCandidate | FileCandidate, b: FolderCandidate | FileCandidate): number {
@@ -110,7 +89,7 @@ export async function GET(request: NextRequest) {
     }
 
     const { client, credential } = await getS3Client(session.user.id, credentialId)
-    const isStoradera = credential.provider.trim().toUpperCase() === "STORADERA"
+    const isStoradera = isStoraderaProvider(credential.provider)
 
     const allEntries = await prisma.fileMetadata.findMany({
       where: {

@@ -3,10 +3,12 @@ import { GetObjectCommand } from "@aws-sdk/client-s3"
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner"
 import { auth } from "@/lib/auth"
 import { getS3Client } from "@/lib/s3"
+import { isStoraderaProvider } from "@/lib/s3-provider"
 import { previewSchema } from "@/lib/validations"
 import { rateLimitByUser, rateLimitResponse } from "@/lib/rate-limit"
-const PREVIEW_URL_TTL_SECONDS = 86400 // 24 hours
 import { getRequestContext, logUserAuditAction } from "@/lib/audit-logger"
+
+const PREVIEW_URL_TTL_SECONDS = 86400 // 24 hours
 
 export async function POST(request: NextRequest) {
   let userId: string | undefined
@@ -40,7 +42,7 @@ export async function POST(request: NextRequest) {
     auditKey = key
     const { client, credential } = await getS3Client(session.user.id, credentialId)
     const ttlSeconds = PREVIEW_URL_TTL_SECONDS
-    const isStoradera = credential.provider.trim().toUpperCase() === "STORADERA"
+    const isStoradera = isStoraderaProvider(credential.provider)
 
     let url: string
     if (isStoradera) {
