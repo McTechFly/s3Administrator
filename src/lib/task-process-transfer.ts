@@ -78,7 +78,7 @@ import {
   buildCopySource,
   toValidContentLength,
   bigintToNumberLossy,
-  buildTransferFallbackReason,
+  buildDetailedFallbackReason,
   getS3ErrorStatus,
   getS3ErrorMessage,
   getS3ErrorCode,
@@ -101,8 +101,9 @@ import {
   resolveTaskPlanPayload,
   deleteKeysFromBucket,
   emptyTransferProgress,
-  tryReserveRelayMemory,
+  reserveRelayMemory,
   releaseRelayMemory,
+  AsyncSemaphore,
 } from "@/lib/task-process-shared"
 
 export class BandwidthThrottleTransform extends Transform {
@@ -349,6 +350,8 @@ export async function copyObjectAcrossLocations(params: {
   destinationKey: string
   expectedContentLength?: unknown
   telemetry?: TransferTelemetryHooks
+  forceStrategy?: TransferStrategy
+  relaySemaphore?: AsyncSemaphore
 }) {
   const relayPartSizeBytes = getTaskTransferRelayPartSizeMb() * ONE_MEBIBYTE_BYTES
   const relayQueueSizeConfigured = getTaskTransferRelayQueueSize()
@@ -366,7 +369,7 @@ export async function copyObjectAcrossLocations(params: {
     return contentLength === null ? null : BigInt(contentLength)
   })()
 
-  const initialStrategy = selectTransferStrategy({
+  const initialStrategy = params.forceStrategy ?? selectTransferStrategy({
     sameCredential: params.sameCredential,
     preferServerCopySameBackend: getTaskTransferPreferServerCopySameBackend(),
     sourceSizeBytes,
@@ -435,17 +438,53 @@ export async function copyObjectAcrossLocations(params: {
     })
   }
 
+  const copySourceValue = buildCopySource(params.sourceBucket, params.sourceKey)
+
+  function detailedFallback(
+    command: string,
+    error: unknown,
+    nextStrategy: TransferStrategy,
+    extraParams?: Record<string, string>
+  ): string {
+    return buildDetailedFallbackReason({
+      action: `${command} failed`,
+      command,
+      commandParams: {
+        Bucket: params.destinationBucket,
+        CopySource: copySourceValue,
+        Key: params.destinationKey,
+        srcBucket: params.sourceBucket,
+        srcKey: params.sourceKey,
+        ...extraParams,
+      },
+      error,
+      nextStrategy,
+    })
+  }
+
   async function multipartRelayObjectAcrossLocations(
     strategy: TransferStrategy = "multipart_relay_upload"
   ): Promise<void> {
-    // Reserve memory from the global relay budget before buffering.
-    // Use MAX_RELAY_BUFFERED_BYTES as worst-case reservation per relay.
-    const reservedBytes = MAX_RELAY_BUFFERED_BYTES
-    if (!tryReserveRelayMemory(reservedBytes)) {
-      throw new Error(
-        "Global relay memory budget exhausted — too many concurrent relay uploads"
-      )
+    // Serialize relay uploads within a task so only 1 runs at a time.
+    // Server-side copy operations are not gated by this semaphore.
+    if (params.relaySemaphore) {
+      await params.relaySemaphore.acquire()
     }
+    try {
+      await doMultipartRelay(strategy)
+    } finally {
+      params.relaySemaphore?.release()
+    }
+  }
+
+  async function doMultipartRelay(
+    strategy: TransferStrategy = "multipart_relay_upload"
+  ): Promise<void> {
+    // Reserve memory from the global relay budget before buffering.
+    // Waits if budget is full instead of failing — other relays finishing
+    // will free up space and wake us.
+    const reservedBytes = MAX_RELAY_BUFFERED_BYTES
+    await reserveRelayMemory(reservedBytes)
 
     try {
     await emitStage(strategy, "copying")
@@ -518,7 +557,11 @@ export async function copyObjectAcrossLocations(params: {
       let partNumber = 1
       let uploadedBytes = BigInt(0)
 
-      // Read the source stream in partSize chunks and upload each part
+      // Decoupled producer-consumer: the reader continuously drains the source
+      // stream into a bounded queue of part-sized buffers, keeping the download
+      // connection alive.  The writer pulls from the queue and uploads parts.
+      // Without this decoupling, a slow upload part stalls the `for await` loop,
+      // the source TCP connection goes idle, and Hetzner aborts it (~60 s).
       const readable = throttledBody as import("stream").Readable
       let chunks: Buffer[] = []
       let chunksLength = 0
@@ -543,44 +586,82 @@ export async function copyObjectAcrossLocations(params: {
         void emitProgress(strategy, uploadedBytes, totalBytes, "copying")
       }
 
-      // Collect concurrent uploads up to relayQueueSize
-      const uploadQueue: Promise<void>[] = []
+      // Bounded buffer between reader and writer.  Allows the reader to stay
+      // ahead by a few parts so the source stream keeps being consumed even
+      // when an individual upload part is slow.
+      const BUFFER_AHEAD_PARTS = Math.max(2, relayQueueSize)
+      const partBuffer: Buffer[] = []
+      let readerFinished = false
+      let readerErr: unknown = null
 
-      for await (const chunk of readable) {
-        chunks.push(chunk as Buffer)
-        chunksLength += (chunk as Buffer).length
+      // Simple one-shot async signals for cross-coroutine notification
+      let notifyPartReady: (() => void) | null = null
+      let notifyBufferSpace: (() => void) | null = null
 
-        while (chunksLength >= partSize) {
-          const combined = Buffer.concat(chunks)
-          const partBody = combined.subarray(0, partSize)
-          const remainder = combined.subarray(partSize)
+      function awaitPartReady(): Promise<void> {
+        if (partBuffer.length > 0 || readerFinished) return Promise.resolve()
+        return new Promise<void>((r) => { notifyPartReady = r })
+      }
+      function signalPartReady() {
+        const fn = notifyPartReady; notifyPartReady = null; fn?.()
+      }
+      function awaitBufferSpace(): Promise<void> {
+        if (partBuffer.length < BUFFER_AHEAD_PARTS) return Promise.resolve()
+        return new Promise<void>((r) => { notifyBufferSpace = r })
+      }
+      function signalBufferSpace() {
+        const fn = notifyBufferSpace; notifyBufferSpace = null; fn?.()
+      }
 
-          chunks = remainder.length > 0 ? [remainder] : []
-          chunksLength = remainder.length
+      // --- Reader (producer): drain source stream → part-sized buffers ---
+      const readerTask = (async () => {
+        try {
+          for await (const chunk of readable) {
+            chunks.push(chunk as Buffer)
+            chunksLength += (chunk as Buffer).length
 
-          const currentPartNumber = partNumber++
-          const uploadPromise = uploadPart(partBody, currentPartNumber)
-          uploadQueue.push(uploadPromise)
+            while (chunksLength >= partSize) {
+              await awaitBufferSpace()
 
-          if (uploadQueue.length >= relayQueueSize) {
-            await Promise.all(uploadQueue)
-            uploadQueue.length = 0
+              const combined = Buffer.concat(chunks)
+              const partBody = combined.subarray(0, partSize)
+              const remainder = combined.subarray(partSize)
+              chunks = remainder.length > 0 ? [remainder] : []
+              chunksLength = remainder.length
+
+              partBuffer.push(Buffer.from(partBody))
+              signalPartReady()
+            }
           }
+          // Push trailing data smaller than partSize as final part
+          if (chunksLength > 0) {
+            await awaitBufferSpace()
+            partBuffer.push(Buffer.concat(chunks))
+            chunks = []
+            chunksLength = 0
+            signalPartReady()
+          }
+        } catch (err) {
+          readerErr = err
+        } finally {
+          readerFinished = true
+          signalPartReady()
         }
+      })()
+
+      // --- Writer (consumer): upload parts from the bounded buffer ---
+      while (true) {
+        await awaitPartReady()
+        if (readerErr) throw readerErr
+        if (partBuffer.length === 0 && readerFinished) break
+
+        const partBody = partBuffer.shift()!
+        signalBufferSpace()
+        await uploadPart(partBody, partNumber++)
       }
 
-      // Upload remaining data as the final part
-      if (chunksLength > 0) {
-        const finalBuffer = Buffer.concat(chunks)
-        const currentPartNumber = partNumber++
-        const uploadPromise = uploadPart(finalBuffer, currentPartNumber)
-        uploadQueue.push(uploadPromise)
-      }
-
-      // Wait for remaining uploads
-      if (uploadQueue.length > 0) {
-        await Promise.all(uploadQueue)
-      }
+      await readerTask
+      if (readerErr) throw readerErr
 
       if (completedParts.length === 0) {
         // Edge case: empty file — upload a single empty part
@@ -650,7 +731,7 @@ export async function copyObjectAcrossLocations(params: {
     }
 
     const partSizeBytes = computeMultipartPartSizeBytes(sourceSizeForCopy)
-    const copySourceHeader = buildCopySource(params.sourceBucket, params.sourceKey)
+    const copySourceHeader = copySourceValue
     const partRanges: Array<{ partNumber: number; rangeStart: bigint; rangeEnd: bigint }> = []
     let offset = BigInt(0)
     let partNumber = 1
@@ -834,10 +915,7 @@ export async function copyObjectAcrossLocations(params: {
           // parsing issues even when the source exists. Relay upload avoids
           // CopySource and still preserves true missing-source behavior.
           await emitFallback(
-            buildTransferFallbackReason(
-              "multipart_server_copy failed; retrying via multipart_relay_upload",
-              error
-            ),
+            detailedFallback("UploadPartCopy", error, "multipart_relay_upload"),
             "multipart_relay_upload"
           )
           await multipartRelayObjectAcrossLocations("multipart_relay_upload")
@@ -854,7 +932,7 @@ export async function copyObjectAcrossLocations(params: {
         await params.destinationClient.send(
           new CopyObjectCommand({
             Bucket: params.destinationBucket,
-            CopySource: buildCopySource(params.sourceBucket, params.sourceKey),
+            CopySource: copySourceValue,
             Key: params.destinationKey,
           })
         )
@@ -871,10 +949,7 @@ export async function copyObjectAcrossLocations(params: {
       } catch (error) {
         if (isEntityTooLargeError(error)) {
           await emitFallback(
-            buildTransferFallbackReason(
-              "single_request_server_copy exceeded size limit; retrying multipart",
-              error
-            ),
+            detailedFallback("CopyObject", error, "multipart_server_copy"),
             "multipart_server_copy"
           )
           try {
@@ -890,10 +965,7 @@ export async function copyObjectAcrossLocations(params: {
               isS3MissingObjectError(multipartError)
             ) {
               await emitFallback(
-                buildTransferFallbackReason(
-                  "multipart_server_copy failed after single_request_server_copy fallback; retrying relay",
-                  multipartError
-                ),
+                detailedFallback("UploadPartCopy", multipartError, "multipart_relay_upload"),
                 "multipart_relay_upload"
               )
               await multipartRelayObjectAcrossLocations("multipart_relay_upload")
@@ -904,7 +976,7 @@ export async function copyObjectAcrossLocations(params: {
           }
 
           await emitFallback(
-            "multipart_server_copy produced no copyable byte ranges after single-request fallback",
+            detailedFallback("UploadPartCopy", new Error("no copyable byte ranges"), "multipart_relay_upload"),
             "multipart_relay_upload"
           )
           await multipartRelayObjectAcrossLocations("multipart_relay_upload")
@@ -913,11 +985,37 @@ export async function copyObjectAcrossLocations(params: {
         }
 
         if (isCopyCompatibilityFallbackError(error) || isCopyAuthFallbackError(error)) {
+          // Try multipart server copy first — UploadPartCopy often works
+          // when CopyObject fails on some S3-compatible providers.
           await emitFallback(
-            buildTransferFallbackReason(
-              "single_request_server_copy rejected by backend; retrying relay",
-              error
-            ),
+            detailedFallback("CopyObject", error, "multipart_server_copy"),
+            "multipart_server_copy"
+          )
+          try {
+            const copied = await multipartCopyObjectWithinBackend("multipart_server_copy")
+            if (copied) {
+              await complete("multipart_server_copy")
+              return
+            }
+          } catch (multipartError) {
+            if (
+              isCopyCompatibilityFallbackError(multipartError) ||
+              isCopyAuthFallbackError(multipartError) ||
+              isS3MissingObjectError(multipartError)
+            ) {
+              await emitFallback(
+                detailedFallback("UploadPartCopy", multipartError, "multipart_relay_upload"),
+                "multipart_relay_upload"
+              )
+              await multipartRelayObjectAcrossLocations("multipart_relay_upload")
+              await complete("multipart_relay_upload")
+              return
+            }
+            throw multipartError
+          }
+
+          await emitFallback(
+            detailedFallback("UploadPartCopy", new Error("no copyable byte ranges"), "multipart_relay_upload"),
             "multipart_relay_upload"
           )
           await multipartRelayObjectAcrossLocations("multipart_relay_upload")
@@ -926,14 +1024,39 @@ export async function copyObjectAcrossLocations(params: {
         }
 
         if (isS3MissingObjectError(error)) {
+          // Try multipart server copy first — some providers return
+          // NoSuchKey for CopySource parsing issues that UploadPartCopy handles.
           await emitFallback(
-            buildTransferFallbackReason(
-              "single_request_server_copy returned missing source; retrying relay verification",
-              error
-            ),
+            detailedFallback("CopyObject", error, "multipart_server_copy"),
+            "multipart_server_copy"
+          )
+          try {
+            const copied = await multipartCopyObjectWithinBackend("multipart_server_copy")
+            if (copied) {
+              await complete("multipart_server_copy")
+              return
+            }
+          } catch (multipartError) {
+            if (
+              isCopyCompatibilityFallbackError(multipartError) ||
+              isCopyAuthFallbackError(multipartError) ||
+              isS3MissingObjectError(multipartError)
+            ) {
+              await emitFallback(
+                detailedFallback("UploadPartCopy", multipartError, "multipart_relay_upload"),
+                "multipart_relay_upload"
+              )
+              await multipartRelayObjectAcrossLocations("multipart_relay_upload")
+              await complete("multipart_relay_upload")
+              return
+            }
+            throw multipartError
+          }
+
+          await emitFallback(
+            detailedFallback("UploadPartCopy", new Error("no copyable byte ranges"), "multipart_relay_upload"),
             "multipart_relay_upload"
           )
-          // Same fallback rationale as multipart_server_copy above.
           await multipartRelayObjectAcrossLocations("multipart_relay_upload")
           await complete("multipart_relay_upload")
           return
@@ -1719,6 +1842,9 @@ export async function processObjectTransferTask(
   const staleDestinationKeys: string[] = []
   const batchStartedAt = Date.now()
   const transferItemConcurrency = getTaskTransferItemConcurrency()
+  // Only 1 relay upload at a time per task. Server copies run at full
+  // concurrency — the semaphore only gates the relay path.
+  const relaySemaphore = new AsyncSemaphore(1)
   const claimedTaskId = candidate.id
   const claimedRunCount = candidate.runCount + 1
   const transferProgressMinFileSizeBytes =
@@ -2005,6 +2131,17 @@ export async function processObjectTransferTask(
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Adaptive fallback: track consecutive server-copy failures at the task level.
+  // After ADAPTIVE_FALLBACK_THRESHOLD consecutive files trigger a fallback to
+  // relay upload, skip server-copy attempts entirely for the remaining files
+  // to avoid ~2 wasted S3 API calls per file.
+  // ---------------------------------------------------------------------------
+  const ADAPTIVE_FALLBACK_THRESHOLD = 3
+  let consecutiveServerCopyFallbacks = 0
+  let adaptiveForcedStrategy: TransferStrategy | null = null
+  let adaptiveFallbackLogged = false
+
   const transferTelemetryHooks: TransferTelemetryHooks = {
     start: ({ sourceKey, destinationKey, strategy, totalBytes }) => {
       const state = getOrCreateTelemetryState(sourceKey, destinationKey)
@@ -2058,6 +2195,38 @@ export async function processObjectTransferTask(
       state.lastProgressAtMs = Date.now()
       activeTransferTelemetryKey = getTelemetryStateKey(sourceKey, destinationKey)
       persistLiveProgressSnapshot(true)
+
+      // Track consecutive fallbacks to relay for adaptive strategy override
+      if (nextStrategy === "multipart_relay_upload") {
+        consecutiveServerCopyFallbacks++
+        if (
+          consecutiveServerCopyFallbacks >= ADAPTIVE_FALLBACK_THRESHOLD &&
+          !adaptiveForcedStrategy
+        ) {
+          adaptiveForcedStrategy = "multipart_relay_upload"
+          if (!adaptiveFallbackLogged) {
+            adaptiveFallbackLogged = true
+            try {
+              prisma.backgroundTaskEvent.create({
+                data: {
+                  taskId: claimedTaskId,
+                  userId: actorUserId,
+                  eventType: "adaptive_fallback",
+                  message:
+                    `Server copy failed for ${consecutiveServerCopyFallbacks} consecutive files; ` +
+                    `using relay for remaining files. Last reason: ${reason}`,
+                  metadata: {
+                    consecutiveFailures: consecutiveServerCopyFallbacks,
+                    lastFallbackReason: reason,
+                  },
+                },
+              }).catch(() => {})
+            } catch {
+              // Non-critical
+            }
+          }
+        }
+      }
     },
     finish: ({ sourceKey, destinationKey, strategy, status }) => {
       const state = getOrCreateTelemetryState(sourceKey, destinationKey)
@@ -2071,10 +2240,19 @@ export async function processObjectTransferTask(
       state.lastProgressAtMs = nowMs
       maybeEmitProgressSample(state, nowMs, previousStage !== state.stage)
       persistLiveProgressSnapshot(true)
+
+      // Reset consecutive fallback counter when a file completes without fallback
+      if (status === "completed" && !state.fallbackReason) {
+        consecutiveServerCopyFallbacks = 0
+      }
     },
   }
 
-  for (let index = 0; index < actionableBatch.length; index += transferItemConcurrency) {
+  for (let index = 0; index < actionableBatch.length; ) {
+    // Relay uploads are serialized via relaySemaphore (1 at a time), so
+    // we can keep full item concurrency — server copies still run in
+    // parallel while relay calls queue up behind the semaphore.
+    const effectiveConcurrency = transferItemConcurrency
     if (
       processedInBatch > 0 &&
       Date.now() - batchStartedAt >= getTaskWorkerUserBudgetMs()
@@ -2091,7 +2269,7 @@ export async function processObjectTransferTask(
       claimedRunCount: candidate.runCount + 1,
     })
 
-    const slice = actionableBatch.slice(index, index + transferItemConcurrency)
+    const slice = actionableBatch.slice(index, index + effectiveConcurrency)
     const prepared = await Promise.all(
       slice.map(async ({ sourceFile, destinationKey }): Promise<PreparedTransferItem> => {
         let destinationExisting = requiresDestinationComparison
@@ -2238,6 +2416,8 @@ export async function processObjectTransferTask(
               destinationKey: item.destinationKey,
               expectedContentLength: item.sourceFile.size,
               telemetry: transferTelemetryHooks,
+              forceStrategy: adaptiveForcedStrategy ?? undefined,
+              relaySemaphore,
             })
 
             return {
@@ -2463,6 +2643,7 @@ export async function processObjectTransferTask(
     }
 
     lastProcessedCursorKey = slice[slice.length - 1]?.sourceFile.key ?? lastProcessedCursorKey
+    index += effectiveConcurrency
   }
 
   // When the actionable loop completed fully (no time budget break),

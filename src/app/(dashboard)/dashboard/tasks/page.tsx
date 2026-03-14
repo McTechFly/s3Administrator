@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from "react"
 import { useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
-import { ListTodo, Pause, Play, RotateCcw, Trash2 } from "lucide-react"
+import { AlertTriangle, ListTodo, Pause, Play, RotateCcw, Trash2 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
@@ -999,9 +999,21 @@ export default function TasksPage() {
         </p>
 
         {live.fallbackReason ? (
-          <p className="mt-1 text-xs text-amber-700 dark:text-amber-400">
-            Fallback: {live.fallbackReason}
-          </p>
+          <div className="mt-2 flex items-start gap-2 rounded-md border border-amber-300 bg-amber-50 p-2 dark:border-amber-700 dark:bg-amber-950/40">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+            <div className="min-w-0 text-xs">
+              <p className="font-medium text-amber-800 dark:text-amber-300">
+                {live.transferStrategy === "multipart_relay_upload"
+                  ? "Server-side copy unavailable — using relay upload (slower)"
+                  : "Transfer fallback active"}
+              </p>
+              <p className="mt-0.5 text-amber-700 dark:text-amber-400">
+                {live.transferStrategy === "multipart_relay_upload"
+                  ? "Your storage provider does not support server-side copy between these buckets. Files are being downloaded and re-uploaded through the server, which is significantly slower."
+                  : live.fallbackReason}
+              </p>
+            </div>
+          </div>
         ) : null}
       </div>
     )
@@ -1103,7 +1115,9 @@ export default function TasksPage() {
                             ? "border-gray-300 bg-gray-50 text-gray-600 hover:bg-gray-100 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-400"
                             : eventType === "file_progress"
                               ? "border-blue-300 bg-blue-50 text-blue-700 hover:bg-blue-100 dark:border-blue-700 dark:bg-blue-950 dark:text-blue-300"
-                              : "border-red-300 bg-red-50 text-red-700 hover:bg-red-100 dark:border-red-700 dark:bg-red-950 dark:text-red-300"
+                              : eventType === "adaptive_fallback"
+                                ? "border-amber-300 bg-amber-50 text-amber-700 hover:bg-amber-100 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-300"
+                                : "border-red-300 bg-red-50 text-red-700 hover:bg-red-100 dark:border-red-700 dark:bg-red-950 dark:text-red-300"
                     }`}
                     onClick={() => void handleTaskEventsFilter(taskId, isActive ? null : eventType)}
                   >
@@ -1181,7 +1195,9 @@ export default function TasksPage() {
                       ? "text-muted-foreground"
                       : event.eventType === "file_failed" || event.eventType === "file_missing_source"
                         ? "text-red-600 dark:text-red-400"
-                        : ""
+                        : event.eventType === "adaptive_fallback"
+                          ? "text-amber-600 dark:text-amber-400"
+                          : ""
                 }`}
               >
                 {event.message}

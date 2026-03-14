@@ -7,6 +7,7 @@ import {
   normalizeExecutionHistory,
   type TaskExecutionHistoryEntry,
 } from "@/lib/task-plans"
+import { isCommunityEdition } from "@/lib/edition"
 import {
   nextRunAtForTaskSchedule,
   resolveTaskSchedule,
@@ -35,15 +36,49 @@ export const MAX_RELAY_BUFFERED_BYTES = 512 * ONE_MEBIBYTE_BYTES
 export const SINGLE_REQUEST_COPY_MAX_BYTES = BigInt(5 * 1024 * 1024 * 1024)
 
 // ---------------------------------------------------------------------------
+// Async semaphore — limits concurrency to N permits.
+// ---------------------------------------------------------------------------
+
+export class AsyncSemaphore {
+  private permits: number
+  private waiters: Array<() => void> = []
+
+  constructor(permits: number) {
+    this.permits = permits
+  }
+
+  async acquire(): Promise<void> {
+    if (this.permits > 0) {
+      this.permits--
+      return
+    }
+    return new Promise<void>((resolve) => {
+      this.waiters.push(resolve)
+    })
+  }
+
+  release(): void {
+    if (this.waiters.length > 0) {
+      const next = this.waiters.shift()!
+      next()
+    } else {
+      this.permits++
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Global relay memory budget
 // ---------------------------------------------------------------------------
 // Caps the total bytes buffered across all concurrent relay uploads in this
 // process, preventing OOM when many large-file transfers run in parallel.
-// Default 2 GB; set TASK_RELAY_GLOBAL_MEMORY_BUDGET_MB to override.
+// When budget is full, callers wait instead of failing.
 
 const RELAY_GLOBAL_BUDGET_BYTES = (() => {
   const raw = process.env.TASK_RELAY_GLOBAL_MEMORY_BUDGET_MB
-  const defaultMb = 2_048
+  // Community edition: 512 MB (allows only 1 concurrent relay upload).
+  // Cloud edition: 2 GB (allows several concurrent relays across users).
+  const defaultMb = isCommunityEdition() ? 512 : 2_048
   if (!raw) return defaultMb * ONE_MEBIBYTE_BYTES
   const parsed = Number.parseInt(raw, 10)
   if (!Number.isFinite(parsed)) return defaultMb * ONE_MEBIBYTE_BYTES
@@ -51,22 +86,37 @@ const RELAY_GLOBAL_BUDGET_BYTES = (() => {
 })()
 
 let relayGlobalBytesInUse = 0
+const relayBudgetWaiters: Array<{ bytes: number; resolve: () => void }> = []
 
 /**
- * Try to reserve `bytes` from the global relay memory budget.
- * Returns true if the reservation succeeded, false if it would exceed budget.
+ * Reserve `bytes` from the global relay memory budget.
+ * If the budget is full, the returned promise resolves once enough memory
+ * is released — callers wait instead of failing.
  */
-export function tryReserveRelayMemory(bytes: number): boolean {
-  if (relayGlobalBytesInUse + bytes > RELAY_GLOBAL_BUDGET_BYTES) {
-    return false
+export async function reserveRelayMemory(bytes: number): Promise<void> {
+  if (relayGlobalBytesInUse + bytes <= RELAY_GLOBAL_BUDGET_BYTES) {
+    relayGlobalBytesInUse += bytes
+    return
   }
-  relayGlobalBytesInUse += bytes
-  return true
+  return new Promise<void>((resolve) => {
+    relayBudgetWaiters.push({ bytes, resolve })
+  })
 }
 
-/** Release previously reserved relay memory bytes. */
+/** Release previously reserved relay memory bytes and wake waiters. */
 export function releaseRelayMemory(bytes: number): void {
   relayGlobalBytesInUse = Math.max(0, relayGlobalBytesInUse - bytes)
+  // Drain waiters whose reservations now fit within the budget.
+  while (relayBudgetWaiters.length > 0) {
+    const next = relayBudgetWaiters[0]
+    if (relayGlobalBytesInUse + next.bytes <= RELAY_GLOBAL_BUDGET_BYTES) {
+      relayGlobalBytesInUse += next.bytes
+      relayBudgetWaiters.shift()
+      next.resolve()
+    } else {
+      break
+    }
+  }
 }
 export const TRANSFER_PROGRESS_MILESTONES = [25, 50, 75, 90, 100] as const
 export const TRANSIENT_S3_ERROR_CODES = new Set([
@@ -617,9 +667,18 @@ export function buildCopySource(bucket: string, key: string): string {
   // for keys with special characters (spaces, parentheses, non-ASCII).
   // See: https://github.com/aws/aws-sdk-js-v3/issues/6596
   //
-  // encodeURI encodes spaces/special chars but preserves '/' separators,
-  // unlike encodeURIComponent which also encodes '/' and breaks the format.
-  return encodeURI(`${bucket}/${key}`)
+  // encodeURI is insufficient: it does NOT encode #, ?, &, +, =, ;, :, @
+  // which can break CopySource header parsing on S3-compatible providers
+  // (notably Hetzner returns NoSuchKey for unencoded special chars).
+  //
+  // Use encodeURIComponent per path segment to encode all special chars
+  // while preserving '/' separators.
+  const encodedBucket = encodeURIComponent(bucket)
+  const encodedKey = key
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/")
+  return `${encodedBucket}/${encodedKey}`
 }
 
 export function toValidContentLength(value: unknown): number | null {
@@ -677,13 +736,62 @@ export function buildTransferFallbackReason(prefix: string, error: unknown): str
   const code = getS3ErrorCode(error)
   const status = getS3ErrorStatus(error)
   const message = getS3ErrorMessage(error).trim()
+  const requestId = getS3ErrorRequestId(error)
   const details = [
     code ? `code=${code}` : null,
     status !== null ? `status=${status}` : null,
     message ? `message=${message.slice(0, 180)}` : null,
+    requestId ? `requestId=${requestId}` : null,
   ].filter((value): value is string => Boolean(value))
   if (details.length === 0) return prefix
   return `${prefix} (${details.join(", ")})`
+}
+
+/**
+ * Build a detailed diagnostic string for transfer fallbacks that includes the
+ * exact S3 command that failed, the parameters it was called with, and the full
+ * error details. Shown in the UI and persisted in task events.
+ */
+export function buildDetailedFallbackReason(params: {
+  action: string
+  command: string
+  commandParams: Record<string, string | undefined>
+  error: unknown
+  nextStrategy: string
+}): string {
+  const code = getS3ErrorCode(params.error)
+  const status = getS3ErrorStatus(params.error)
+  const message = getS3ErrorMessage(params.error).trim()
+  const requestId = getS3ErrorRequestId(params.error)
+
+  const errorParts = [
+    code ? `code=${code}` : null,
+    status !== null ? `status=${status}` : null,
+    requestId ? `requestId=${requestId}` : null,
+  ].filter(Boolean).join(", ")
+
+  const cmdParams = Object.entries(params.commandParams)
+    .filter(([, v]) => v !== undefined)
+    .map(([k, v]) => `${k}=${v}`)
+    .join(", ")
+
+  const lines = [
+    `${params.action} → falling back to ${params.nextStrategy}`,
+    `  command: ${params.command}(${cmdParams})`,
+    errorParts ? `  error: ${errorParts}` : null,
+    message ? `  message: ${message.slice(0, 300)}` : null,
+  ].filter(Boolean).join("\n")
+
+  return lines
+}
+
+export function getS3ErrorRequestId(error: unknown): string | null {
+  if (!error || typeof error !== "object") return null
+  const candidate = error as {
+    $metadata?: { requestId?: unknown }
+  }
+  const id = candidate.$metadata?.requestId
+  return typeof id === "string" && id.length > 0 ? id : null
 }
 
 export function getS3ErrorStatus(error: unknown): number | null {

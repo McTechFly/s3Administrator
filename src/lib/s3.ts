@@ -192,11 +192,19 @@ export async function getS3Client(
     s3ClientCache.delete(cacheKey)
   }
 
-  const credential = await prisma.s3Credential.findFirst({
+  let credential = await prisma.s3Credential.findFirst({
     where: credentialId
       ? { id: credentialId, userId }
       : { userId, isDefault: true },
   })
+
+  // Fall back to any credential for this user when no default is set
+  if (!credential && !credentialId) {
+    credential = await prisma.s3Credential.findFirst({
+      where: { userId },
+      orderBy: { createdAt: "desc" },
+    })
+  }
 
   if (!credential) {
     throw new Error("No S3 credentials configured")
