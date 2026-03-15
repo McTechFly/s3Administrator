@@ -45,6 +45,7 @@ import {
   ArrowUp,
   ArrowUpDown,
   CircleAlert,
+  FileDown,
   Loader2,
   Plus,
   RefreshCw,
@@ -140,6 +141,7 @@ export default function BucketsPage() {
     Record<string, boolean>
   >({})
   const [multipartErrorByBucketKey, setMultipartErrorByBucketKey] = useState<Record<string, string>>({})
+  const [exportingByBucketKey, setExportingByBucketKey] = useState<Record<string, boolean>>({})
   const multipartScanInFlightRef = useRef<Set<string>>(new Set())
 
   const { data: buckets = [], isLoading: bucketsLoading } = useQuery<BucketRow[]>({
@@ -497,6 +499,40 @@ export default function BucketsPage() {
     }
   }
 
+  async function handleExportPaths(bucket: BucketRow) {
+    const bucketKey = `${bucket.credentialId}:${bucket.name}`
+    setExportingByBucketKey((prev) => ({ ...prev, [bucketKey]: true }))
+    try {
+      const res = await fetch("/api/s3/export-paths", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          bucket: bucket.name,
+          credentialId: bucket.credentialId,
+        }),
+      })
+      if (!res.ok) {
+        const payload = await res.json().catch(() => null)
+        throw new Error(payload?.error ?? "Failed to export paths")
+      }
+      const blob = await res.blob()
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement("a")
+      link.href = url
+      link.download = `${bucket.name}-paths.txt`
+      link.style.display = "none"
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+      URL.revokeObjectURL(url)
+      toast.success(`Exported paths for ${bucket.name}`)
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Failed to export paths")
+    } finally {
+      setExportingByBucketKey((prev) => ({ ...prev, [bucketKey]: false }))
+    }
+  }
+
   async function handleDeleteBucket(bucket: BucketRow) {
     await deleteBucket(bucket.name, bucket.credentialId)
     setPendingDeleteBucket(null)
@@ -831,6 +867,20 @@ export default function BucketsPage() {
                       </TableCell>
                       <TableCell className="text-right">
                         <div className="flex items-center justify-end gap-2">
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            disabled={exportingByBucketKey[bucketKey] || fileCount === 0}
+                            onClick={() => void handleExportPaths(bucket)}
+                          >
+                            {exportingByBucketKey[bucketKey] ? (
+                              <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                            ) : (
+                              <FileDown className="mr-1.5 h-3.5 w-3.5" />
+                            )}
+                            Export
+                          </Button>
                           <Button
                             type="button"
                             variant="outline"
