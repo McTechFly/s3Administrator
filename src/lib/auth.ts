@@ -1,7 +1,23 @@
 import NextAuth from "next-auth"
 import Credentials from "next-auth/providers/credentials"
+import { CredentialsSignin } from "@auth/core/errors"
+import bcrypt from "bcryptjs"
 import { isCommunityEdition } from "@/lib/edition"
+import { isMultiUserMode } from "@/lib/auth-mode"
 import { prisma } from "@/lib/db"
+import { consumeBackupCode, verifyTotpCode } from "@/lib/totp"
+
+/**
+ * Signals that the user's password was correct but a TOTP code is required
+ * (or was incorrect). The `code` is exposed to the client on the signIn()
+ * response so the login form can reveal the 2FA input or display an error.
+ */
+class TotpRequiredError extends CredentialsSignin {
+  code = "TOTP_REQUIRED"
+}
+class TotpInvalidError extends CredentialsSignin {
+  code = "TOTP_INVALID"
+}
 
 const LOCAL_USER = {
   id: "local",
@@ -89,6 +105,7 @@ function buildCommunitySession(): NonNullable<SessionLike> {
 async function resolveCommunitySessionFallback(
   session: SessionLike
 ): Promise<SessionLike> {
+  if (isMultiUserMode()) return session
   if (!isCommunityEdition()) return session
   if (hasSessionUserId(session)) return session
   await ensureLocalUser()
@@ -126,16 +143,109 @@ function buildCommunityAuth() {
   })
 }
 
+/**
+ * Multi-user self-hosted auth: email + password via bcrypt.
+ * First registered user is promoted to admin (handled in /api/auth/register).
+ */
+function buildMultiUserAuth() {
+  return NextAuth({
+    providers: [
+      Credentials({
+        credentials: {
+          email: { label: "Email", type: "email" },
+          password: { label: "Password", type: "password" },
+          totp: { label: "2FA code", type: "text" },
+        },
+        async authorize(raw) {
+          const email = String(raw?.email ?? "").trim().toLowerCase()
+          const password = String(raw?.password ?? "")
+          const totpCode = String(raw?.totp ?? "").trim()
+          if (!email || !password) return null
+
+          const user = await prisma.user.findUnique({ where: { email } })
+          if (!user || !user.passwordHash) return null
+          if (!user.isActive) return null
+
+          const ok = await bcrypt.compare(password, user.passwordHash)
+          if (!ok) return null
+
+          // Enforce TOTP when enabled. An empty code surfaces a structured
+          // error so the login UI can reveal the 2FA field.
+          if (user.totpEnabled && user.totpSecret) {
+            if (!totpCode) {
+              throw new TotpRequiredError()
+            }
+            const passesTotp = verifyTotpCode(user.totpSecret, totpCode)
+            if (!passesTotp) {
+              const { ok: backupOk, remaining } = await consumeBackupCode(
+                user.totpBackupCodes,
+                totpCode,
+              )
+              if (!backupOk) {
+                throw new TotpInvalidError()
+              }
+              await prisma.user
+                .update({ where: { id: user.id }, data: { totpBackupCodes: remaining } })
+                .catch(() => null)
+            }
+          }
+
+          await prisma.user
+            .update({ where: { id: user.id }, data: { lastLoginAt: new Date() } })
+            .catch(() => null)
+
+          return {
+            id: user.id,
+            name: user.name ?? user.email,
+            email: user.email,
+            role: user.role,
+          }
+        },
+      }),
+    ],
+    callbacks: {
+      async jwt({ token, user }) {
+        if (user) {
+          token.id = (user as { id: string }).id
+          token.role = (user as { role?: string }).role ?? "user"
+        } else if (token.id) {
+          const fresh = await prisma.user
+            .findUnique({
+              where: { id: String(token.id) },
+              select: { role: true, isActive: true },
+            })
+            .catch(() => null)
+          if (fresh && !fresh.isActive) return {}
+          if (fresh?.role) token.role = fresh.role
+        }
+        return token
+      },
+      async session({ session, token }) {
+        if (session.user && token.id) {
+          session.user.id = String(token.id)
+          session.user.role = String(token.role ?? "user")
+        }
+        return session
+      },
+    },
+    session: { strategy: "jwt", maxAge: 60 * 60 * 24 * 30 },
+    pages: { signIn: "/login" },
+    secret: process.env.AUTH_SECRET || "dev-insecure-secret-change-me",
+  })
+}
+
 type AuthModule = ReturnType<typeof buildCommunityAuth>
 
 let _authModule: AuthModule | null = null
 
-const _ready: Promise<AuthModule> = isCommunityEdition()
+const _ready: Promise<AuthModule> = isMultiUserMode()
+  ? Promise.resolve(buildMultiUserAuth())
+  : isCommunityEdition()
   ? Promise.resolve(buildCommunityAuth())
   : (async () => {
       try {
         const pkg = "@s3administrator/cloud/auth"
-        const mod = await import(pkg)
+        const mod = await import(/* webpackIgnore: true */ /* turbopackIgnore: true */ pkg)
         return mod as unknown as AuthModule
       } catch {
         console.warn("@s3administrator/cloud/auth not available - falling back to community auth")

@@ -62,6 +62,14 @@ COPY --from=builder /app/public ./public
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
 COPY --from=builder /app/prisma ./prisma
+# The Next.js standalone output strips devDependencies and most transitive deps.
+# db-bootstrap runs `prisma migrate deploy` at boot, and the task worker uses
+# tsx + the full dependency graph, so overlay the builder's full node_modules
+# on top of the standalone tree so both the web app and the worker run.
+COPY --from=builder --chown=nextjs:nodejs /app/node_modules ./node_modules
+COPY --from=builder --chown=nextjs:nodejs /app/src ./src
+COPY --from=builder /app/tsconfig.json ./tsconfig.json
+COPY --from=builder /app/prisma.config.ts ./prisma.config.ts
 
 USER nextjs
 EXPOSE 3000

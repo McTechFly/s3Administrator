@@ -1,0 +1,140 @@
+# =============================================================================
+#  s3Administrator — High-availability (cluster) docker-compose
+# =============================================================================
+#
+#  Example topology for running the app on multiple hosts behind a load
+#  balancer. You can copy this file, move services to different hosts and
+#  point them at a shared PostgreSQL + shared log volume (or replace the
+#  volume with a central log shipper).
+#
+#  Stateless pieces:
+#    - app replicas (any number behind a load balancer, no sticky sessions
+#      needed because next-auth uses JWT cookies)
+#
+#  Stateful singletons:
+#    - postgres (master + optional replicas outside this file)
+#    - worker (task engine v2) — a single instance is enough; scale up only
+#      if the queue gets big
+#
+#  Requirements:
+#    - AUTH_SECRET, ENCRYPTION_MASTER_KEY, ENCRYPTION_SALT must be IDENTICAL
+#      on every replica, otherwise sessions and encrypted credentials break.
+#    - CLUSTER_MODE=true on every app replica disables the embedded task
+#      worker so only the dedicated `worker` service processes jobs.
+#    - Database migrations are serialized across replicas via a Postgres
+#      advisory lock — safe to boot replicas in parallel.
+#
+#  Usage on a single host (for local HA testing):
+#    cp .env.example .env && edit .env
+#    docker compose -f docker-compose.cluster.yml up -d --scale app=3
+#
+#  Usage on multiple hosts: run this compose on each host with the same
+#  .env file, and point DATABASE_URL at your centralized PostgreSQL.
+#  Keep the `db` service only on the host that owns the database, or drop
+#  it entirely and use a managed Postgres.
+# =============================================================================
+
+x-app-common: &app-common
+  image: ${APP_IMAGE:-registry.gitlab.com/s3administrator/s3administrator:latest}
+  restart: unless-stopped
+  env_file:
+    - .env
+  environment:
+    DATABASE_URL: ${DATABASE_URL:-postgres://s3admin:${POSTGRES_PASSWORD:-change-me}@db:5432/s3admin}
+    CLUSTER_MODE: "true"
+    # All replicas must agree on these. They come from .env but we list them
+    # here to make the requirement explicit.
+    AUTH_SECRET: ${AUTH_SECRET}
+    ENCRYPTION_MASTER_KEY: ${ENCRYPTION_MASTER_KEY}
+    ENCRYPTION_SALT: ${ENCRYPTION_SALT}
+    TASK_ENGINE_V2: "true"
+    TASK_ENGINE_INTERNAL_TOKEN: ${TASK_ENGINE_INTERNAL_TOKEN}
+  depends_on:
+    db:
+      condition: service_healthy
+  volumes:
+    - app_logs:/app/logs
+  healthcheck:
+    test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:3000/api/health"]
+    interval: 15s
+    timeout: 5s
+    retries: 5
+    start_period: 20s
+
+services:
+  # --- Application replicas (scale horizontally) ------------------------------
+  app:
+    <<: *app-common
+    # Use `docker compose up -d --scale app=N` to run more replicas.
+    # The load balancer in front of them is the `proxy` service below.
+    deploy:
+      replicas: 3
+
+  # --- Task worker (HA — run 2+ replicas) -------------------------------------
+  # Safe to scale: each claim uses `FOR UPDATE SKIP LOCKED` so two workers
+  # never pick the same task. Crashed workers release their tasks after
+  # TASK_LOCK_SECONDS (default 120s) via an expiring lease on `nextRunAt`.
+  worker:
+    image: ${APP_IMAGE:-registry.gitlab.com/s3administrator/s3administrator:latest}
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://s3admin:${POSTGRES_PASSWORD:-change-me}@db:5432/s3admin}
+      TASK_ENGINE_V2: "true"
+      TASK_ENGINE_INTERNAL_TOKEN: ${TASK_ENGINE_INTERNAL_TOKEN}
+      TASK_ENGINE_APP_URL: http://app:3000
+      # Workers must NOT run migrations or a web server — app replicas do.
+      AUTO_MIGRATE: "false"
+      # Lease duration. Shorter = faster failover after a worker crash,
+      # but must be long enough to cover your longest task step.
+      TASK_LOCK_SECONDS: ${TASK_LOCK_SECONDS:-120}
+    command: ["node", "node_modules/tsx/dist/cli.mjs", "src/worker/task-worker.ts"]
+    depends_on:
+      db:
+        condition: service_healthy
+      app:
+        condition: service_healthy
+    # Worker replicas don't serve HTTP, disable the inherited web healthcheck.
+    healthcheck:
+      disable: true
+    deploy:
+      replicas: 3
+
+  # --- Load balancer (terminates TLS + round-robins to app replicas) ---------
+  proxy:
+    image: caddy:2.11-alpine
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
+    volumes:
+      - ./docker/Caddyfile.cluster:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - app
+
+  # --- Shared PostgreSQL (replace with managed DB for real HA) ----------------
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-s3admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+      POSTGRES_DB: ${POSTGRES_DB:-s3admin}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-s3admin} -d ${POSTGRES_DB:-s3admin}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:
+  app_logs:

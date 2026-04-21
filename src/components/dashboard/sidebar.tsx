@@ -29,6 +29,7 @@ import { cn } from "@/lib/utils"
 import { ThemeSwitcher } from "@/components/theme-switcher"
 import { BucketSettingsSheet } from "@/components/dashboard/bucket-settings-sheet"
 import { SidebarBucketList } from "@/components/dashboard/sidebar-bucket-list"
+import { UserMenu } from "@/components/dashboard/user-menu"
 import { OrgSwitcher } from "@/lib/org-switcher"
 import { Building2, Users } from "lucide-react"
 
@@ -68,6 +69,15 @@ export function Sidebar({
   const sidebarCollapsed = collapsible && isCollapsed
   const isAdmin = session?.user?.role === "admin"
   const isCommunity = (process.env.NEXT_PUBLIC_EDITION || "").trim().toLowerCase() !== "cloud"
+  // In self-hosted multi-user mode we still run under "community" edition
+  // but we want the Admin link visible for admin users.
+  const isMultiUser =
+    (process.env.NEXT_PUBLIC_AUTH_MODE || "").trim().toLowerCase() === "multi"
+  const showAdminLink = isAdmin && (!isCommunity || isMultiUser)
+  // Show the user menu whenever there is an authenticated session. In
+  // single-user community mode there is no session, so the menu stays hidden.
+  const showUserMenu = Boolean(session?.user)
+  const isSharesActive = pathname === "/dashboard/shares"
 
   // Read active org slug from cookie (set by OrgSwitcher via /api/teams/switch)
   const [activeOrgSlug, setActiveOrgSlug] = useState<string | null>(() => {
@@ -321,7 +331,17 @@ export function Sidebar({
                   >
                     <ListTodo className="h-4 w-4" />
                   </Link>
-                  {!isCommunity && isAdmin && (
+                  <Link
+                    href="/dashboard/shares"
+                    title="Shared buckets"
+                    className={cn(
+                      "flex justify-center rounded-md px-2 py-2 hover:bg-accent",
+                      isSharesActive && "bg-accent"
+                    )}
+                  >
+                    <HardDrive className="h-4 w-4" />
+                  </Link>
+                  {showAdminLink && (
                     <Link
                       href="/admin"
                       title="Admin"
@@ -378,7 +398,9 @@ export function Sidebar({
             <div className="flex justify-center pb-1">
               <ThemeSwitcher />
             </div>
-            {!isCommunity && (
+            {showUserMenu ? (
+              <UserMenu collapsed />
+            ) : !isCommunity ? (
               <Button
                 variant="ghost"
                 size="sm"
@@ -389,7 +411,7 @@ export function Sidebar({
                 <LogOut className="h-4 w-4" />
                 <span className="sr-only">Sign Out</span>
               </Button>
-            )}
+            ) : null}
           </div>
         ) : (
           <div className="shrink-0 space-y-0.5 p-2 pb-4 sm:space-y-1 sm:p-3">
@@ -485,7 +507,18 @@ export function Sidebar({
                   Tasks
                 </Link>
 
-                {!isCommunity && isAdmin && (
+                <Link
+                  href="/dashboard/shares"
+                  className={cn(
+                    "flex items-center gap-2 rounded-md px-2 py-1 text-xs hover:bg-accent sm:py-1.5 sm:text-sm",
+                    isSharesActive && "bg-accent"
+                  )}
+                >
+                  <HardDrive className="h-3.5 w-3.5 sm:h-4 sm:w-4" />
+                  Shared buckets
+                </Link>
+
+                {showAdminLink && (
                   <Link
                     href="/admin"
                     className={cn(
@@ -521,7 +554,11 @@ export function Sidebar({
                 )}
               </>
             )}
-            {!isCommunity && (
+            {showUserMenu ? (
+              <div className="pt-1">
+                <UserMenu />
+              </div>
+            ) : !isCommunity ? (
               <Button
                 variant="ghost"
                 size="sm"
@@ -531,7 +568,7 @@ export function Sidebar({
                 <LogOut className="h-3.5 w-3.5 sm:h-4 sm:w-4" />
                 Sign Out
               </Button>
-            )}
+            ) : null}
           </div>
         )}
       </div>

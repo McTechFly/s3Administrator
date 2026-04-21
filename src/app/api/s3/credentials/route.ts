@@ -5,6 +5,7 @@ import { rebuildUserExtensionStats } from "@/lib/file-stats"
 import { encrypt } from "@/lib/crypto"
 import { normalizeS3Endpoint, normalizeS3Region } from "@/lib/s3"
 import { addCredentialSchema } from "@/lib/validations"
+import { listVisibleCredentialsForUser } from "@/lib/credential-resolver"
 
 export async function GET() {
   const session = await auth()
@@ -12,21 +13,27 @@ export async function GET() {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
   }
 
-  const credentials = await prisma.s3Credential.findMany({
-    where: { userId: session.user.id },
-    select: {
-      id: true,
-      label: true,
-      provider: true,
-      endpoint: true,
-      region: true,
-      isDefault: true,
-      createdAt: true,
-    },
-    orderBy: { createdAt: "desc" },
-  })
+  const { owned, shared } = await listVisibleCredentialsForUser(session.user.id)
 
-  return NextResponse.json(credentials)
+  // Owned credentials keep the same wire shape as before (backward compat).
+  // Shared ones are returned under a separate key and additionally flattened
+  // into the top-level array with a `sharedFrom` marker so existing UI lists
+  // can show them without changes.
+  const sharedFlattened = shared.map((s) => ({
+    id: s.credential.id,
+    label: s.credential.label,
+    provider: s.credential.provider,
+    endpoint: s.credential.endpoint,
+    region: s.credential.region,
+    isDefault: false,
+    createdAt: s.credential.createdAt,
+    sharedFrom: { userId: s.owner.id, email: s.owner.email, name: s.owner.name },
+    restrictedBucket: s.bucket,
+    permissionLevel: s.permissionLevel,
+    shareId: s.shareId,
+  }))
+
+  return NextResponse.json([...owned, ...sharedFlattened])
 }
 
 export async function POST(req: NextRequest) {

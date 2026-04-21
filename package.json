@@ -10,7 +10,7 @@
     "build": "node scripts/next-with-env.mjs build",
     "start": "node scripts/next-with-env.mjs start",
     "task-worker": "tsx src/worker/task-worker.ts",
-    "lint": "node scripts/validate-no-private-deps.mjs && node scripts/validate-no-cloud-imports.mjs && node scripts/ensure-edition-stubs.mjs && eslint",
+    "lint": "node scripts/validate-no-private-deps.mjs && node scripts/validate-no-cloud-imports.mjs && eslint",
     "validate:edition-sync": "node scripts/validate-edition-sync.mjs",
     "validate:no-private-deps": "node scripts/validate-no-private-deps.mjs"
   },
@@ -24,6 +24,7 @@
     "@prisma/client": "^7.4.0",
     "@radix-ui/react-slider": "^1.3.6",
     "@tanstack/react-query": "^5.90.20",
+    "bcryptjs": "^2.4.3",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "cron-parser": "^4.9.0",
@@ -32,8 +33,10 @@
     "next": "16.1.6",
     "next-auth": "^5.0.0-beta.30",
     "next-themes": "^0.4.6",
+    "otpauth": "^9.3.6",
     "pg": "^8.18.0",
     "pg-boss": "^10.4.2",
+    "qrcode": "^1.5.4",
     "radix-ui": "^1.4.3",
     "react": "19.2.4",
     "react-dom": "19.2.4",
@@ -47,8 +50,10 @@
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.2.1",
+    "@types/bcryptjs": "^2.4.6",
     "@types/node": "^20",
     "@types/pg": "^8.11.0",
+    "@types/qrcode": "^1.5.5",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "@types/sharp": "^0.31.1",
@@ -65,7 +70,7 @@
     "ajv": "^8.18.0",
     "hono": "^4.12.2",
     "lodash": "^4.17.23",
-    "fast-xml-parser": "^5.3.8",
+    "fast-xml-parser": "5.3.9",
     "minimatch": "^10.2.3",
     "qs": "^6.14.2"
   }

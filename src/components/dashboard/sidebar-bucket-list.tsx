@@ -146,7 +146,14 @@ export function SidebarBucketList({
         <div className="flex items-center gap-1 px-2">
           <div className="relative flex-1">
             <Search className="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+            <label htmlFor="sidebar-bucket-search" className="sr-only">
+              Search buckets
+            </label>
             <Input
+              id="sidebar-bucket-search"
+              name="sidebar-bucket-search"
+              type="search"
+              autoComplete="off"
               placeholder="Search buckets..."
               value={bucketSearch}
               onChange={(e) => setBucketSearch(e.target.value)}

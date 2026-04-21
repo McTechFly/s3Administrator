@@ -1,5 +1,6 @@
 import { auth } from "@/lib/auth"
 import { isCommunityEdition } from "@/lib/edition"
+import { isMultiUserMode } from "@/lib/auth-mode"
 import { NextResponse } from "next/server"
 import { logSystemEvent } from "@/lib/system-logger"
 
@@ -105,7 +106,7 @@ const cloudMiddleware = auth((req) => {
   return NextResponse.next()
 })
 
-export default isCommunityEdition()
+export default isCommunityEdition() && !isMultiUserMode()
   ? () => NextResponse.next()
   : cloudMiddleware
 

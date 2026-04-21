@@ -13,6 +13,19 @@ model User {
   emailVerified DateTime?
   image         String?
 
+  // Multi-user self-hosted auth fields
+  passwordHash String?
+  isActive     Boolean   @default(true)
+  lastLoginAt  DateTime?
+
+  // TOTP-based two-factor authentication (self-hosted multi-user mode).
+  // `totpSecret` stores the base32 TOTP secret. `totpEnabled` toggles enforcement
+  // at login. `totpBackupCodes` is a JSON-encoded array of bcrypt-hashed one-time
+  // recovery codes a user can use instead of their authenticator.
+  totpSecret       String?
+  totpEnabled      Boolean @default(false)
+  totpBackupCodes  String?
+
   role             String  @default("user")
   stripeCustomerId String? @unique
 
@@ -28,8 +41,34 @@ model User {
   actionEvents   UserActionEvent[]
   organizationMemberships OrganizationMember[]
 
+  // Direct user→user bucket shares
+  bucketSharesOwned    BucketShare[] @relation("BucketShareOwner")
+  bucketSharesReceived BucketShare[] @relation("BucketShareTarget")
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+}
+
+/// Direct user→user share of an S3 credential (optionally scoped to a single bucket).
+model BucketShare {
+  id              String   @id @default(cuid())
+  credentialId    String
+  ownerUserId     String
+  targetUserId    String
+  bucket          String?
+  permissionLevel String   @default("read") // "read" | "read_write" | "full"
+
+  credential S3Credential @relation(fields: [credentialId], references: [id], onDelete: Cascade)
+  owner      User         @relation("BucketShareOwner",  fields: [ownerUserId],  references: [id], onDelete: Cascade)
+  target     User         @relation("BucketShareTarget", fields: [targetUserId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([credentialId, targetUserId, bucket])
+  @@index([targetUserId])
+  @@index([ownerUserId])
+  @@index([credentialId])
 }
 
 model UserActionEvent {
@@ -103,6 +142,7 @@ model S3Credential {
 
   user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
   fileMetadata FileMetadata[]
+  shares       BucketShare[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

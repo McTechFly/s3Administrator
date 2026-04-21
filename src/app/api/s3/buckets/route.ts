@@ -160,15 +160,47 @@ async function listBucketsAcrossCredentials(
     if (cached) return cached
   }
 
-  const credentials = await prisma.s3Credential.findMany({
-    where: { userId },
-    select: {
-      id: true,
-      label: true,
-      provider: true,
-    },
-    orderBy: { createdAt: "asc" },
-  })
+  const [owned, shares] = await Promise.all([
+    prisma.s3Credential.findMany({
+      where: { userId },
+      select: {
+        id: true,
+        label: true,
+        provider: true,
+      },
+      orderBy: { createdAt: "asc" },
+    }),
+    prisma.bucketShare.findMany({
+      where: { targetUserId: userId },
+      include: {
+        credential: { select: { id: true, label: true, provider: true } },
+      },
+    }),
+  ])
+
+  // Build a combined list of credentials to scan. For shares scoped to a
+  // specific bucket we still list buckets for that credential and then
+  // filter below to only the bucket(s) explicitly granted.
+  const credentialsById = new Map<string, UserCredentialRef>()
+  for (const c of owned) credentialsById.set(c.id, c)
+  const sharedBucketFilters = new Map<string, Set<string> | null>() // credId -> allowed bucket names, null = all
+  for (const s of shares) {
+    if (!credentialsById.has(s.credential.id)) {
+      credentialsById.set(s.credential.id, s.credential)
+    }
+    const existing = sharedBucketFilters.get(s.credential.id)
+    if (s.bucket === null) {
+      sharedBucketFilters.set(s.credential.id, null) // credential-wide share
+    } else if (existing === undefined) {
+      sharedBucketFilters.set(s.credential.id, new Set([s.bucket]))
+    } else if (existing !== null) {
+      existing.add(s.bucket)
+    }
+  }
+  // Owner of a credential has unrestricted access — override filter.
+  for (const c of owned) sharedBucketFilters.set(c.id, null)
+
+  const credentials = Array.from(credentialsById.values())
 
   const allBuckets: ListedBucket[] = []
   const seenBucketNames = new Set<string>()
@@ -194,7 +226,9 @@ async function listBucketsAcrossCredentials(
     }
 
     successCount += 1
+    const filter = sharedBucketFilters.get(credential.id)
     for (const bucket of result.value) {
+      if (filter instanceof Set && !filter.has(bucket.name)) continue
       if (seenBucketNames.has(bucket.name)) continue
       seenBucketNames.add(bucket.name)
       allBuckets.push(bucket)
@@ -313,6 +347,19 @@ export async function POST(request: NextRequest) {
     }
 
     const { client, credential } = await getS3Client(session.user.id, credentialId)
+
+    // Creating a new bucket on someone else's credential is owner-only.
+    const ownerRecord = await prisma.s3Credential.findFirst({
+      where: { id: credential.id, userId: session.user.id },
+      select: { id: true },
+    })
+    if (!ownerRecord) {
+      return NextResponse.json(
+        { error: "You do not own this credential and cannot create a bucket on it." },
+        { status: 403 }
+      )
+    }
+
     const createInput: CreateBucketCommandInput = { Bucket: bucket }
 
     if (credential.provider === "AWS" && credential.region !== "us-east-1") {
@@ -409,6 +456,19 @@ export async function DELETE(request: NextRequest) {
 
     const { client, credential } = await getS3Client(session.user.id, credentialId)
     auditCredentialId = credential.id
+
+    // Deleting a bucket is an owner-only operation. Users who merely received
+    // a share of this credential/bucket must not be able to destroy it.
+    const ownerRecord = await prisma.s3Credential.findFirst({
+      where: { id: credential.id, userId: session.user.id },
+      select: { id: true },
+    })
+    if (!ownerRecord) {
+      return NextResponse.json(
+        { error: "You do not own this bucket and cannot delete it." },
+        { status: 403 }
+      )
+    }
 
     const preview = await client.send(
       new ListObjectsV2Command({

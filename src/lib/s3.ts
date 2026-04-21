@@ -206,6 +206,22 @@ export async function getS3Client(
     })
   }
 
+  // If still not found and a specific credentialId was requested, check whether
+  // this credential has been shared with the current user via BucketShare.
+  if (!credential && credentialId) {
+    const maybeShared = await prisma.s3Credential.findUnique({
+      where: { id: credentialId },
+    })
+    if (maybeShared) {
+      const share = await prisma.bucketShare.findFirst({
+        where: { credentialId: maybeShared.id, targetUserId: userId },
+      })
+      if (share) {
+        credential = maybeShared
+      }
+    }
+  }
+
   if (!credential) {
     throw new Error("No S3 credentials configured")
   }

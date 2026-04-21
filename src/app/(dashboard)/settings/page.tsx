@@ -15,6 +15,7 @@ import {
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogHeader,
   DialogTitle,
   DialogTrigger,
@@ -143,7 +144,10 @@ export default function SettingsPage() {
     queryFn: async () => {
       const res = await fetch("/api/s3/credentials")
       if (!res.ok) return []
-      return res.json()
+      const all = (await res.json()) as Array<Credential & { sharedFrom?: unknown }>
+      // Settings manages only credentials the user owns. Shared credentials
+      // are listed in /dashboard/shares and cannot be edited/deleted here.
+      return all.filter((c) => !c.sharedFrom)
     },
   })
 
@@ -352,6 +356,9 @@ export default function SettingsPage() {
           <DialogContent className="max-h-[90vh] overflow-y-auto">
             <DialogHeader>
               <DialogTitle>Add S3 Credential</DialogTitle>
+              <DialogDescription>
+                Connect a new S3-compatible bucket by entering its endpoint, region and access keys.
+              </DialogDescription>
             </DialogHeader>
             <form
               onSubmit={handleAddCredentialSubmit}

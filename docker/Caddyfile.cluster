@@ -1,0 +1,30 @@
+# Caddy configuration for the HA cluster.
+# Docker's embedded DNS resolves `app` to all replicas round-robin,
+# giving us a simple L7 load balancer with automatic HTTPS.
+
+{
+	# Set ACME email via env or comment out for local/dev.
+	# email admin@example.com
+}
+
+{$DOMAIN:localhost} {
+	encode zstd gzip
+
+	# Next.js app replicas. Using the service name + Docker DNS means new
+	# replicas scaled with `--scale app=N` are picked up automatically.
+	reverse_proxy app:3000 {
+		lb_policy       round_robin
+		lb_try_duration 5s
+		lb_try_interval 500ms
+
+		health_uri      /api/health
+		health_interval 10s
+		health_timeout  3s
+
+		transport http {
+			# Long-lived requests (big uploads, sync) need a generous timeout.
+			read_timeout  1h
+			write_timeout 1h
+		}
+	}
+}

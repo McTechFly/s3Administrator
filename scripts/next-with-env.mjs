@@ -31,7 +31,9 @@ if (environment !== "COMMUNITY" && environment !== "CLOUD") {
 }
 
 try {
-  await ensureEditionStubs(environment)
+  if (process.env.SKIP_EDITION_STUBS !== "true") {
+    await ensureEditionStubs(environment)
+  }
 } catch (error) {
   console.error("Failed to prepare edition stubs.", error)
   process.exit(1)

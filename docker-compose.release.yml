@@ -1,0 +1,62 @@
+# =============================================================================
+#  s3Administrator — Release docker-compose
+# =============================================================================
+#
+#  Minimal stack for self-hosting: just the app, a Postgres database,
+#  and a reverse proxy. Everything reads its configuration from `.env`.
+#
+#  Usage:
+#    1. cp .env.example .env  && edit .env
+#    2. docker compose -f docker-compose.release.yml up -d
+#    3. open http://localhost:3000 and register the first admin user.
+#
+#  Upgrade:
+#    docker compose -f docker-compose.release.yml pull
+#    docker compose -f docker-compose.release.yml up -d
+#    (migrations run automatically at boot; no manual step required)
+#
+# -----------------------------------------------------------------------------
+
+services:
+  app:
+    image: ${APP_IMAGE:-registry.gitlab.com/s3administrator/s3administrator:latest}
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-3000}:3000"
+    env_file:
+      - .env
+    environment:
+      # Override DATABASE_URL inside docker network so the app always talks
+      # to the bundled `db` service. Comment this out if you set
+      # DATABASE_URL yourself to point at an external PostgreSQL.
+      DATABASE_URL: postgres://${POSTGRES_USER:-s3admin}:${POSTGRES_PASSWORD:-change-me}@db:5432/${POSTGRES_DB:-s3admin}
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - app_logs:/app/logs
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-s3admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+      POSTGRES_DB: ${POSTGRES_DB:-s3admin}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-s3admin} -d ${POSTGRES_DB:-s3admin}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata:
+  app_logs:
